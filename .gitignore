@@ -12,4 +12,8 @@ build/
 env/
 venv/
 *.db
+*.sqlite
 *.sqlite3
+*.docx
+*.doc
+*.log

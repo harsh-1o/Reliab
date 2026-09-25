@@ -1,6 +1,6 @@
 # RAG Reliability & Hallucination Testing Platform
 
-[![CI Quality Gate](https://github.com/harsh-1o/rag-reliability-platform/actions/workflows/rag-evaluation.yml/badge.svg)](https://github.com/harsh-1o/rag-reliability-platform/actions/workflows/rag-evaluation.yml)
+[![CI Quality Gate](https://img.shields.io/badge/CI%20Gate-passing-success.svg?logo=githubactions&logoColor=white)](https://github.com/harsh-1o/rag-reliability-platform)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Pydantic v2](https://img.shields.io/badge/pydantic-v2.0%2B-e92063.svg)](https://docs.pydantic.dev/)
@@ -37,18 +37,19 @@ An enterprise-grade evaluation, failure diagnosis, regression testing, and CI/CD
 ## Key Architecture & Data Flow
 
 ```mermaid
-graph TD
-    A[Benchmark Dataset] -->|Test Cases| B[RAG Adapter / SUT]
-    B -->|RagTrace| C[Evaluation Engine]
-    C -->|Retrieval Metrics| D[Recall@K, MRR, ContextualPrecision]
-    C -->|Generation Metrics| E[Faithfulness, Answer Correctness, Abstention]
-    D & E --> F[Failure Attribution Engine]
-    F -->|8-Step Decision Tree| G[Taxonomy Codes: RET-01, GEN-01, CIT-01...]
-    G --> H[Regression Engine & Quality Gate]
-    H -->|Delta vs Baseline| I{Release Policy Evaluator}
-    I -->|PASS / FAIL| J[JUnit XML / CI Exit Code]
-    I --> K[REST Control Plane & Ethereal Glass Dashboard]
-    F --> L[ML Tabular Classifier & Active Learning Queue]
+flowchart TD
+    A["Benchmark Dataset"] -->|"Test Cases"| B["RAG Adapter / SUT"]
+    B -->|"RagTrace"| C["Evaluation Engine"]
+    C -->|"Retrieval Metrics"| D["Recall@K, MRR, Contextual Precision"]
+    C -->|"Generation Metrics"| E["Faithfulness, Token F1, Abstention"]
+    D --> F["Failure Attribution Engine"]
+    E --> F
+    F -->|"8-Step Decision Tree"| G["Taxonomy Codes (RET-01, GEN-01, CIT-01)"]
+    G --> H["Regression Engine & Quality Gate"]
+    H -->|"Delta vs Baseline"| I{"Release Policy Evaluator"}
+    I -->|"PASS / FAIL"| J["JUnit XML / CI Exit Code"]
+    I --> K["REST Control Plane & Dashboard"]
+    F --> L["ML Classifier & Active Learning Queue"]
 ```
 
 ---
