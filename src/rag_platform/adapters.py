@@ -1,7 +1,4 @@
-"""RAG System Under Test (SUT) adapters and offline self-testing fixtures.
-
-# ponytail: single file covers protocol, HTTP/Python adapters, and all 6 mock RAGs.
-"""
+"""RAG System Under Test (SUT) adapters and adapter registry."""
 
 from __future__ import annotations
 
@@ -20,6 +17,7 @@ from rag_platform.models import (
     RunConfig,
     TestCase,
 )
+from rag_platform.security import SecretRedactor
 
 
 class RagAdapter(Protocol):
@@ -46,7 +44,6 @@ class PythonRagAdapter:
         if isinstance(res, RagTrace):
             res.latency_ms = max(res.latency_ms, latency_ms)
             return res
-        # Auto-wrap raw dict / string output
         return RagTrace(
             trace_id=generate_id("tr"),
             run_id=generate_id("run_adhoc"),
@@ -58,17 +55,39 @@ class PythonRagAdapter:
 
 
 class HttpRagAdapter:
-    """Invokes an external HTTP RAG endpoint and normalizes to canonical RagTrace."""
+    """Invokes an external HTTP RAG endpoint and normalizes to canonical RagTrace.
+    
+    Supports reusable connection pooling via shared httpx.AsyncClient to minimize
+    TCP handshake latency across high-throughput evaluation suites.
+    """
 
     def __init__(
         self,
         endpoint_url: str,
         headers: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self.endpoint_url = endpoint_url
         self.headers = headers or {}
         self.timeout_seconds = timeout_seconds
+        self._shared_client = client
+        self._owns_client = client is None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._shared_client is not None and not self._shared_client.is_closed:
+            return self._shared_client
+        self._shared_client = httpx.AsyncClient(
+            timeout=self.timeout_seconds,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+        self._owns_client = True
+        return self._shared_client
+
+    async def close(self) -> None:
+        """Close internal HTTP client pool if owned."""
+        if self._owns_client and self._shared_client is not None and not self._shared_client.is_closed:
+            await self._shared_client.aclose()
 
     async def run(self, case: TestCase, config: RunConfig) -> RagTrace:
         start = time.perf_counter()
@@ -80,60 +99,62 @@ class HttpRagAdapter:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                resp = await client.post(self.endpoint_url, json=payload, headers=self.headers)
-                latency_ms = int((time.perf_counter() - start) * 1000)
+            client = await self._get_client()
+            resp = await client.post(self.endpoint_url, json=payload, headers=self.headers)
+            latency_ms = int((time.perf_counter() - start) * 1000)
 
-                if resp.status_code >= 400:
-                    return RagTrace(
-                        trace_id=trace_id,
-                        run_id=generate_id("run"),
-                        test_case_id=case.id,
-                        question=case.question,
-                        error_code="OPS-01",
-                        latency_ms=latency_ms,
-                        telemetry={"http_status": resp.status_code, "body": resp.text},
-                    )
-
-                data = resp.json()
-                chunks = [
-                    RetrievedChunk(
-                        document_id=c.get("document_id", "doc_unknown"),
-                        chunk_id=c.get("chunk_id", f"c_{i}"),
-                        rank=c.get("rank", i + 1),
-                        score=float(c.get("score", 0.0)),
-                        text=c.get("text", ""),
-                    )
-                    for i, c in enumerate(data.get("retrieved_chunks", []))
-                ]
-                citations = [
-                    Citation(
-                        claim_id=cit.get("claim_id", f"cl_{i}"),
-                        claim_text=cit.get("claim_text", ""),
-                        document_id=cit.get("document_id", ""),
-                        chunk_id=cit.get("chunk_id", ""),
-                        span=cit.get("span"),
-                    )
-                    for i, cit in enumerate(data.get("citations", []))
-                ]
-
+            if resp.status_code >= 400:
+                # Truncate and redact provider error response to prevent data leakage in telemetry
+                safe_body = SecretRedactor.redact_text(resp.text[:500])
                 return RagTrace(
                     trace_id=trace_id,
                     run_id=generate_id("run"),
                     test_case_id=case.id,
                     question=case.question,
-                    answer=data.get("answer"),
-                    abstained=bool(data.get("abstained", False)),
-                    abstention_reason=data.get("abstention_reason"),
-                    retrieved_chunks=chunks,
-                    citations=citations,
+                    error_code="OPS-01",
                     latency_ms=latency_ms,
-                    input_tokens=data.get("input_tokens"),
-                    output_tokens=data.get("output_tokens"),
-                    cost_usd=data.get("cost_usd"),
-                    model=data.get("model"),
-                    telemetry=data.get("telemetry", {}),
+                    telemetry={"http_status": resp.status_code, "body": safe_body},
                 )
+
+            data = resp.json()
+            chunks = [
+                RetrievedChunk(
+                    document_id=c.get("document_id", "doc_unknown"),
+                    chunk_id=c.get("chunk_id", f"c_{i}"),
+                    rank=c.get("rank", i + 1),
+                    score=float(c.get("score", 0.0)),
+                    text=c.get("text", ""),
+                )
+                for i, c in enumerate(data.get("retrieved_chunks", []))
+            ]
+            citations = [
+                Citation(
+                    claim_id=cit.get("claim_id", f"cl_{i}"),
+                    claim_text=cit.get("claim_text", ""),
+                    document_id=cit.get("document_id", ""),
+                    chunk_id=cit.get("chunk_id", ""),
+                    span=cit.get("span"),
+                )
+                for i, cit in enumerate(data.get("citations", []))
+            ]
+
+            return RagTrace(
+                trace_id=trace_id,
+                run_id=generate_id("run"),
+                test_case_id=case.id,
+                question=case.question,
+                answer=data.get("answer"),
+                abstained=bool(data.get("abstained", False)),
+                abstention_reason=data.get("abstention_reason"),
+                retrieved_chunks=chunks,
+                citations=citations,
+                latency_ms=latency_ms,
+                input_tokens=data.get("input_tokens"),
+                output_tokens=data.get("output_tokens"),
+                cost_usd=data.get("cost_usd"),
+                model=data.get("model"),
+                telemetry=SecretRedactor.redact_dict(data.get("telemetry", {})),
+            )
         except (httpx.TimeoutException, httpx.RequestError) as ex:
             latency_ms = int((time.perf_counter() - start) * 1000)
             return RagTrace(
@@ -143,11 +164,33 @@ class HttpRagAdapter:
                 question=case.question,
                 error_code="OPS-01",
                 latency_ms=latency_ms,
-                telemetry={"exception": str(ex), "type": type(ex).__name__},
+                telemetry={"exception": SecretRedactor.redact_text(str(ex)), "type": type(ex).__name__},
             )
 
 
-# --- Platform Self-Test: 6 Flawed Synthetic RAGs ---
+# --- Adapter Registry ---
+class AdapterRegistry:
+    """Central registry mapping adapter identifiers to adapter factories."""
+
+    _factories: dict[str, Callable[..., RagAdapter]] = {}
+
+    @classmethod
+    def register(cls, name: str, factory: Callable[..., RagAdapter]) -> None:
+        cls._factories[name.lower()] = factory
+
+    @classmethod
+    def get(cls, name: str, **kwargs: Any) -> RagAdapter:
+        key = name.lower()
+        if key not in cls._factories:
+            raise ValueError(f"Unknown adapter '{name}'. Registered: {cls.available()}")
+        return cls._factories[key](**kwargs)
+
+    @classmethod
+    def available(cls) -> list[str]:
+        return sorted(list(cls._factories.keys()))
+
+
+# --- Platform Self-Test: Flawed Synthetic RAGs (Development & Demo Only) ---
 class SyntheticRagMode(str, Enum):
     PERFECT = "PERFECT"
     DISTRACTOR = "DISTRACTOR"           # RET-01 / RET-02
@@ -158,6 +201,11 @@ class SyntheticRagMode(str, Enum):
 
 
 class SyntheticRagAdapter:
+    """Synthetic SUT adapter for offline development, integration tests, and platform calibration.
+    
+    NOT intended for production SUT evaluation.
+    """
+    is_development_adapter: bool = True
     """Offline synthetic RAG engine producing deterministic behaviors for platform self-tests."""
 
     def __init__(self, mode: SyntheticRagMode = SyntheticRagMode.PERFECT) -> None:
@@ -270,3 +318,15 @@ class SyntheticRagAdapter:
             latency_ms=70,
             model="synthetic-perfect-v1",
         )
+
+
+# Register standard built-in adapters
+AdapterRegistry.register(
+    "synthetic",
+    lambda mode=SyntheticRagMode.PERFECT, **_: SyntheticRagAdapter(
+        SyntheticRagMode(mode) if isinstance(mode, str) else mode
+    ),
+)
+AdapterRegistry.register("python", lambda target_fn=None, **_: PythonRagAdapter(target_fn))
+AdapterRegistry.register("http", lambda endpoint_url="", headers=None, timeout_seconds=30.0, **_: HttpRagAdapter(endpoint_url=endpoint_url, headers=headers, timeout_seconds=timeout_seconds))
+

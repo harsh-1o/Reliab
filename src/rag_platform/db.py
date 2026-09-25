@@ -1,6 +1,5 @@
 """Relational database models, immutability constraints, and CRUD repository.
-
-# ponytail: single file for SQLAlchemy 2.0 ORM + repo. Supports SQLite (zero-infra) & Postgres.
+Supports SQLite and PostgreSQL via SQLAlchemy 2.0 ORM.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from rag_platform.core import (
     generate_id,
     settings,
 )
-from rag_platform.security import SecretRedactor
+from rag_platform.security import RecursiveTraceSanitizer, SecretRedactor
 from rag_platform.models import (
     BenchmarkDataset,
     DatasetStatus,
@@ -154,7 +153,8 @@ class MetricResultRow(Base):
     run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
     metric_family: Mapped[str] = mapped_column(String(32), nullable=False)
-    score: Mapped[float] = mapped_column(Float, nullable=False)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="PASS")
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     evaluator_version: Mapped[str] = mapped_column(String(64), default="1.0.0")
     cached: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -321,37 +321,23 @@ class DatabaseRepo:
         if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value):
             raise ImmutabilityError(f"Cannot add traces to completed/terminal run {trace.run_id}.")
 
-        # Sanitize sensitive credentials and tokens BEFORE database persistence
-        sanitized_question = SecretRedactor.redact_text(trace.question)
-        sanitized_answer = SecretRedactor.redact_text(trace.answer) if trace.answer else None
-        sanitized_telemetry = SecretRedactor.redact_dict(trace.telemetry)
-        clean_chunks = [
-            c.model_copy(update={"text": SecretRedactor.redact_text(c.text)})
-            for c in trace.retrieved_chunks
-        ]
-        clean_trace = trace.model_copy(
-            update={
-                "question": sanitized_question,
-                "answer": sanitized_answer,
-                "telemetry": sanitized_telemetry,
-                "retrieved_chunks": clean_chunks,
-            }
-        )
+        # Recursively sanitize the entire trace (nested chunks, metadata, telemetry, credentials)
+        clean_trace: RagTrace = RecursiveTraceSanitizer.sanitize_trace(trace)
 
         trace_row = TraceRow(
-            id=trace.trace_id,
-            run_id=trace.run_id,
-            test_case_id=trace.test_case_id,
-            question=sanitized_question,
-            answer=sanitized_answer,
-            abstained=trace.abstained,
-            abstention_reason=trace.abstention_reason,
-            latency_ms=trace.latency_ms,
-            input_tokens=trace.input_tokens,
-            output_tokens=trace.output_tokens,
-            cost_usd=trace.cost_usd,
-            model=trace.model,
-            error_code=trace.error_code,
+            id=clean_trace.trace_id,
+            run_id=clean_trace.run_id,
+            test_case_id=clean_trace.test_case_id,
+            question=clean_trace.question,
+            answer=clean_trace.answer,
+            abstained=clean_trace.abstained,
+            abstention_reason=clean_trace.abstention_reason,
+            latency_ms=clean_trace.latency_ms,
+            input_tokens=clean_trace.input_tokens,
+            output_tokens=clean_trace.output_tokens,
+            cost_usd=clean_trace.cost_usd,
+            model=clean_trace.model,
+            error_code=clean_trace.error_code,
             raw_trace_json=clean_trace.model_dump_json(),
         )
         self.session.add(trace_row)
@@ -361,16 +347,18 @@ class DatabaseRepo:
             for m in metrics:
                 m_row = MetricResultRow(
                     id=generate_id("met"),
-                    trace_id=trace.trace_id,
-                    run_id=trace.run_id,
+                    trace_id=clean_trace.trace_id,
+                    run_id=clean_trace.run_id,
                     metric_name=m.metric_name,
                     metric_family=m.metric_family.value,
                     score=m.score,
+                    status=m.status.value,
                     reason=m.reason,
                     evaluator_version=m.evaluator_version,
                     cached=m.cached,
                 )
                 self.session.add(m_row)
+            self.session.flush()
 
         if attribution:
             evidence_payload = {

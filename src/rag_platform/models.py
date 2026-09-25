@@ -1,7 +1,4 @@
-"""Domain models, enums, traces, and policies.
-
-# ponytail: one file covers the entire data model. No imports-of-imports.
-"""
+"""Domain models, enums, traces, and policies."""
 
 from __future__ import annotations
 
@@ -45,6 +42,13 @@ class MetricFamily(str, Enum):
     SYSTEM = "SYSTEM"
 
 
+class MetricStatus(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+
 class FailureCode(str, Enum):
     OPS_01 = "OPS-01"  # Infrastructure error (timeout/network)
     ABS_01 = "ABS-01"  # Unanswerable abstention failure (answered unanswerable)
@@ -85,6 +89,7 @@ class ClaimVerification(BaseModel):
     status: ClaimStatus
     supporting_chunk_id: str | None = None
     confidence: float = 1.0
+    confidence_type: str = "heuristic"
     reason: str = ""
 
 
@@ -92,6 +97,7 @@ class DiagnosticFinding(BaseModel):
     code: FailureCode
     severity: Severity = Severity.MEDIUM
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    confidence_type: str = "heuristic"
     explanation: str
     evidence: dict[str, Any] = Field(default_factory=dict)
     recommended_actions: list[str] = Field(default_factory=list)
@@ -198,9 +204,10 @@ class RagTrace(BaseModel):
 class MetricResult(BaseModel):
     metric_name: str
     metric_family: MetricFamily
-    score: float
+    score: float | None = None
+    status: MetricStatus = MetricStatus.PASS
     reason: str | None = None
-    evaluator_version: str = "1.0.0"
+    evaluator_version: str = "2.0.0"
     cached: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -214,6 +221,7 @@ class MetricSummary(BaseModel):
     min: float
     max: float
     count: int
+    applicable_count: int = 0
     std_dev: float = 0.0
     ci_lower: float | None = None
     ci_upper: float | None = None
@@ -240,6 +248,7 @@ class FailureAttribution(BaseModel):
     failure_type: FailureCode | None = None  # Backward-compatible alias for primary_code
     severity: Severity = Severity.MEDIUM
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    confidence_type: str = "heuristic"
     explanation: str
     evidence: dict[str, Any] = Field(default_factory=dict)
     recommended_actions: list[str] = Field(default_factory=list)
@@ -264,38 +273,68 @@ class HumanOverride(BaseModel):
 # --- Run Provenance & Gate ---
 class RunProvenance(BaseModel):
     dataset_checksum: str
-    rag_version: str = "rag_v1"
-    model_config_hash: str = "default_model_hash"
-    prompt_hash: str = "default_prompt_hash"
-    evaluator_version: str = "2.0.0"
-    experiment_hash: str = "default_exp_hash"
-    manifest_hash: str = ""
-    # Explicit structured metadata for enhanced auditability
     dataset_id: str | None = None
     dataset_version: str | None = None
-    model_id: str | None = None
-    retrieval_config: dict[str, Any] = Field(default_factory=dict)
+    rag_version: str = "rag_v1"
+    model_name: str | None = None
+    model_version: str | None = None
+    model_parameters: dict[str, Any] = Field(default_factory=dict)
+    model_config_hash: str = "default_model_config_hash"
+    temperature: float | None = None
+    prompt_template: str | None = None
+    prompt_hash: str = "default_prompt_hash"
+    system_prompt_hash: str | None = None
+    embedding_model: str | None = None
+    embedding_version: str | None = None
+    retriever_config: dict[str, Any] = Field(default_factory=dict)
+    reranker_config: dict[str, Any] = Field(default_factory=dict)
+    chunking_config: dict[str, Any] = Field(default_factory=dict)
+    adapter_type: str = "synthetic"
+    adapter_config: dict[str, Any] = Field(default_factory=dict)
+    evaluator_version: str = "2.0.0"
+    evaluation_config: dict[str, Any] = Field(default_factory=dict)
+    experiment_config: dict[str, Any] = Field(default_factory=dict)
+    experiment_hash: str = "default_experiment_hash"
+    python_version: str | None = None
+    dependency_lock_hash: str | None = None
     environment_info: dict[str, Any] = Field(default_factory=dict)
+    random_seed: int | None = None
+    manifest_hash: str = ""
 
     def model_post_init(self, __context: Any) -> None:
+        if self.model_parameters and self.model_config_hash == "default_model_config_hash":
+            self.model_config_hash = sha256_hash(canonical_json(self.model_parameters))
+        if self.experiment_config and self.experiment_hash == "default_experiment_hash":
+            self.experiment_hash = sha256_hash(canonical_json(self.experiment_config))
         if not self.manifest_hash:
-            extra = {}
-            if self.dataset_id:
-                extra["dataset_id"] = self.dataset_id
-            if self.retrieval_config:
-                extra["retrieval_config"] = self.retrieval_config
-            if self.environment_info:
-                extra["environment_info"] = self.environment_info
-
-            self.manifest_hash = compute_manifest_hash(
-                dataset_checksum=self.dataset_checksum,
-                rag_version=self.rag_version,
-                model_config_hash=self.model_config_hash,
-                prompt_hash=self.prompt_hash,
-                evaluator_version=self.evaluator_version,
-                experiment_hash=self.experiment_hash,
-                extra_metadata=extra if extra else None,
-            )
+            payload = {
+                "dataset_checksum": self.dataset_checksum,
+                "dataset_id": self.dataset_id,
+                "dataset_version": self.dataset_version,
+                "rag_version": self.rag_version,
+                "model_name": self.model_name,
+                "model_version": self.model_version,
+                "model_parameters": self.model_parameters,
+                "temperature": self.temperature,
+                "prompt_hash": self.prompt_hash,
+                "system_prompt_hash": self.system_prompt_hash,
+                "embedding_model": self.embedding_model,
+                "embedding_version": self.embedding_version,
+                "retriever_config": self.retriever_config,
+                "reranker_config": self.reranker_config,
+                "chunking_config": self.chunking_config,
+                "adapter_type": self.adapter_type,
+                "adapter_config": self.adapter_config,
+                "evaluator_version": self.evaluator_version,
+                "evaluation_config": self.evaluation_config,
+                "experiment_config": self.experiment_config,
+                "python_version": self.python_version,
+                "dependency_lock_hash": self.dependency_lock_hash,
+                "environment_info": self.environment_info,
+                "random_seed": self.random_seed,
+            }
+            clean_payload = {k: v for k, v in payload.items() if v not in (None, {}, "")}
+            self.manifest_hash = sha256_hash(canonical_json(clean_payload))
 
 
 class RunOptions(BaseModel):
@@ -316,6 +355,14 @@ class RunConfig(BaseModel):
     options: RunOptions = Field(default_factory=RunOptions)
 
 
+class MetricRegressionPolicy(BaseModel):
+    metric_name: str
+    min_absolute_score: float | None = None
+    max_absolute_score: float | None = None
+    max_degradation_pct: float | None = None
+    max_absolute_degradation: float | None = None
+
+
 class ReleasePolicy(BaseModel):
     policy_id: str = "prod-default"
     min_faithfulness: float = 0.90
@@ -325,7 +372,9 @@ class ReleasePolicy(BaseModel):
     min_abstention_accuracy: float = 0.90
     max_latency_regression_pct: float = 20.0
     max_cost_regression_pct: float = 25.0
+    min_cost_budget_usd: float = 0.05
     max_critical_regressions: int = 0
+    metric_policies: list[MetricRegressionPolicy] = Field(default_factory=list)
 
 
 class GateViolation(BaseModel):

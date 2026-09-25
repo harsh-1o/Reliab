@@ -17,6 +17,7 @@ from rag_platform.models import (
     DocumentReference,
     MetricFamily,
     MetricResult,
+    MetricStatus,
     MetricSummary,
     RagTrace,
     RetrievedChunk,
@@ -25,10 +26,84 @@ from rag_platform.models import (
 )
 
 
+EQUIVALENCE_MAPPINGS: list[tuple[str, str]] = [
+    (r"\bone month\b", "30 days"),
+    (r"\b1 month\b", "30 days"),
+    (r"\btwo months\b", "60 days"),
+    (r"\b2 months\b", "60 days"),
+    (r"\bone year\b", "12 months"),
+    (r"\b1 year\b", "12 months"),
+    (r"\bannually\b", "yearly"),
+    (r"\bannual\b", "yearly"),
+    (r"\bpermitted\b", "allowed"),
+    (r"\bcan receive\b", "allowed"),
+    (r"\beligible for\b", "allowed"),
+    (r"\bprohibited\b", "forbidden"),
+    (r"\bcustomers\b", "clients"),
+    (r"\busers\b", "clients"),
+    (r"\bconsumers\b", "clients"),
+]
+
+
+def normalize_text_equivalences(text: str) -> str:
+    """Normalize common semantic synonyms, duration phrasing, and entity aliases."""
+    normalized = text.lower()
+    for pattern, replacement in EQUIVALENCE_MAPPINGS:
+        normalized = re.sub(pattern, replacement, normalized)
+    return normalized
+
+
+def _decompose_sentence_into_clauses(sentence: str) -> list[str]:
+    """Decompose a complex sentence into atomic factual clauses."""
+    s = sentence.strip()
+    if not s:
+        return []
+
+    # Semicolons are strong proposition separators
+    raw_subparts = [p.strip() for p in s.split(";") if p.strip()]
+    clauses: list[str] = []
+
+    for part in raw_subparts:
+        # Check for serial comma or coordinating conjunction clause boundaries
+        # e.g., "Revenue increased 20%, profit increased 12%, and headcount increased by 500."
+        # or "Revenue increased 20% and profit increased 15%."
+        candidate_splits = re.split(
+            r"(?:,\s+(?:and\s+|but\s+|while\s+|whereas\s+|as well as\s+)?|\s+(?:and|but|while|whereas)\s+)",
+            part,
+            flags=re.IGNORECASE,
+        )
+        if len(candidate_splits) > 1:
+            valid_clauses: list[str] = []
+            for c in candidate_splits:
+                c_clean = c.strip().rstrip(".!?")
+                c_clean = re.sub(r"^(?:and|or|but|also|as well as)\s+", "", c_clean, flags=re.IGNORECASE).strip()
+                # A factual clause typically has numbers/symbols or at least 2 content tokens
+                if len(c_clean) > 5 and (re.search(r"\b\d+|\$|%", c_clean) or len(c_clean.split()) >= 2):
+                    # Capitalize first character
+                    c_formatted = c_clean[0].upper() + c_clean[1:] if len(c_clean) > 1 else c_clean.upper()
+                    valid_clauses.append(c_formatted)
+                elif valid_clauses:
+                    # Merge fragment back into previous clause
+                    valid_clauses[-1] = f"{valid_clauses[-1]} and {c_clean}"
+
+            if len(valid_clauses) > 1:
+                for vc in valid_clauses:
+                    clauses.append(vc if vc.endswith((".", "!", "?")) else f"{vc}.")
+                continue
+
+        # Single clause fallback
+        cleaned = part.rstrip(".!?").strip()
+        if cleaned:
+            formatted = cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()
+            clauses.append(formatted if formatted.endswith((".", "!", "?")) else f"{formatted}.")
+
+    return clauses
+
+
 def extract_claims(text: str) -> list[str]:
     """Extract atomic factual claim units from answer text.
     
-    Decomposes paragraphs into declarative sentence/clause propositions,
+    Decomposes paragraphs and compound sentences into atomic declarative clauses,
     filtering conversational padding and meta-discourse.
     """
     if not text or not text.strip():
@@ -37,15 +112,13 @@ def extract_claims(text: str) -> list[str]:
     # Clean bracketed citation tags [1], [doc-1] for pure claim analysis
     clean_text = re.sub(r"\[\s*[\w\-]+\s*\]", "", text).strip()
 
-    # Split by sentence boundaries
-    raw_sentences = [
-        s.strip()
-        for s in re.split(r"(?<=[.!?])\s+", clean_text)
-        if len(s.strip()) > 5
+    # Split lines and bullet points
+    lines = [
+        re.sub(r"^[-*•\d+\.]\s+", "", line).strip()
+        for line in clean_text.splitlines()
+        if line.strip()
     ]
 
-    claims: list[str] = []
-    # Conversational filler prefixes to strip or ignore
     fillers = (
         "based on the provided context",
         "according to the documents",
@@ -56,18 +129,29 @@ def extract_claims(text: str) -> list[str]:
         "here is the answer",
     )
 
-    for s in raw_sentences:
-        lower_s = s.lower().strip()
-        # Skip pure boilerplate or disclaimers
-        if any(lower_s == f for f in fillers):
-            continue
-        for f in fillers:
-            if lower_s.startswith(f + ",") or lower_s.startswith(f + ":"):
-                s = s[len(f) + 1 :].strip()
-                break
+    claims: list[str] = []
 
-        if len(s) > 8:
-            claims.append(s)
+    for line in lines:
+        # Split into sentences
+        raw_sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", line)
+            if len(s.strip()) > 5
+        ]
+
+        for s in raw_sentences:
+            lower_s = s.lower().strip()
+            if any(lower_s == f for f in fillers):
+                continue
+            for f in fillers:
+                if lower_s.startswith(f + ",") or lower_s.startswith(f + ":"):
+                    s = s[len(f) + 1 :].strip()
+                    break
+
+            decomposed = _decompose_sentence_into_clauses(s)
+            for c in decomposed:
+                if len(c) > 6:
+                    claims.append(c)
 
     return claims if claims else ([clean_text] if len(clean_text) > 8 else [])
 
@@ -75,23 +159,26 @@ def extract_claims(text: str) -> list[str]:
 def verify_claim_against_chunks(
     claim: str, chunks: list[RetrievedChunk]
 ) -> tuple[ClaimStatus, RetrievedChunk | None, str]:
-    """Verify an individual claim against all retrieved context chunks.
+    """Verify an individual claim against retrieved context chunks using Lexical Claim Grounding.
     
     Returns (ClaimStatus, supporting_chunk, explanation).
     Classifies as:
-      - SUPPORTED: Core entities and predicates confirmed in chunk.
-      - CONTRADICTED: Directly conflicts with factual values or negation in chunk.
-      - UNSUPPORTED: Facts not present in retrieved context (extrinsic hallucination).
+      - SUPPORTED: Key entities, predicates, and semantic alignments confirmed in evidence chunk.
+      - CONTRADICTED: Directly conflicts with numerical amounts, explicit negation, or opposing predicates.
+      - UNSUPPORTED: Facts not substantiated by any retrieved context chunk.
     """
-    claim_lower = claim.lower()
-    claim_tokens = set(re.findall(r"[a-zA-Z0-9_\-\.%]+", claim_lower))
-    # Extract numbers, percentages, currency, proper nouns
-    claim_entities = set(re.findall(r"\b(?:\d+(?:\.\d+)?%?|\$\d+(?:\.\d+)?|[A-Z][a-z]+)\b", claim))
+    claim_norm = normalize_text_equivalences(claim)
+    claim_lower = claim_norm.lower()
+    claim_tokens = {
+        t.strip(".,;:!?\"'()[]{}")
+        for t in re.findall(r"[a-zA-Z0-9_\-\.%]+", claim_lower)
+        if t.strip(".,;:!?\"'()[]{}")
+    }
 
     best_match_chunk: RetrievedChunk | None = None
     best_overlap = 0.0
 
-    # Common antonym / negation pairs for contradiction detection
+    # Explicit antonym / predicate opposition pairs
     contradiction_pairs = [
         ("increased", "decreased"),
         ("expanded", "contracted"),
@@ -108,16 +195,21 @@ def verify_claim_against_chunks(
         ("enabled", "disabled"),
         ("success", "failure"),
         ("supported", "unsupported"),
+        ("permitted", "forbidden"),
     ]
 
     for chunk in chunks:
-        chunk_text_lower = chunk.text.lower()
-        chunk_tokens = set(re.findall(r"[a-zA-Z0-9_\-\.%]+", chunk_text_lower))
+        chunk_norm = normalize_text_equivalences(chunk.text)
+        chunk_text_lower = chunk_norm.lower()
+        chunk_tokens = {
+            t.strip(".,;:!?\"'()[]{}")
+            for t in re.findall(r"[a-zA-Z0-9_\-\.%]+", chunk_text_lower)
+            if t.strip(".,;:!?\"'()[]{}")
+        }
 
-        # Check for explicit contradictions
+        # 1. Antonym / Predicate Opposition Check
         for w1, w2 in contradiction_pairs:
             if (w1 in claim_lower and w2 in chunk_text_lower) or (w2 in claim_lower and w1 in chunk_text_lower):
-                # Verify they share common topic tokens (at least 1 content word)
                 shared = {
                     t for t in claim_tokens.intersection(chunk_tokens)
                     if len(t) > 2 and t not in (w1, w2, "the", "and", "for", "with", "this", "that")
@@ -126,40 +218,58 @@ def verify_claim_against_chunks(
                     return (
                         ClaimStatus.CONTRADICTED,
                         chunk,
-                        f"Claim directly contradicts chunk {chunk.chunk_id}: asserts '{w1}' while evidence states '{w2}'.",
+                        f"Lexical Claim Grounding contradiction: claim asserts '{w1}' while evidence states '{w2}' (chunk {chunk.chunk_id}).",
                     )
 
-        # Check numeric contradictions (e.g. claim says 55% while chunk says 42.1%)
-        chunk_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", chunk_text_lower))
-        claim_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", claim_lower))
-        if claim_numbers and chunk_numbers and not claim_numbers.intersection(chunk_numbers):
-            shared_words = claim_tokens.intersection(chunk_tokens) - claim_numbers
-            if len(shared_words) >= 4:
+        # 2. Numerical / Monetary / Quantitative Conflict Check (e.g. $100M vs $80M)
+        claim_amounts = {
+            a.strip(".,;:!?")
+            for a in re.findall(r"\$?\d+(?:\.\d+)?(?:%|[bkmBKM]|(?:\s*(?:million|billion|thousand)))?\b", claim_lower)
+            if a.strip(".,;:!?")
+        }
+        chunk_amounts = {
+            a.strip(".,;:!?")
+            for a in re.findall(r"\$?\d+(?:\.\d+)?(?:%|[bkmBKM]|(?:\s*(?:million|billion|thousand)))?\b", chunk_text_lower)
+            if a.strip(".,;:!?")
+        }
+
+        if claim_amounts and chunk_amounts and not claim_amounts.intersection(chunk_amounts):
+            # Contradiction requires shared subject/noun entities, not just common predicate verbs
+            predicate_verbs = (
+                "the", "and", "for", "with", "this", "that", "was", "were", "are", "is",
+                "has", "had", "have", "been", "increased", "decreased", "grew", "rose",
+                "fell", "dropped", "added", "expanded", "reported", "reached", "to", "by",
+            )
+            shared_topic = {
+                t for t in claim_tokens.intersection(chunk_tokens)
+                if len(t) > 2 and t not in predicate_verbs
+            }
+            if shared_topic:
                 return (
                     ClaimStatus.CONTRADICTED,
                     chunk,
-                    f"Numerical conflict with chunk {chunk.chunk_id}: claim states {claim_numbers} while evidence records {chunk_numbers}.",
+                    f"Numerical conflict with chunk {chunk.chunk_id}: claim asserts {claim_amounts} while evidence states {chunk_amounts}.",
                 )
 
-        # Calculate semantic token overlap
+        # 3. Normalized Token / Entity Alignment
         if claim_tokens:
             overlap = len(claim_tokens.intersection(chunk_tokens)) / len(claim_tokens)
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_match_chunk = chunk
 
-    # Supported threshold: key entities and > 50% non-trivial tokens match chunk
-    if best_overlap >= 0.50 and best_match_chunk is not None:
+    # Supported threshold: key entities and >= 45% normalized token alignment
+    if best_overlap >= 0.45 and best_match_chunk is not None:
         return (
             ClaimStatus.SUPPORTED,
             best_match_chunk,
-            f"Supported by chunk {best_match_chunk.chunk_id} ({round(best_overlap * 100, 1)}% token alignment).",
+            f"Supported by chunk {best_match_chunk.chunk_id} ({round(best_overlap * 100, 1)}% lexical grounding).",
         )
 
     return (
         ClaimStatus.UNSUPPORTED,
         None,
-        f"Unsupported: no retrieved chunk substantiates claim (max alignment {round(best_overlap * 100, 1)}%).",
+        f"Unsupported: no retrieved chunk substantiates claim (max lexical alignment {round(best_overlap * 100, 1)}%).",
     )
 
 
@@ -172,12 +282,25 @@ def is_evidence_match(gold: DocumentReference, chunk: RetrievedChunk) -> bool:
     return True
 
 
+def wilson_score_interval(p: float, n: int, confidence: float = 0.95) -> tuple[float, float]:
+    """Compute the Wilson score confidence interval for a binomial proportion."""
+    if n <= 0:
+        return (0.0, 0.0)
+    z = 1.95996  # 95% standard normal quantile
+    denominator = 1.0 + (z**2) / n
+    centre = (p + (z**2) / (2 * n)) / denominator
+    half_width = (z / denominator) * math.sqrt((p * (1.0 - p) / n) + ((z**2) / (4 * (n**2))))
+    lower = max(0.0, round(centre - half_width, 4))
+    upper = min(1.0, round(centre + half_width, 4))
+    return (lower, upper)
+
+
 class BaseMetric(ABC):
     """Abstract base metric evaluator."""
 
     name: str
     family: MetricFamily
-    version: str = "2.0.0"
+    version: str = "2.1.0"
 
     @abstractmethod
     async def compute(self, trace: RagTrace, case: TestCase) -> MetricResult:
@@ -199,8 +322,9 @@ class RecallAtKMetric(BaseMetric):
             return MetricResult(
                 metric_name=self.name,
                 metric_family=self.family,
-                score=1.0,
-                reason="No relevant documents specified in golden test case.",
+                score=None,
+                status=MetricStatus.NOT_APPLICABLE,
+                reason="No relevant gold documents specified in test case.",
                 evaluator_version=self.version,
             )
 
@@ -225,6 +349,7 @@ class RecallAtKMetric(BaseMetric):
             metric_name=self.name,
             metric_family=self.family,
             score=round(score, 4),
+            status=MetricStatus.PASS if score >= 0.70 else MetricStatus.FAIL,
             reason=f"Found {matched_gold}/{len(gold_refs)} gold evidence targets ({spec_level}-level) in top-{self.k}.",
             evaluator_version=self.version,
             metadata={
@@ -249,8 +374,9 @@ class MeanReciprocalRankMetric(BaseMetric):
             return MetricResult(
                 metric_name=self.name,
                 metric_family=self.family,
-                score=1.0,
-                reason="No golden documents required.",
+                score=None,
+                status=MetricStatus.NOT_APPLICABLE,
+                reason="No golden documents required for query.",
                 evaluator_version=self.version,
             )
 
@@ -262,6 +388,7 @@ class MeanReciprocalRankMetric(BaseMetric):
                     metric_name=self.name,
                     metric_family=self.family,
                     score=round(rr, 4),
+                    status=MetricStatus.PASS if rr >= 0.50 else MetricStatus.FAIL,
                     reason=f"First relevant evidence '{chunk.document_id}:{chunk.chunk_id}' found at rank {chunk.rank}.",
                     evaluator_version=self.version,
                 )
@@ -270,6 +397,7 @@ class MeanReciprocalRankMetric(BaseMetric):
             metric_name=self.name,
             metric_family=self.family,
             score=0.0,
+            status=MetricStatus.FAIL,
             reason="No golden evidence targets found in retrieved chunks.",
             evaluator_version=self.version,
         )
@@ -283,12 +411,23 @@ class ContextualPrecisionMetric(BaseMetric):
         self.family = MetricFamily.RETRIEVAL
 
     async def compute(self, trace: RagTrace, case: TestCase) -> MetricResult:
-        if not trace.retrieved_chunks or not case.relevant_documents:
+        if not case.relevant_documents:
             return MetricResult(
                 metric_name=self.name,
                 metric_family=self.family,
-                score=1.0,
-                reason="Trivially satisfied: no retrieved chunks or no golden references.",
+                score=None,
+                status=MetricStatus.NOT_APPLICABLE,
+                reason="No gold evidence was supplied.",
+                evaluator_version=self.version,
+            )
+
+        if not trace.retrieved_chunks:
+            return MetricResult(
+                metric_name=self.name,
+                metric_family=self.family,
+                score=None,
+                status=MetricStatus.INSUFFICIENT_DATA,
+                reason="No retrieved chunks available to evaluate contextual precision.",
                 evaluator_version=self.version,
             )
 
@@ -306,6 +445,7 @@ class ContextualPrecisionMetric(BaseMetric):
             metric_name=self.name,
             metric_family=self.family,
             score=round(score, 4),
+            status=MetricStatus.PASS if score >= 0.60 else MetricStatus.FAIL,
             reason=f"Precision computed across {len(precisions)} relevant evidence chunk hits.",
             evaluator_version=self.version,
         )
@@ -320,22 +460,22 @@ class FaithfulnessMetric(BaseMetric):
         self.family = MetricFamily.GENERATION
 
     async def compute(self, trace: RagTrace, case: TestCase) -> MetricResult:
-        # Separate abstention dimension from faithfulness:
         if trace.abstained:
             if case.answerability == Answerability.UNANSWERABLE:
                 return MetricResult(
                     metric_name=self.name,
                     metric_family=self.family,
                     score=1.0,
+                    status=MetricStatus.PASS,
                     reason="Correctly abstained on unanswerable query; zero hallucinated claims produced.",
                     evaluator_version=self.version,
                     metadata={"claims": [], "abstained": True, "is_refusal": True},
                 )
-            # Falsely abstained: no claims generated
             return MetricResult(
                 metric_name=self.name,
                 metric_family=self.family,
                 score=0.0,
+                status=MetricStatus.FAIL,
                 reason="System abstained on an answerable query; no grounded claims produced.",
                 evaluator_version=self.version,
                 metadata={"claims": [], "abstained": True},
@@ -346,6 +486,7 @@ class FaithfulnessMetric(BaseMetric):
                 metric_name=self.name,
                 metric_family=self.family,
                 score=0.0,
+                status=MetricStatus.FAIL,
                 reason="Answer is empty; no claims produced.",
                 evaluator_version=self.version,
                 metadata={"claims": []},
@@ -356,6 +497,7 @@ class FaithfulnessMetric(BaseMetric):
                 metric_name=self.name,
                 metric_family=self.family,
                 score=0.0,
+                status=MetricStatus.FAIL,
                 reason="No retrieved context available to support answer claims.",
                 evaluator_version=self.version,
                 metadata={"claims": []},
@@ -368,6 +510,7 @@ class FaithfulnessMetric(BaseMetric):
                 metric_name=self.name,
                 metric_family=self.family,
                 score=1.0,
+                status=MetricStatus.PASS,
                 reason="No verifiable factual claims detected in response.",
                 evaluator_version=self.version,
                 metadata={"claims": []},
@@ -387,6 +530,7 @@ class FaithfulnessMetric(BaseMetric):
                     status=status,
                     supporting_chunk_id=matched_chunk.chunk_id if matched_chunk else None,
                     confidence=0.95 if status == ClaimStatus.SUPPORTED else 0.90,
+                    confidence_type="heuristic",
                     reason=reason,
                 )
             )
@@ -396,7 +540,6 @@ class FaithfulnessMetric(BaseMetric):
                 contradiction_count += 1
 
         raw_score = supported_count / len(claims)
-        # Apply contradiction penalty
         penalty = 0.25 * contradiction_count
         final_score = max(0.0, round(raw_score - penalty, 4))
 
@@ -404,7 +547,8 @@ class FaithfulnessMetric(BaseMetric):
             metric_name=self.name,
             metric_family=self.family,
             score=final_score,
-            reason=f"Claim-level verdict: {supported_count}/{len(claims)} supported, {contradiction_count} contradicted.",
+            status=MetricStatus.PASS if final_score >= 0.70 else MetricStatus.FAIL,
+            reason=f"Lexical Claim Grounding verdict: {supported_count}/{len(claims)} supported, {contradiction_count} contradicted.",
             evaluator_version=self.version,
             metadata={
                 "total_claims": len(claims),
@@ -428,7 +572,8 @@ class AnswerCorrectnessMetric(BaseMetric):
             return MetricResult(
                 metric_name=self.name,
                 metric_family=self.family,
-                score=1.0,
+                score=None,
+                status=MetricStatus.NOT_APPLICABLE,
                 reason="No expected answer or expected facts specified in golden test case.",
                 evaluator_version=self.version,
             )
@@ -439,6 +584,7 @@ class AnswerCorrectnessMetric(BaseMetric):
                 metric_name=self.name,
                 metric_family=self.family,
                 score=score,
+                status=MetricStatus.PASS if score >= 0.70 else MetricStatus.FAIL,
                 reason="Answer is empty.",
                 evaluator_version=self.version,
             )
@@ -447,12 +593,13 @@ class AnswerCorrectnessMetric(BaseMetric):
         fact_coverage = 1.0
         covered_facts: list[str] = []
         missing_facts: list[str] = []
-        ans_lower = trace.answer.lower()
+        ans_norm = normalize_text_equivalences(trace.answer)
 
         if case.expected_facts:
             for fact in case.expected_facts:
-                fact_tokens = [w for w in re.findall(r"\w+", fact.lower()) if len(w) > 2]
-                if fact_tokens and all(w in ans_lower for w in fact_tokens[: max(1, int(len(fact_tokens) * 0.7))]):
+                fact_norm = normalize_text_equivalences(fact)
+                fact_tokens = [w for w in re.findall(r"\w+", fact_norm) if len(w) > 2]
+                if fact_tokens and all(w in ans_norm for w in fact_tokens[: max(1, int(len(fact_tokens) * 0.7))]):
                     covered_facts.append(fact)
                 else:
                     missing_facts.append(fact)
@@ -461,8 +608,8 @@ class AnswerCorrectnessMetric(BaseMetric):
         # 2. Token / Entity F1
         token_f1 = 1.0
         if case.expected_answer:
-            ans_words = set(re.findall(r"\w+", ans_lower))
-            exp_words = set(re.findall(r"\w+", case.expected_answer.lower()))
+            ans_words = set(re.findall(r"\w+", ans_norm))
+            exp_words = set(re.findall(r"\w+", normalize_text_equivalences(case.expected_answer)))
 
             if ans_words and exp_words:
                 intersection = ans_words.intersection(exp_words)
@@ -472,7 +619,6 @@ class AnswerCorrectnessMetric(BaseMetric):
             else:
                 token_f1 = 0.0
 
-        # Weighted composite score
         if case.expected_facts and case.expected_answer:
             score = round(0.60 * fact_coverage + 0.40 * token_f1, 4)
             reason = f"Fact coverage: {len(covered_facts)}/{len(case.expected_facts)} ({round(fact_coverage, 2)}), Token F1: {round(token_f1, 3)}."
@@ -487,6 +633,7 @@ class AnswerCorrectnessMetric(BaseMetric):
             metric_name=self.name,
             metric_family=self.family,
             score=score,
+            status=MetricStatus.PASS if score >= 0.70 else MetricStatus.FAIL,
             reason=reason,
             evaluator_version=self.version,
             metadata={
@@ -509,10 +656,12 @@ class CitationSupportMetric(BaseMetric):
         if not trace.citations:
             claims = extract_claims(trace.answer or "")
             if claims and len(claims) > 0 and trace.answer and len(trace.answer.strip()) > 30:
+                # Factual claims were produced without citing evidence
                 return MetricResult(
                     metric_name=self.name,
                     metric_family=self.family,
-                    score=0.50,
+                    score=0.0,
+                    status=MetricStatus.FAIL,
                     reason=f"Generated {len(claims)} factual statements without citing evidence.",
                     evaluator_version=self.version,
                     metadata={"missing_citations": True},
@@ -520,7 +669,8 @@ class CitationSupportMetric(BaseMetric):
             return MetricResult(
                 metric_name=self.name,
                 metric_family=self.family,
-                score=1.0,
+                score=None,
+                status=MetricStatus.NOT_APPLICABLE,
                 reason="No citations required for query.",
                 evaluator_version=self.version,
             )
@@ -536,20 +686,22 @@ class CitationSupportMetric(BaseMetric):
             if not matched:
                 continue
 
-            claim_words = [w for w in re.findall(r"\w+", cit.claim_text.lower()) if len(w) > 2]
-            chunk_words = set(re.findall(r"\w+", matched.text.lower()))
-            if claim_words:
-                overlap = sum(1 for w in claim_words if w in chunk_words) / len(claim_words)
-                if overlap >= 0.40:
-                    valid_count += 1
-            else:
+            # Verify claim against matched chunk using the grounding evaluator
+            status, _, _ = verify_claim_against_chunks(cit.claim_text, [matched])
+            if status == ClaimStatus.SUPPORTED:
                 valid_count += 1
+            else:
+                claim_words = [w for w in re.findall(r"\w+", cit.claim_text.lower()) if len(w) > 2]
+                chunk_words = set(re.findall(r"\w+", matched.text.lower()))
+                if claim_words and sum(1 for w in claim_words if w in chunk_words) / len(claim_words) >= 0.40:
+                    valid_count += 1
 
         score = round(valid_count / total, 4)
         return MetricResult(
             metric_name=self.name,
             metric_family=self.family,
             score=score,
+            status=MetricStatus.PASS if score >= 0.70 else MetricStatus.FAIL,
             reason=f"{valid_count}/{total} citations substantiated by retrieved evidence chunks.",
             evaluator_version=self.version,
             metadata={"valid_citations": valid_count, "total_citations": total},
@@ -580,6 +732,7 @@ class AbstentionAccuracyMetric(BaseMetric):
             metric_name=self.name,
             metric_family=self.family,
             score=score,
+            status=MetricStatus.PASS if score == 1.0 else MetricStatus.FAIL,
             reason=reason,
             evaluator_version=self.version,
         )
@@ -631,6 +784,7 @@ class EvaluationEngine:
     def aggregate_run(self, traces_with_metrics: list[tuple[RagTrace, list[MetricResult]]]) -> RunMetricsSummary:
         metric_values: dict[str, list[float]] = {}
         metric_families: dict[str, MetricFamily] = {}
+        metric_total_counts: dict[str, int] = {}
         hallucinations = 0
         abstention_scores = []
         latencies = []
@@ -642,30 +796,48 @@ class EvaluationEngine:
                 total_cost += trace.cost_usd
 
             for m in m_list:
-                metric_values.setdefault(m.metric_name, []).append(m.score)
+                metric_total_counts[m.metric_name] = metric_total_counts.get(m.metric_name, 0) + 1
                 metric_families[m.metric_name] = m.metric_family
+                # Only include applicable metrics with a real numerical score
+                if m.score is not None:
+                    metric_values.setdefault(m.metric_name, []).append(m.score)
 
-                if m.metric_name == "faithfulness" and m.score < 0.60 and not trace.abstained:
+                if m.metric_name == "faithfulness" and m.score is not None and m.score < 0.60 and not trace.abstained:
                     hallucinations += 1
-                if m.metric_name == "abstention_accuracy":
+                if m.metric_name == "abstention_accuracy" and m.score is not None:
                     abstention_scores.append(m.score)
 
         summaries: dict[str, MetricSummary] = {}
-        for name, vals in metric_values.items():
-            if not vals:
+        for name, total_evals in metric_total_counts.items():
+            vals = metric_values.get(name, [])
+            n = len(vals)
+            if n == 0:
+                summaries[name] = MetricSummary(
+                    metric_name=name,
+                    metric_family=metric_families[name],
+                    mean=0.0,
+                    p50=0.0,
+                    p95=0.0,
+                    min=0.0,
+                    max=0.0,
+                    count=0,
+                    applicable_count=0,
+                    std_dev=0.0,
+                    ci_lower=0.0,
+                    ci_upper=0.0,
+                    sample_warning="No applicable test cases evaluated for this metric.",
+                )
                 continue
+
             sorted_vals = sorted(vals)
-            n = len(sorted_vals)
             mean_val = sum(vals) / n
 
             # Calculate sample standard deviation
             variance = sum((x - mean_val) ** 2 for x in vals) / (n - 1) if n > 1 else 0.0
             std_dev = math.sqrt(variance)
 
-            # 95% Confidence Interval (z = 1.96)
-            margin_error = 1.96 * (std_dev / math.sqrt(n)) if n > 0 else 0.0
-            ci_lower = max(0.0, round(mean_val - margin_error, 4))
-            ci_upper = min(1.0, round(mean_val + margin_error, 4))
+            # Wilson score interval for bounded proportion metrics
+            ci_lower, ci_upper = wilson_score_interval(mean_val, n)
 
             p50_idx = int(n * 0.50)
             p95_idx = min(int(n * 0.95), n - 1)
@@ -685,6 +857,7 @@ class EvaluationEngine:
                 min=round(sorted_vals[0], 4),
                 max=round(sorted_vals[-1], 4),
                 count=n,
+                applicable_count=n,
                 std_dev=round(std_dev, 4),
                 ci_lower=ci_lower,
                 ci_upper=ci_upper,

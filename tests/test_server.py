@@ -119,3 +119,27 @@ def test_server_project_and_dataset_endpoints():
     dash_resp = client.get("/dashboard")
     assert dash_resp.status_code == 200
     assert "RAG Reliability Platform" in dash_resp.text
+
+    # 9. Asynchronous 202 Accepted run execution
+    async_resp = client.post(
+        "/v1/runs",
+        json={
+            "project_id": proj_id,
+            "dataset_id": ds_id,
+            "system_version": "rag_async_test",
+            "mock_mode": SyntheticRagMode.PERFECT.value,
+            "async_exec": True,
+        },
+    )
+    assert async_resp.status_code == 202
+    async_data = async_resp.json()
+    assert async_data["status"] == "QUEUED"
+    assert "run_id" in async_data
+
+    # 10. Pagination on collection endpoints
+    list_resp = client.get(f"/v1/runs?project_id={proj_id}&limit=1&offset=0")
+    assert list_resp.status_code == 200
+    list_data = list_resp.json()
+    assert len(list_data["runs"]) == 1
+    assert list_data["limit"] == 1
+
