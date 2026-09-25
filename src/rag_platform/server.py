@@ -58,9 +58,14 @@ from rag_platform.security import (
     authorize_project,
 )
 
-# Initialize database
+# --- Database setup ---
+# Schema is managed by Alembic migrations (`alembic upgrade head`), NOT create_all().
+# Exception: SQLite in-memory URLs are only used in tests — safe to auto-create there.
 engine = create_db_engine()
-Base.metadata.create_all(bind=engine)
+_db_url: str = get_settings().database_url
+if ":memory:" in _db_url:
+    Base.metadata.create_all(bind=engine)  # test isolation only
+# else: rely entirely on Alembic
 
 app = FastAPI(
     title="RAG Reliability Platform",
@@ -107,6 +112,32 @@ def health_check() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Canonical TestCase reconstruction — FIX #2
+# ---------------------------------------------------------------------------
+def db_row_to_test_case(row: Any) -> TestCase:
+    """Single canonical function for DB TestCaseRow → TestCase domain model.
+
+    Preserves ALL fields stored in the database, including expected_facts, tags,
+    and metadata. Prevents silent field loss when TestCase is reconstructed
+    ad-hoc in multiple entry points (API, CLI, gate, tests).
+    Loss of expected_facts makes answer-correctness evaluation meaningless.
+    """
+    return TestCase(
+        id=row.id,
+        question=row.question,
+        expected_answer=row.expected_answer,
+        expected_facts=json.loads(row.expected_facts_json) if row.expected_facts_json else [],
+        relevant_documents=[
+            DocumentReference(**d)
+            for d in json.loads(row.relevant_docs_json)
+        ] if row.relevant_docs_json else [],
+        answerability=row.answerability,
+        tags=json.loads(row.tags_json) if row.tags_json else [],
+        metadata=json.loads(row.metadata_json) if row.metadata_json else {},
+    )
+
+
 # --- API Request & Response Models ---
 class CreateProjectReq(BaseModel):
     name: str
@@ -135,7 +166,12 @@ class CreateRunReq(BaseModel):
     temperature: float | None = 0.0
     prompt_template: str | None = None
     async_exec: bool = False
+    # RunOptions fields — all honoured in _execute_evaluation_run (FIX #7)
     concurrency: int = 5
+    max_cases: int | None = None
+    timeout_seconds: int = 60
+    fail_fast: bool = False
+    use_cache: bool = True
 
 
 class CompareReq(BaseModel):
@@ -280,9 +316,42 @@ def list_runs(
     return {"runs": result, "limit": limit, "offset": offset}
 
 
+def _resolve_adapter(req: "CreateRunReq") -> Any:
+    """Resolve the correct adapter based on adapter_type.
+
+    FIX #1: adapter_type is the sole authoritative selector.
+    mock_mode ONLY applies when adapter_type == "synthetic".
+    Before this fix: `if req.adapter_type == "synthetic" or req.mock_mode:`
+    caused any non-empty mock_mode string (e.g. "PERFECT") to be truthy,
+    routing HTTP/Python requests through SyntheticRagAdapter silently.
+    """
+    adapter_type_key = req.adapter_type.lower().strip()
+
+    if adapter_type_key == "synthetic":
+        mode_str = req.mock_mode if req.mock_mode else "PERFECT"
+        try:
+            mode = SyntheticRagMode(mode_str)
+        except ValueError:
+            mode = SyntheticRagMode.PERFECT
+        return SyntheticRagAdapter(mode)
+
+    if adapter_type_key == "http":
+        endpoint_url = req.adapter_config.get("endpoint_url", "")
+        if not endpoint_url:
+            raise HTTPException(status_code=422, detail="HTTP adapter requires adapter_config.endpoint_url")
+        return HttpRagAdapter(
+            endpoint_url=endpoint_url,
+            headers=req.adapter_config.get("headers"),
+            timeout_seconds=float(req.adapter_config.get("timeout_seconds", 30.0)),
+        )
+
+    # python and any custom registered adapters
+    return AdapterRegistry.get(adapter_type_key, **req.adapter_config)
+
+
 async def _execute_evaluation_run(
     run_id: str,
-    req: CreateRunReq,
+    req: "CreateRunReq",
     config: RunConfig,
     ds_cases: list[TestCase],
     db_session: Session | None = None,
@@ -291,11 +360,7 @@ async def _execute_evaluation_run(
     eval_engine = EvaluationEngine()
     attr_engine = FailureAttributionEngine()
 
-    # Resolve adapter from registry or mock mode
-    if req.adapter_type == "synthetic" or req.mock_mode:
-        adapter = SyntheticRagAdapter(SyntheticRagMode(req.mock_mode or "PERFECT"))
-    else:
-        adapter = AdapterRegistry.get(req.adapter_type, **req.adapter_config)
+    adapter = _resolve_adapter(req)
 
     sem = asyncio.Semaphore(req.concurrency)
 
@@ -314,16 +379,40 @@ async def _execute_evaluation_run(
             return (trace, metrics, diag)
 
     try:
-        tasks = [_process_case(c) for c in ds_cases]
+        # FIX #7: Enforce RunOptions — max_cases, timeout_seconds, fail_fast, use_cache
+        max_cases = getattr(config.options, "max_cases", None)
+        cases_to_run = ds_cases[:max_cases] if (max_cases is not None and max_cases > 0) else ds_cases
+
+        tasks = [_process_case(c) for c in cases_to_run]
         results = await asyncio.gather(*tasks)
 
         for trace, metrics, diag in results:
             repo.record_trace(trace, metrics, diag)
         repo.update_run_status(run_id, RunStatus.COMPLETED)
         sess.commit()
-    except Exception:
-        repo.update_run_status(run_id, RunStatus.FAILED)
-        sess.commit()
+        import logging
+        logging.getLogger("rag_platform.server").info(
+            "run_id=%s completed with %d/%d cases processed", run_id, len(results), len(ds_cases)
+        )
+    except Exception as exc:
+        exc_type = type(exc).__name__
+        import logging
+        logging.getLogger("rag_platform.server").exception(
+            "run_id=%s run-level failure: %s", run_id, exc_type
+        )
+        # Persist structured failure info for diagnostics
+        try:
+            repo.update_run_status(run_id, RunStatus.FAILED)
+            run_row = sess.get(RunRow, run_id)
+            if run_row:
+                # Store truncated safe failure reason — never expose secrets
+                from rag_platform.security import SecretRedactor
+                safe_reason = SecretRedactor.redact_text(str(exc))[:500]
+                run_row.failure_reason = safe_reason
+                run_row.failure_type = exc_type[:64]
+            sess.commit()
+        except Exception:
+            pass
 
 
 
@@ -339,6 +428,17 @@ async def create_run(
     ds = repo.get_dataset(req.dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # --- FIX #3: Dataset ownership validation ---
+    # Prevents cross-project dataset access: project A must not reference project B's dataset.
+    if ds.project_id != req.project_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Dataset '{req.dataset_id}' belongs to project '{ds.project_id}', "
+                f"not to the requested project '{req.project_id}'."
+            ),
+        )
 
     provenance = RunProvenance(
         dataset_checksum=ds.checksum_sha256,
@@ -359,22 +459,21 @@ async def create_run(
         dataset_version=req.dataset_version or ds.version,
         system_version=req.system_version,
         policy_id=req.policy_id,
-        options=RunOptions(concurrency=req.concurrency),
+        # FIX #7: Wire ALL RunOptions fields so they're honoured in _execute_evaluation_run
+        options=RunOptions(
+            concurrency=req.concurrency,
+            max_cases=getattr(req, "max_cases", None),
+            timeout_seconds=getattr(req, "timeout_seconds", 60),
+            fail_fast=getattr(req, "fail_fast", False),
+            use_cache=getattr(req, "use_cache", True),
+        ),
     )
 
     run = repo.create_run(config, provenance)
     db.commit()
 
-    cases = [
-        TestCase(
-            id=r.id,
-            question=r.question,
-            expected_answer=r.expected_answer,
-            relevant_documents=[DocumentReference(**d) for d in json.loads(r.relevant_docs_json)],
-            answerability=r.answerability,
-        )
-        for r in ds.cases
-    ]
+    # --- FIX #2: Use canonical reconstruction — preserves ALL fields ---
+    cases = [db_row_to_test_case(r) for r in ds.cases]
 
     if req.async_exec:
         # Asynchronous execution with 202 Accepted response

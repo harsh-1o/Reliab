@@ -64,7 +64,7 @@ class DatasetRow(Base):
     __tablename__ = "datasets"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     version: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default=DatasetStatus.DRAFT.value)
@@ -97,8 +97,8 @@ class RunRow(Base):
     __tablename__ = "runs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False, index=True)
     system_version: Mapped[str] = mapped_column(String(128), nullable=False)
     
     # 6-Dimension Provenance
@@ -114,6 +114,9 @@ class RunRow(Base):
     policy_id: Mapped[str] = mapped_column(String(64), default="prod-default")
     suite: Mapped[str] = mapped_column(String(64), default="full")
     options_json: Mapped[str] = mapped_column(Text, default="{}")
+    # Structured failure info (FIX #6): preserved when a run fails instead of silent exception swallow
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -126,8 +129,8 @@ class TraceRow(Base):
     __tablename__ = "traces"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False)
-    test_case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    test_case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     abstained: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -149,7 +152,7 @@ class MetricResultRow(Base):
     __tablename__ = "metric_results"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    trace_id: Mapped[str] = mapped_column(ForeignKey("traces.id"), nullable=False)
+    trace_id: Mapped[str] = mapped_column(ForeignKey("traces.id"), nullable=False, index=True)
     run_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
     metric_family: Mapped[str] = mapped_column(String(32), nullable=False)

@@ -27,7 +27,11 @@ class AuthorizationError(PlatformError): pass
 
 # --- IDs ---
 def generate_id(prefix: str = "id") -> str:
-    """Generate a collision-resistant pseudorandom entity identifier using UUID4."""
+    """Generate a collision-resistant pseudorandom entity identifier using UUID4.
+
+    Note: UUID4 identifiers are NOT time-sortable. Use `generate_ordered_id` when
+    lexicographic ordering by creation time is required.
+    """
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
@@ -78,6 +82,26 @@ def compute_manifest_hash(
     return sha256_hash(canonical_json(payload))
 
 # --- Config ---
+def _resolve_api_key() -> str:
+    """Resolve API key from environment.
+
+    Fails startup with a clear error if running in production mode (DEV_MODE=false / AUTH_ENABLED=true)
+    and no key is configured, preventing a silent insecure default.
+    """
+    key = os.getenv("RAG_PLATFORM_API_KEY", "")
+    auth_enabled = os.getenv("AUTH_ENABLED", "false").lower() in ("true", "1")
+    dev_mode = os.getenv("DEV_MODE", "true").lower() in ("true", "1")
+
+    if auth_enabled and not dev_mode:
+        if not key or len(key) < 32:
+            raise RuntimeError(
+                "STARTUP FAILURE: AUTH_ENABLED=true but RAG_PLATFORM_API_KEY is not set or is too short (<32 chars). "
+                "Set a strong secret via RAG_PLATFORM_API_KEY env variable, or set DEV_MODE=true for local development."
+            )
+    # Development-mode fallback (never used when auth is enforced)
+    return key or "dev-secret-key-REPLACE-IN-PRODUCTION-32+"
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str = field(
@@ -86,9 +110,7 @@ class Settings:
     auth_enabled: bool = field(
         default_factory=lambda: os.getenv("AUTH_ENABLED", "false").lower() in ("true", "1")
     )
-    api_key: str = field(
-        default_factory=lambda: os.getenv("RAG_PLATFORM_API_KEY", "dev-secret-key-32chars-min-ok")
-    )
+    api_key: str = field(default_factory=_resolve_api_key)
     dev_mode: bool = field(
         default_factory=lambda: os.getenv("DEV_MODE", "true").lower() in ("true", "1")
     )
