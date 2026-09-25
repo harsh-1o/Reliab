@@ -19,11 +19,11 @@ class MetricDelta(BaseModel):
     """Calculated difference between baseline and candidate for a single metric."""
 
     metric_name: str
-    baseline: float
-    candidate: float
-    delta_abs: float
+    baseline: float | None = None
+    candidate: float | None = None
+    delta_abs: float | None = None
     delta_pct: float | None = None
-    direction: str = "UNCHANGED"  # "IMPROVED", "REGRESSED", "UNCHANGED"
+    direction: str = "UNCHANGED"  # "IMPROVED", "REGRESSED", "UNCHANGED", "NOT_APPLICABLE", "BASELINE_MISSING", "CANDIDATE_MISSING"
     sample_size_baseline: int = 0
     sample_size_candidate: int = 0
 
@@ -54,8 +54,8 @@ class RegressionEngine:
         candidate_summary: RunMetricsSummary,
         baseline_run_id: str,
         candidate_run_id: str,
-        baseline_case_scores: dict[str, float] | None = None,
-        candidate_case_scores: dict[str, float] | None = None,
+        baseline_case_scores: dict[str, float | None] | None = None,
+        candidate_case_scores: dict[str, float | None] | None = None,
         per_case_threshold: float = 0.15,
     ) -> RunComparison:
         """Calculate metric deltas and detect per-case regressions and recoveries."""
@@ -67,8 +67,51 @@ class RegressionEngine:
             b_metric = baseline_summary.metrics.get(m_name)
             c_metric = candidate_summary.metrics.get(m_name)
 
-            b_val = b_metric.mean if b_metric else 0.0
-            c_val = c_metric.mean if c_metric else 0.0
+            b_has = b_metric is not None and b_metric.count > 0
+            c_has = c_metric is not None and c_metric.count > 0
+
+            if not b_has and not c_has:
+                deltas[m_name] = MetricDelta(
+                    metric_name=m_name,
+                    baseline=None,
+                    candidate=None,
+                    delta_abs=None,
+                    delta_pct=None,
+                    direction="NOT_APPLICABLE",
+                    sample_size_baseline=0,
+                    sample_size_candidate=0,
+                )
+                continue
+
+            if not b_has and c_has:
+                deltas[m_name] = MetricDelta(
+                    metric_name=m_name,
+                    baseline=None,
+                    candidate=round(c_metric.mean, 4),
+                    delta_abs=None,
+                    delta_pct=None,
+                    direction="BASELINE_MISSING",
+                    sample_size_baseline=0,
+                    sample_size_candidate=c_metric.count,
+                )
+                continue
+
+            if b_has and not c_has:
+                deltas[m_name] = MetricDelta(
+                    metric_name=m_name,
+                    baseline=round(b_metric.mean, 4),
+                    candidate=None,
+                    delta_abs=None,
+                    delta_pct=None,
+                    direction="CANDIDATE_MISSING",
+                    sample_size_baseline=b_metric.count,
+                    sample_size_candidate=0,
+                )
+                continue
+
+            # Both have measurements
+            b_val = b_metric.mean
+            c_val = c_metric.mean
 
             delta_abs = round(c_val - b_val, 4)
 
@@ -106,36 +149,48 @@ class RegressionEngine:
         unchanged_fail: list[str] = []
         transitions: dict[str, dict[str, Any]] = {}
 
-        if baseline_case_scores and candidate_case_scores:
-            common_cases = set(baseline_case_scores.keys()).intersection(candidate_case_scores.keys())
+        if baseline_case_scores is not None and candidate_case_scores is not None:
+            common_cases = set(baseline_case_scores.keys()).union(candidate_case_scores.keys())
             for cid in common_cases:
-                b_score = baseline_case_scores[cid]
-                c_score = candidate_case_scores[cid]
-                score_drop = round(b_score - c_score, 4)
+                b_score = baseline_case_scores.get(cid)
+                c_score = candidate_case_scores.get(cid)
 
-                b_pass = b_score >= 0.70
-                c_pass = c_score >= 0.70
-
-                if (b_pass and not c_pass) or score_drop >= per_case_threshold:
-                    trans_status = "NEW_FAILURE"
-                    newly_failed.append(cid)
-                elif (not b_pass and c_pass) or (c_score - b_score) >= per_case_threshold:
-                    trans_status = "RECOVERED"
-                    recovered.append(cid)
-                elif b_pass and c_pass:
-                    trans_status = "UNCHANGED_PASS"
-                    unchanged_pass.append(cid)
-                    unchanged.append(cid)
+                if b_score is None and c_score is None:
+                    trans_status = "NOT_APPLICABLE"
+                    score_delta = None
+                elif b_score is None:
+                    trans_status = "BASELINE_MISSING"
+                    score_delta = None
+                elif c_score is None:
+                    trans_status = "CANDIDATE_MISSING"
+                    score_delta = None
                 else:
-                    trans_status = "UNCHANGED_FAIL"
-                    unchanged_fail.append(cid)
-                    unchanged.append(cid)
+                    score_drop = round(b_score - c_score, 4)
+                    score_delta = round(c_score - b_score, 4)
+
+                    b_pass = b_score >= 0.70
+                    c_pass = c_score >= 0.70
+
+                    if (b_pass and not c_pass) or score_drop >= per_case_threshold:
+                        trans_status = "NEW_FAILURE"
+                        newly_failed.append(cid)
+                    elif (not b_pass and c_pass) or (c_score - b_score) >= per_case_threshold:
+                        trans_status = "RECOVERED"
+                        recovered.append(cid)
+                    elif b_pass and c_pass:
+                        trans_status = "UNCHANGED_PASS"
+                        unchanged_pass.append(cid)
+                        unchanged.append(cid)
+                    else:
+                        trans_status = "UNCHANGED_FAIL"
+                        unchanged_fail.append(cid)
+                        unchanged.append(cid)
 
                 transitions[cid] = {
                     "case_id": cid,
                     "baseline_score": b_score,
                     "candidate_score": c_score,
-                    "score_delta": round(c_score - b_score, 4),
+                    "score_delta": score_delta,
                     "transition": trans_status,
                 }
 
@@ -168,35 +223,53 @@ class RegressionEngine:
 
         # 1. Faithfulness Threshold
         cand_faith = candidate.metrics.get("faithfulness")
-        faith_val = cand_faith.mean if cand_faith else 0.0
-        if faith_val < policy.min_faithfulness:
+        if cand_faith is None or cand_faith.count == 0:
             violations.append(
                 GateViolation(
                     metric_name="faithfulness",
-                    candidate_value=faith_val,
+                    candidate_value=None,
+                    threshold=policy.min_faithfulness,
+                    violation_type="MISSING_DATA",
+                    message=f"Faithfulness metric is missing or unmeasured; cannot satisfy required minimum {policy.min_faithfulness:.3f}.",
+                )
+            )
+        elif cand_faith.mean < policy.min_faithfulness:
+            violations.append(
+                GateViolation(
+                    metric_name="faithfulness",
+                    candidate_value=cand_faith.mean,
                     threshold=policy.min_faithfulness,
                     violation_type="THRESHOLD_BREACH",
-                    message=f"Faithfulness {faith_val:.3f} fell below required minimum {policy.min_faithfulness:.3f}.",
+                    message=f"Faithfulness {cand_faith.mean:.3f} fell below required minimum {policy.min_faithfulness:.3f}.",
                 )
             )
 
         # 2. Retrieval Recall Threshold
         cand_recall = candidate.metrics.get("recall_at_5")
-        recall_val = cand_recall.mean if cand_recall else 0.0
-        if recall_val < policy.min_retrieval_recall:
+        if cand_recall is None or cand_recall.count == 0:
             violations.append(
                 GateViolation(
                     metric_name="recall_at_5",
-                    candidate_value=recall_val,
+                    candidate_value=None,
+                    threshold=policy.min_retrieval_recall,
+                    violation_type="MISSING_DATA",
+                    message=f"Recall@5 metric is missing or unmeasured; cannot satisfy required minimum {policy.min_retrieval_recall:.3f}.",
+                )
+            )
+        elif cand_recall.mean < policy.min_retrieval_recall:
+            violations.append(
+                GateViolation(
+                    metric_name="recall_at_5",
+                    candidate_value=cand_recall.mean,
                     threshold=policy.min_retrieval_recall,
                     violation_type="THRESHOLD_BREACH",
-                    message=f"Recall@5 {recall_val:.3f} fell below required minimum {policy.min_retrieval_recall:.3f}.",
+                    message=f"Recall@5 {cand_recall.mean:.3f} fell below required minimum {policy.min_retrieval_recall:.3f}.",
                 )
             )
 
         # 3. Citation Accuracy Threshold
         cand_cit = candidate.metrics.get("citation_accuracy")
-        if cand_cit and cand_cit.mean < policy.min_citation_accuracy:
+        if cand_cit and cand_cit.count > 0 and cand_cit.mean < policy.min_citation_accuracy:
             violations.append(
                 GateViolation(
                     metric_name="citation_accuracy",

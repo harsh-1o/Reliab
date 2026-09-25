@@ -426,7 +426,7 @@ class ReleasePolicy(BaseModel):
 class GateViolation(BaseModel):
     metric_name: str
     baseline_value: float | None = None
-    candidate_value: float
+    candidate_value: float | None = None
     threshold: float
     violation_type: str
     message: str

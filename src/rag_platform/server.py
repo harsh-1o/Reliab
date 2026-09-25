@@ -16,7 +16,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Qu
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from rag_platform.adapters import (
@@ -36,6 +36,7 @@ from rag_platform.db import (
     FailureRow,
     ProjectRow,
     RunRow,
+    TraceRow,
     create_db_engine,
 )
 from rag_platform.evaluators import EvaluationEngine
@@ -99,9 +100,10 @@ def create_session() -> Session:
 def get_auth(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
 ) -> SecurityContext:
     """FastAPI dependency for authentication."""
-    return authenticate_request(x_api_key=x_api_key, authorization=authorization)
+    return authenticate_request(x_api_key=x_api_key, authorization=authorization, db_session=db)
 
 
 @app.get("/health")
@@ -217,12 +219,20 @@ def list_projects(
     auth: SecurityContext = Depends(get_auth),
 ):
     query = select(ProjectRow)
+    count_query = select(func.count(ProjectRow.id))
     allowed = auth.get_authorized_projects()
     if allowed is not None:
         query = query.where(ProjectRow.id.in_(allowed))
-    query = query.offset(offset).limit(limit)
+        count_query = count_query.where(ProjectRow.id.in_(allowed))
+    total = db.scalar(count_query) or 0
+    query = query.order_by(ProjectRow.name.asc()).offset(offset).limit(limit)
     projects = db.scalars(query).all()
-    return {"projects": [{"id": p.id, "name": p.name} for p in projects], "limit": limit, "offset": offset}
+    return {
+        "projects": [{"id": p.id, "name": p.name} for p in projects],
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+    }
 
 
 @app.get("/v1/projects/{project_id}")
@@ -267,15 +277,19 @@ def list_datasets(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
+    query = select(DatasetRow)
+    count_query = select(func.count(DatasetRow.id))
     if project_id:
         authorize_project(project_id, auth, required_role=Role.VIEWER)
-        query = select(DatasetRow).where(DatasetRow.project_id == project_id)
+        query = query.where(DatasetRow.project_id == project_id)
+        count_query = count_query.where(DatasetRow.project_id == project_id)
     else:
-        query = select(DatasetRow)
         allowed = auth.get_authorized_projects()
         if allowed is not None:
             query = query.where(DatasetRow.project_id.in_(allowed))
-    query = query.offset(offset).limit(limit)
+            count_query = count_query.where(DatasetRow.project_id.in_(allowed))
+    total = db.scalar(count_query) or 0
+    query = query.order_by(DatasetRow.created_at.desc()).offset(offset).limit(limit)
     rows = db.scalars(query).all()
     return {
         "datasets": [
@@ -291,6 +305,7 @@ def list_datasets(
         ],
         "limit": limit,
         "offset": offset,
+        "total": total,
     }
 
 
@@ -324,17 +339,22 @@ def list_runs(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
+    query = select(RunRow)
+    count_query = select(func.count(RunRow.id))
     if project_id:
         authorize_project(project_id, auth, required_role=Role.VIEWER)
-        query = select(RunRow).where(RunRow.project_id == project_id).order_by(RunRow.created_at.desc())
+        query = query.where(RunRow.project_id == project_id)
+        count_query = count_query.where(RunRow.project_id == project_id)
     else:
-        query = select(RunRow).order_by(RunRow.created_at.desc())
         allowed = auth.get_authorized_projects()
         if allowed is not None:
             query = query.where(RunRow.project_id.in_(allowed))
-    query = query.offset(offset).limit(limit)
+            count_query = count_query.where(RunRow.project_id.in_(allowed))
+    total = db.scalar(count_query) or 0
+    query = query.order_by(RunRow.created_at.desc()).offset(offset).limit(limit)
     runs = db.scalars(query).all()
     eval_engine = EvaluationEngine()
+    reg_engine = RegressionEngine()
 
     result = []
     for r in runs:
@@ -353,6 +373,14 @@ def list_runs(
             for t in r.traces
         ]
         summary = eval_engine.aggregate_run(traces) if traces else None
+        gate_res = None
+        if summary:
+            gate_res = reg_engine.evaluate_gate(
+                summary,
+                ReleasePolicy(policy_id=r.policy_id),
+                candidate_run_id=r.id,
+            ).model_dump()
+
         result.append({
             "id": r.id,
             "project_id": r.project_id,
@@ -364,8 +392,9 @@ def list_runs(
             "created_at": r.created_at.isoformat(),
             "trace_count": len(r.traces),
             "summary": summary.model_dump() if summary else None,
+            "gate_result": gate_res,
         })
-    return {"runs": result, "limit": limit, "offset": offset}
+    return {"runs": result, "limit": limit, "offset": offset, "total": total}
 
 
 def _resolve_adapter(req: "CreateRunReq") -> Any:
@@ -396,22 +425,19 @@ def _resolve_adapter(req: "CreateRunReq") -> Any:
 
     if adapter_type_key == "python":
         adapter_name = req.adapter_config.get("adapter_name")
-        target_fn = req.adapter_config.get("target_fn")
-        if target_fn is not None:
-            return PythonRagAdapter(target_fn)
-        if adapter_name:
-            try:
-                fn = PythonAdapterRegistry.get(adapter_name)
-                return PythonRagAdapter(fn)
-            except ValueError as err:
-                raise HTTPException(status_code=422, detail=str(err))
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Python adapter requires 'adapter_name' in adapter_config referencing "
-                "a pre-registered callable in PythonAdapterRegistry."
-            ),
-        )
+        if not adapter_name:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Python adapter requires 'adapter_name' in adapter_config referencing "
+                    "a pre-registered callable in PythonAdapterRegistry."
+                ),
+            )
+        try:
+            fn = PythonAdapterRegistry.get(adapter_name)
+            return PythonRagAdapter(fn)
+        except ValueError as err:
+            raise HTTPException(status_code=422, detail=str(err))
 
     # Any other custom registered adapters
     return AdapterRegistry.get(adapter_type_key, **req.adapter_config)
@@ -435,6 +461,7 @@ async def _execute_evaluation_run(
     adapter = _resolve_adapter(req)
 
     # Acquire session (respecting dependency overrides if running in test)
+    owned_session = db_session is None
     sess = db_session if db_session is not None else create_session()
     repo = DatabaseRepo(sess)
     repo.update_run_status(run_id, RunStatus.RUNNING)
@@ -587,6 +614,8 @@ async def _execute_evaluation_run(
                     await res
             except Exception:
                 pass
+        if owned_session:
+            sess.close()
 
 
 @app.post("/v1/runs")
@@ -731,6 +760,14 @@ def get_run(
         for t in run.traces
     ]
     summary = eval_engine.aggregate_run(traces) if traces else None
+    gate_res = None
+    if summary:
+        reg_engine = RegressionEngine()
+        gate_res = reg_engine.evaluate_gate(
+            summary,
+            ReleasePolicy(policy_id=run.policy_id),
+            candidate_run_id=run.id,
+        ).model_dump()
 
     return {
         "id": run.id,
@@ -743,6 +780,7 @@ def get_run(
         "created_at": run.created_at.isoformat(),
         "trace_count": len(run.traces),
         "summary": summary.model_dump() if summary else None,
+        "gate_result": gate_res,
     }
 
 
@@ -761,13 +799,20 @@ def get_run_traces(
 
     authorize_project(run.project_id, auth, required_role=Role.VIEWER)
 
-    items = []
-    traces_slice = run.traces[offset : offset + limit]
-    for t in traces_slice:
-        if failure_only and not t.failure:
-            continue
+    # Database-level filtering, count, offset, and limit
+    data_query = select(TraceRow).where(TraceRow.run_id == run_id)
+    count_query = select(func.count(TraceRow.id)).where(TraceRow.run_id == run_id)
 
-        raw = json.loads(t.raw_trace_json)
+    if failure_only:
+        data_query = data_query.join(FailureRow, TraceRow.id == FailureRow.trace_id)
+        count_query = count_query.join(FailureRow, TraceRow.id == FailureRow.trace_id)
+
+    total = db.scalar(count_query) or 0
+    traces = db.scalars(data_query.order_by(TraceRow.id.asc()).offset(offset).limit(limit)).all()
+
+    items = []
+    for t in traces:
+        raw = json.loads(t.raw_trace_json) if t.raw_trace_json else {}
         chunks = raw.get("retrieved_chunks", [])
         citations = raw.get("citations", [])
 
@@ -797,7 +842,7 @@ def get_run_traces(
             "metrics": [{"name": m.metric_name, "score": m.score, "reason": m.reason} for m in t.metrics],
             "failure": failure_obj,
         })
-    return {"run_id": run_id, "traces": items, "limit": limit, "offset": offset, "total": len(run.traces)}
+    return {"run_id": run_id, "traces": items, "limit": limit, "offset": offset, "total": total}
 
 
 @app.get("/v1/failures")
@@ -818,16 +863,22 @@ def list_failures(
         authorize_project(run.project_id, auth, required_role=Role.VIEWER)
 
     query = select(FailureRow)
+    count_query = select(func.count(FailureRow.id))
+
     if run_id:
         query = query.where(FailureRow.run_id == run_id)
+        count_query = count_query.where(FailureRow.run_id == run_id)
     elif project_id:
         query = query.join(RunRow, FailureRow.run_id == RunRow.id).where(RunRow.project_id == project_id)
+        count_query = count_query.join(RunRow, FailureRow.run_id == RunRow.id).where(RunRow.project_id == project_id)
     else:
         allowed = auth.get_authorized_projects()
         if allowed is not None:
             query = query.join(RunRow, FailureRow.run_id == RunRow.id).where(RunRow.project_id.in_(allowed))
+            count_query = count_query.join(RunRow, FailureRow.run_id == RunRow.id).where(RunRow.project_id.in_(allowed))
 
-    query = query.offset(offset).limit(limit)
+    total = db.scalar(count_query) or 0
+    query = query.order_by(FailureRow.id.desc()).offset(offset).limit(limit)
     failures = db.scalars(query).all()
     return {
         "failures": [
@@ -844,6 +895,7 @@ def list_failures(
         ],
         "limit": limit,
         "offset": offset,
+        "total": total,
     }
 
 
@@ -895,11 +947,11 @@ def compare_runs(
     c_summary = eval_engine.aggregate_run(c_traces)
 
     b_case_scores = {
-        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), 0.5)
+        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), None)
         for t in b_run.traces
     }
     c_case_scores = {
-        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), 0.5)
+        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), None)
         for t in c_run.traces
     }
 
@@ -933,6 +985,13 @@ async def seed_demo_run(
     auth: SecurityContext = Depends(get_auth),
 ):
     """Convenience helper to bootstrap an evaluation run with real data for dashboard demonstration."""
+    app_settings = get_settings()
+    if not app_settings.dev_mode and not auth.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: /v1/demo-run is only available when DEV_MODE is active or with ADMIN role.",
+        )
+
     repo = DatabaseRepo(db)
     proj = db.query(ProjectRow).filter_by(name="Enterprise Knowledge Bot").first()
     if not proj:

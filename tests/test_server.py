@@ -44,7 +44,7 @@ def test_server_project_and_dataset_endpoints():
         "version": "v1.0",
         "cases": [
             {
-                "id": "c1",
+                "id": f"{proj_id}-c1",
                 "question": "What is Q1 revenue?",
                 "expected_answer": "$10M",
                 "expected_facts": ["Q1 was $10M"],
@@ -52,7 +52,7 @@ def test_server_project_and_dataset_endpoints():
                 "answerability": "ANSWERABLE",
             },
             {
-                "id": "c2",
+                "id": f"{proj_id}-c2",
                 "question": "Where is the CEO's rocket?",
                 "expected_answer": None,
                 "answerability": "UNANSWERABLE",

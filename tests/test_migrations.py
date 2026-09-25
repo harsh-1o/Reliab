@@ -27,3 +27,6 @@ def test_alembic_upgrade_head_on_fresh_sqlite(monkeypatch, tmp_path):
     assert {"failure_reason", "failure_type"}.issubset(run_columns)
     run_indexes = {index["name"] for index in inspector.get_indexes("runs")}
     assert {"ix_runs_project_id", "ix_runs_dataset_id"}.issubset(run_indexes)
+    assert "api_keys" in inspector.get_table_names()
+    api_key_columns = {column["name"] for column in inspector.get_columns("api_keys")}
+    assert {"key_hash", "client_id", "is_admin", "project_roles_json"}.issubset(api_key_columns)

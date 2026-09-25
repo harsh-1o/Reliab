@@ -24,6 +24,7 @@ from rag_platform.core import (
     ImmutabilityError,
     generate_id,
     settings,
+    sha256_hash,
 )
 from rag_platform.security import RecursiveTraceSanitizer
 from rag_platform.models import (
@@ -177,10 +178,27 @@ class FailureRow(Base):
     trace: Mapped[TraceRow] = relationship("TraceRow", back_populates="failure")
 
 
+class ApiKeyRow(Base):
+    __tablename__ = "api_keys"
+
+    key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    project_roles_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 # --- Database Operations & Repository ---
 def create_db_engine(db_url: str | None = None):
     url = db_url or settings.database_url
     return create_engine(url, echo=False)
+
+
+def create_session(db_url: str | None = None) -> Session:
+    """Create a new SQLAlchemy session connected to the configured database."""
+    return Session(create_db_engine(db_url))
 
 
 def init_db(engine=None) -> None:
@@ -391,3 +409,27 @@ class DatabaseRepo:
             run.finished_at = datetime.now(timezone.utc)
         self.session.flush()
         return run
+
+    def create_api_key(
+        self,
+        client_id: str,
+        api_key: str | None = None,
+        project_roles: dict[str, Any] | None = None,
+        is_admin: bool = False,
+    ) -> tuple[str, ApiKeyRow]:
+        raw_key = api_key or f"rag_{generate_id('key')}"
+        key_hash = sha256_hash(raw_key)
+        roles = {p: (r.value if hasattr(r, "value") else str(r)) for p, r in (project_roles or {}).items()}
+        row = ApiKeyRow(
+            key_hash=key_hash,
+            client_id=client_id,
+            is_admin=is_admin,
+            project_roles_json=json.dumps(roles),
+        )
+        self.session.add(row)
+        self.session.flush()
+        return raw_key, row
+
+    def get_api_key(self, api_key: str) -> ApiKeyRow | None:
+        key_hash = sha256_hash(api_key)
+        return self.session.get(ApiKeyRow, key_hash)

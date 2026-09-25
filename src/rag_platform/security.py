@@ -326,9 +326,35 @@ class ClientIdentity(BaseModel):
 
 
 class ApiKeyRegistry:
-    """Registry mapping API keys to client identities and project role memberships."""
+    """Registry mapping API keys to client identities and project role memberships.
+    
+    Supports both fast in-memory registration and durable, multi-process database
+    persistence via hashed API keys (SHA-256). Raw keys are never stored in the database.
+    """
 
     _registry: dict[str, ClientIdentity] = {}
+
+    @classmethod
+    def register(
+        cls,
+        client_id: str,
+        api_key: str | None = None,
+        project_roles: dict[str, Role | str] | None = None,
+        is_admin: bool = False,
+        persist_db: bool = False,
+        db_session: Any = None,
+    ) -> str:
+        from rag_platform.core import generate_id
+        actual_key = api_key or f"rag_{generate_id('key')}"
+        cls.register_key(
+            api_key=actual_key,
+            client_id=client_id,
+            project_roles=project_roles,
+            is_admin=is_admin,
+            persist_db=persist_db,
+            db_session=db_session,
+        )
+        return actual_key
 
     @classmethod
     def register_key(
@@ -337,6 +363,8 @@ class ApiKeyRegistry:
         client_id: str,
         project_roles: dict[str, Role | str] | None = None,
         is_admin: bool = False,
+        persist_db: bool = False,
+        db_session: Any = None,
     ) -> None:
         roles: dict[str, Role] = {}
         for p_id, r in (project_roles or {}).items():
@@ -347,9 +375,66 @@ class ApiKeyRegistry:
             project_roles=roles,
         )
 
+        if persist_db or db_session is not None:
+            try:
+                import json
+                from rag_platform.core import sha256_hash
+                from rag_platform.db import ApiKeyRow, create_db_engine
+                from sqlalchemy.orm import Session
+
+                key_hash = sha256_hash(api_key)
+                roles_str = {p: r.value for p, r in roles.items()}
+                row = ApiKeyRow(
+                    key_hash=key_hash,
+                    client_id=client_id,
+                    is_admin=is_admin,
+                    project_roles_json=json.dumps(roles_str),
+                )
+                if db_session is not None:
+                    db_session.merge(row)
+                    db_session.flush()
+                else:
+                    eng = create_db_engine()
+                    with Session(eng) as s:
+                        s.merge(row)
+                        s.commit()
+            except Exception:
+                pass
+
     @classmethod
-    def get(cls, api_key: str) -> ClientIdentity | None:
-        return cls._registry.get(api_key)
+    def get(cls, api_key: str, db_session: Any = None) -> ClientIdentity | None:
+        if api_key in cls._registry:
+            return cls._registry[api_key]
+
+        # Query database for persistent key hash across processes
+        try:
+            import json
+            from rag_platform.core import sha256_hash
+            from rag_platform.db import ApiKeyRow, create_db_engine
+            from sqlalchemy.orm import Session
+
+            key_hash = sha256_hash(api_key)
+            row = None
+            if db_session is not None:
+                row = db_session.get(ApiKeyRow, key_hash)
+            else:
+                eng = create_db_engine()
+                with Session(eng) as s:
+                    row = s.get(ApiKeyRow, key_hash)
+
+            if row:
+                roles_raw = json.loads(row.project_roles_json) if row.project_roles_json else {}
+                roles = {p: Role(r) for p, r in roles_raw.items()}
+                identity = ClientIdentity(
+                    client_id=row.client_id,
+                    is_admin=row.is_admin,
+                    project_roles=roles,
+                )
+                cls._registry[api_key] = identity
+                return identity
+        except Exception:
+            pass
+        return None
 
     @classmethod
     def clear(cls) -> None:
@@ -386,6 +471,7 @@ class SecurityContext(BaseModel):
 def authenticate_request(
     x_api_key: str | None = None,
     authorization: str | None = None,
+    db_session: Any = None,
 ) -> SecurityContext:
     """Verify API credential and resolve client identity with project memberships."""
     from rag_platform.core import get_settings
@@ -407,8 +493,8 @@ def authenticate_request(
             detail="Authentication required: missing API key or Bearer token.",
         )
 
-    # 1. Check registered client keys
-    client = ApiKeyRegistry.get(token)
+    # 1. Check registered client keys (in-memory cache or persistent DB)
+    client = ApiKeyRegistry.get(token, db_session=db_session)
     if client:
         return SecurityContext(
             authenticated=True,
