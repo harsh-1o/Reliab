@@ -17,6 +17,8 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import shutil
 import socket
 import subprocess
 from unittest.mock import patch, MagicMock
@@ -522,9 +524,16 @@ class TestRealJavaScriptSecurity:
     """Executes Node.js against the real src/rag_platform/static/app.js implementation."""
 
     def test_escape_html_in_real_nodejs_environment(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        node_bin = shutil.which("node")
+        if not node_bin:
+            pytest.skip("Node.js is not installed on this system.")
+
         js_code = """
         const fs = require('fs');
-        const code = fs.readFileSync('src/rag_platform/static/app.js', 'utf8');
+        const path = require('path');
+        const appPath = path.resolve(process.cwd(), 'src', 'rag_platform', 'static', 'app.js');
+        const code = fs.readFileSync(appPath, 'utf8');
 
         // Extract escapeHtml function definition
         const fnMatch = code.match(/function escapeHtml\\([\\s\\S]*?\\}\\s*\\n/);
@@ -553,8 +562,8 @@ class TestRealJavaScriptSecurity:
         console.log('ALL_VECTORS_ESCAPED_SAFELY');
         """
         result = subprocess.run(
-            ["node", "-e", js_code],
-            cwd=r"c:\Users\Admin\Desktop\rag testing",
+            [node_bin, "-e", js_code],
+            cwd=str(repo_root),
             capture_output=True,
             text=True,
             timeout=10,
