@@ -5,15 +5,35 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from rag_platform.adapters import SyntheticRagMode
-from rag_platform.server import app
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
+from rag_platform.adapters import SyntheticRagMode
+from rag_platform.db import Base
+from rag_platform.server import app, get_db
+
+# Isolated in-memory DB shared across test requests via StaticPool
+test_engine = create_engine(
+    "sqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+Base.metadata.create_all(bind=test_engine)
+
+def override_get_db():
+    with Session(test_engine) as session:
+        yield session
+
+app.dependency_overrides[get_db] = override_get_db
 client = TestClient(app)
 
 
 def test_server_project_and_dataset_endpoints():
+    from rag_platform.core import generate_id
+    proj_name = f"API Eval Test Proj {generate_id()}"
     # 1. Create project
-    proj_resp = client.post("/v1/projects", json={"name": "API Eval Test Proj"})
+    proj_resp = client.post("/v1/projects", json={"name": proj_name})
     assert proj_resp.status_code == 200
     proj_id = proj_resp.json()["id"]
 
