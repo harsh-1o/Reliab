@@ -53,6 +53,7 @@ def compute_manifest_hash(
     prompt_hash: str,
     evaluator_version: str,
     experiment_hash: str,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> str:
     payload = {
         "dataset_checksum": dataset_checksum,
@@ -62,6 +63,8 @@ def compute_manifest_hash(
         "evaluator_version": evaluator_version,
         "experiment_hash": experiment_hash,
     }
+    if extra_metadata:
+        payload["extra_metadata"] = extra_metadata
     return sha256_hash(canonical_json(payload))
 
 # --- Config ---
@@ -69,12 +72,6 @@ def compute_manifest_hash(
 class Settings:
     database_url: str = field(
         default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///./rag_platform.db")
-    )
-    redis_url: str = field(
-        default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    )
-    queue_backend: str = field(
-        default_factory=lambda: os.getenv("QUEUE_BACKEND", "memory")
     )
     default_max_cases: int = 500
     default_timeout_seconds: int = 60

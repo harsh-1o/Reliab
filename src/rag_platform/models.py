@@ -46,17 +46,19 @@ class MetricFamily(str, Enum):
 
 
 class FailureCode(str, Enum):
-    RET_01 = "RET-01"  # Retrieval miss
-    RET_02 = "RET-02"  # Bad ranking
-    GEN_01 = "GEN-01"  # Unsupported claim / Hallucination
-    GEN_02 = "GEN-02"  # Contradiction
-    CIT_01 = "CIT-01"  # Mis-citation
-    CIT_02 = "CIT-02"  # Missing citation
-    KNW_01 = "KNW-01"  # Knowledge gap
-    ABS_01 = "ABS-01"  # Abstention failure
-    NUM_01 = "NUM-01"  # Numerical reasoning
-    ENT_01 = "ENT-01"  # Entity confusion
     OPS_01 = "OPS-01"  # Infrastructure error (timeout/network)
+    ABS_01 = "ABS-01"  # Unanswerable abstention failure (answered unanswerable)
+    ABS_02 = "ABS-02"  # Answerable false abstention (refused answerable case)
+    RET_01 = "RET-01"  # Retrieval miss (evidence chunk absent from top-K)
+    RET_02 = "RET-02"  # Bad ranking / distractor contamination (evidence buried below distractors)
+    RET_03 = "RET-03"  # Context window truncation (relevant passage cut off)
+    GEN_01 = "GEN-01"  # Extrinsic hallucination (unsupported claims)
+    GEN_02 = "GEN-02"  # Intrinsic contradiction (claims contradict retrieved evidence)
+    CIT_01 = "CIT-01"  # Missing citation (factual claims without citation)
+    CIT_02 = "CIT-02"  # Misattributed citation (cited chunk does not substantiate claim)
+    KNW_01 = "KNW-01"  # Knowledge gap
+    NUM_01 = "NUM-01"  # Numerical reasoning error
+    ENT_01 = "ENT-01"  # Entity confusion
 
 
 class Severity(str, Enum):
@@ -69,6 +71,30 @@ class Severity(str, Enum):
 class GateStatus(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
+
+
+class ClaimStatus(str, Enum):
+    SUPPORTED = "SUPPORTED"
+    UNSUPPORTED = "UNSUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
+
+
+class ClaimVerification(BaseModel):
+    claim_id: str
+    claim_text: str
+    status: ClaimStatus
+    supporting_chunk_id: str | None = None
+    confidence: float = 1.0
+    reason: str = ""
+
+
+class DiagnosticFinding(BaseModel):
+    code: FailureCode
+    severity: Severity = Severity.MEDIUM
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    explanation: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    recommended_actions: list[str] = Field(default_factory=list)
 
 
 # --- Dataset & Cases ---
@@ -188,6 +214,10 @@ class MetricSummary(BaseModel):
     min: float
     max: float
     count: int
+    std_dev: float = 0.0
+    ci_lower: float | None = None
+    ci_upper: float | None = None
+    sample_warning: str | None = None
 
 
 class RunMetricsSummary(BaseModel):
@@ -199,17 +229,27 @@ class RunMetricsSummary(BaseModel):
     infra_error_count: int = 0
     p95_latency_ms: float = 0.0
     total_cost_usd: float = 0.0
+    sample_warning: str | None = None
 
 
 # --- Failure Attribution ---
 class FailureAttribution(BaseModel):
     trace_id: str
-    failure_type: FailureCode
+    primary_code: FailureCode = FailureCode.OPS_01
+    contributing_codes: list[FailureCode] = Field(default_factory=list)
+    failure_type: FailureCode | None = None  # Backward-compatible alias for primary_code
     severity: Severity = Severity.MEDIUM
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     explanation: str
     evidence: dict[str, Any] = Field(default_factory=dict)
     recommended_actions: list[str] = Field(default_factory=list)
+    findings: list[DiagnosticFinding] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.failure_type is None:
+            self.failure_type = self.primary_code
+        elif self.primary_code == FailureCode.OPS_01 and self.failure_type != FailureCode.OPS_01:
+            self.primary_code = self.failure_type
 
 
 class HumanOverride(BaseModel):
@@ -224,15 +264,29 @@ class HumanOverride(BaseModel):
 # --- Run Provenance & Gate ---
 class RunProvenance(BaseModel):
     dataset_checksum: str
-    rag_version: str
-    model_config_hash: str
-    prompt_hash: str
-    evaluator_version: str
-    experiment_hash: str
+    rag_version: str = "rag_v1"
+    model_config_hash: str = "default_model_hash"
+    prompt_hash: str = "default_prompt_hash"
+    evaluator_version: str = "2.0.0"
+    experiment_hash: str = "default_exp_hash"
     manifest_hash: str = ""
+    # Explicit structured metadata for enhanced auditability
+    dataset_id: str | None = None
+    dataset_version: str | None = None
+    model_id: str | None = None
+    retrieval_config: dict[str, Any] = Field(default_factory=dict)
+    environment_info: dict[str, Any] = Field(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
         if not self.manifest_hash:
+            extra = {}
+            if self.dataset_id:
+                extra["dataset_id"] = self.dataset_id
+            if self.retrieval_config:
+                extra["retrieval_config"] = self.retrieval_config
+            if self.environment_info:
+                extra["environment_info"] = self.environment_info
+
             self.manifest_hash = compute_manifest_hash(
                 dataset_checksum=self.dataset_checksum,
                 rag_version=self.rag_version,
@@ -240,6 +294,7 @@ class RunProvenance(BaseModel):
                 prompt_hash=self.prompt_hash,
                 evaluator_version=self.evaluator_version,
                 experiment_hash=self.experiment_hash,
+                extra_metadata=extra if extra else None,
             )
 
 

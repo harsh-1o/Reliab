@@ -27,6 +27,7 @@ from rag_platform.core import (
     generate_id,
     settings,
 )
+from rag_platform.security import SecretRedactor
 from rag_platform.models import (
     BenchmarkDataset,
     DatasetStatus,
@@ -194,11 +195,17 @@ class DatabaseRepo:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def create_project(self, name: str, settings_dict: dict[str, Any] | None = None) -> ProjectRow:
+    def create_project(
+        self,
+        name: str,
+        settings_dict: dict[str, Any] | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> ProjectRow:
+        actual_settings = settings if settings is not None else (settings_dict or {})
         proj = ProjectRow(
             id=generate_id("proj"),
             name=name,
-            settings_json=json.dumps(settings_dict or {}),
+            settings_json=json.dumps(actual_settings),
         )
         self.session.add(proj)
         self.session.flush()
@@ -271,6 +278,9 @@ class DatabaseRepo:
         self.session.flush()
         return ds
 
+    def get_dataset(self, dataset_id: str) -> DatasetRow | None:
+        return self.session.get(DatasetRow, dataset_id)
+
     def create_run(self, config: RunConfig, provenance: RunProvenance) -> RunRow:
         ds = self.session.get(DatasetRow, config.dataset_id)
         if not ds:
@@ -311,12 +321,29 @@ class DatabaseRepo:
         if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value):
             raise ImmutabilityError(f"Cannot add traces to completed/terminal run {trace.run_id}.")
 
+        # Sanitize sensitive credentials and tokens BEFORE database persistence
+        sanitized_question = SecretRedactor.redact_text(trace.question)
+        sanitized_answer = SecretRedactor.redact_text(trace.answer) if trace.answer else None
+        sanitized_telemetry = SecretRedactor.redact_dict(trace.telemetry)
+        clean_chunks = [
+            c.model_copy(update={"text": SecretRedactor.redact_text(c.text)})
+            for c in trace.retrieved_chunks
+        ]
+        clean_trace = trace.model_copy(
+            update={
+                "question": sanitized_question,
+                "answer": sanitized_answer,
+                "telemetry": sanitized_telemetry,
+                "retrieved_chunks": clean_chunks,
+            }
+        )
+
         trace_row = TraceRow(
             id=trace.trace_id,
             run_id=trace.run_id,
             test_case_id=trace.test_case_id,
-            question=trace.question,
-            answer=trace.answer,
+            question=sanitized_question,
+            answer=sanitized_answer,
             abstained=trace.abstained,
             abstention_reason=trace.abstention_reason,
             latency_ms=trace.latency_ms,
@@ -325,7 +352,7 @@ class DatabaseRepo:
             cost_usd=trace.cost_usd,
             model=trace.model,
             error_code=trace.error_code,
-            raw_trace_json=trace.model_dump_json(),
+            raw_trace_json=clean_trace.model_dump_json(),
         )
         self.session.add(trace_row)
         self.session.flush()
@@ -346,6 +373,10 @@ class DatabaseRepo:
                 self.session.add(m_row)
 
         if attribution:
+            evidence_payload = {
+                **attribution.evidence,
+                "recommended_actions": attribution.recommended_actions,
+            }
             f_row = FailureRow(
                 id=generate_id("fail"),
                 trace_id=trace.trace_id,
@@ -354,7 +385,7 @@ class DatabaseRepo:
                 severity=attribution.severity.value,
                 confidence=attribution.confidence,
                 explanation=attribution.explanation,
-                evidence_json=json.dumps(attribution.evidence),
+                evidence_json=json.dumps(evidence_payload),
             )
             self.session.add(f_row)
 

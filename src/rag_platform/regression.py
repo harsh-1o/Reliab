@@ -1,10 +1,9 @@
-"""Regression detection, baseline-candidate comparison, and release policy gate evaluation.
-
-# ponytail: single file covers delta calculations, per-case regressions, and gate evaluation.
+"""Regression detection, baseline-candidate comparison, statistical deltas, and release policy gate evaluation.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 from pydantic import BaseModel, Field
 
@@ -12,7 +11,6 @@ from rag_platform.models import (
     GateResult,
     GateStatus,
     GateViolation,
-    RagTrace,
     ReleasePolicy,
     RunMetricsSummary,
 )
@@ -25,7 +23,10 @@ class MetricDelta(BaseModel):
     baseline: float
     candidate: float
     delta_abs: float
-    delta_pct: float
+    delta_pct: float | None = None
+    direction: str = "UNCHANGED"  # "IMPROVED", "REGRESSED", "UNCHANGED"
+    sample_size_baseline: int = 0
+    sample_size_candidate: int = 0
 
 
 class RunComparison(BaseModel):
@@ -34,8 +35,12 @@ class RunComparison(BaseModel):
     baseline_run_id: str
     candidate_run_id: str
     metric_deltas: dict[str, MetricDelta] = Field(default_factory=dict)
-    regressed_cases: list[str] = Field(default_factory=list)
-    improved_cases: list[str] = Field(default_factory=list)
+    newly_failed_cases: list[str] = Field(default_factory=list)
+    recovered_cases: list[str] = Field(default_factory=list)
+    unchanged_cases: list[str] = Field(default_factory=list)
+    regressed_cases: list[str] = Field(default_factory=list)  # Backward-compatible alias
+    improved_cases: list[str] = Field(default_factory=list)   # Backward-compatible alias
+    net_case_drift: int = 0
 
 
 class RegressionEngine:
@@ -49,18 +54,37 @@ class RegressionEngine:
         candidate_run_id: str,
         baseline_case_scores: dict[str, float] | None = None,
         candidate_case_scores: dict[str, float] | None = None,
+        per_case_threshold: float = 0.15,
     ) -> RunComparison:
-        """Calculate metric deltas and detect per-case regressions."""
+        """Calculate metric deltas and detect per-case regressions and recoveries."""
         deltas: dict[str, MetricDelta] = {}
 
         # Compare common metrics
         all_metrics = set(baseline_summary.metrics.keys()).union(candidate_summary.metrics.keys())
         for m_name in all_metrics:
-            b_val = baseline_summary.metrics[m_name].mean if m_name in baseline_summary.metrics else 0.0
-            c_val = candidate_summary.metrics[m_name].mean if m_name in candidate_summary.metrics else 0.0
+            b_metric = baseline_summary.metrics.get(m_name)
+            c_metric = candidate_summary.metrics.get(m_name)
+
+            b_val = b_metric.mean if b_metric else 0.0
+            c_val = c_metric.mean if c_metric else 0.0
 
             delta_abs = round(c_val - b_val, 4)
-            delta_pct = round(((c_val - b_val) / b_val * 100), 2) if b_val > 0 else (100.0 if c_val > 0 else 0.0)
+
+            # Mathematically sound delta percentage calculation:
+            if abs(b_val) < 1e-6:
+                delta_pct = None if abs(c_val) > 1e-6 else 0.0
+            else:
+                delta_pct = round(((c_val - b_val) / abs(b_val)) * 100, 2)
+
+            # Direction determination based on metric family:
+            # For latency, cost, and hallucination rate: negative delta is an improvement
+            is_lower_better = any(kw in m_name for kw in ("latency", "cost", "hallucination", "error"))
+            if abs(delta_abs) < 0.005:
+                direction = "UNCHANGED"
+            elif is_lower_better:
+                direction = "IMPROVED" if delta_abs < 0 else "REGRESSED"
+            else:
+                direction = "IMPROVED" if delta_abs > 0 else "REGRESSED"
 
             deltas[m_name] = MetricDelta(
                 metric_name=m_name,
@@ -68,26 +92,41 @@ class RegressionEngine:
                 candidate=round(c_val, 4),
                 delta_abs=delta_abs,
                 delta_pct=delta_pct,
+                direction=direction,
+                sample_size_baseline=b_metric.count if b_metric else 0,
+                sample_size_candidate=c_metric.count if c_metric else 0,
             )
 
-        # Per-case regressions (passed in baseline but failed in candidate)
-        regressed: list[str] = []
-        improved: list[str] = []
+        # Per-case regressions and recoveries
+        newly_failed: list[str] = []
+        recovered: list[str] = []
+        unchanged: list[str] = []
+
         if baseline_case_scores and candidate_case_scores:
-            for case_id, b_score in baseline_case_scores.items():
-                if case_id in candidate_case_scores:
-                    c_score = candidate_case_scores[case_id]
-                    if b_score >= 0.80 and c_score < 0.50:
-                        regressed.append(case_id)
-                    elif b_score < 0.50 and c_score >= 0.80:
-                        improved.append(case_id)
+            common_cases = set(baseline_case_scores.keys()).intersection(candidate_case_scores.keys())
+            for cid in common_cases:
+                b_score = baseline_case_scores[cid]
+                c_score = candidate_case_scores[cid]
+                score_drop = b_score - c_score
+
+                # Case regression: dropped by more than per_case_threshold or fell from passing to failing
+                if score_drop >= per_case_threshold or (b_score >= 0.70 and c_score < 0.50):
+                    newly_failed.append(cid)
+                elif (c_score - b_score) >= per_case_threshold or (b_score < 0.50 and c_score >= 0.70):
+                    recovered.append(cid)
+                else:
+                    unchanged.append(cid)
 
         return RunComparison(
             baseline_run_id=baseline_run_id,
             candidate_run_id=candidate_run_id,
             metric_deltas=deltas,
-            regressed_cases=regressed,
-            improved_cases=improved,
+            newly_failed_cases=newly_failed,
+            recovered_cases=recovered,
+            unchanged_cases=unchanged,
+            regressed_cases=newly_failed,
+            improved_cases=recovered,
+            net_case_drift=len(recovered) - len(newly_failed),
         )
 
     def evaluate_gate(
@@ -112,7 +151,7 @@ class RegressionEngine:
                     candidate_value=faith_val,
                     threshold=policy.min_faithfulness,
                     violation_type="THRESHOLD_BREACH",
-                    message=f"Faithfulness {faith_val} fell below required minimum {policy.min_faithfulness}.",
+                    message=f"Faithfulness {faith_val:.3f} fell below required minimum {policy.min_faithfulness:.3f}.",
                 )
             )
 
@@ -126,11 +165,24 @@ class RegressionEngine:
                     candidate_value=recall_val,
                     threshold=policy.min_retrieval_recall,
                     violation_type="THRESHOLD_BREACH",
-                    message=f"Recall@5 {recall_val} fell below required minimum {policy.min_retrieval_recall}.",
+                    message=f"Recall@5 {recall_val:.3f} fell below required minimum {policy.min_retrieval_recall:.3f}.",
                 )
             )
 
-        # 3. Hallucination Rate Cap
+        # 3. Citation Accuracy Threshold
+        cand_cit = candidate.metrics.get("citation_accuracy")
+        if cand_cit and cand_cit.mean < policy.min_citation_accuracy:
+            violations.append(
+                GateViolation(
+                    metric_name="citation_accuracy",
+                    candidate_value=cand_cit.mean,
+                    threshold=policy.min_citation_accuracy,
+                    violation_type="THRESHOLD_BREACH",
+                    message=f"Citation accuracy {cand_cit.mean:.3f} fell below required {policy.min_citation_accuracy:.3f}.",
+                )
+            )
+
+        # 4. Hallucination Rate Cap
         if candidate.hallucination_rate > policy.max_hallucination_rate:
             violations.append(
                 GateViolation(
@@ -138,11 +190,11 @@ class RegressionEngine:
                     candidate_value=candidate.hallucination_rate,
                     threshold=policy.max_hallucination_rate,
                     violation_type="THRESHOLD_BREACH",
-                    message=f"Hallucination rate {candidate.hallucination_rate} exceeded maximum ceiling {policy.max_hallucination_rate}.",
+                    message=f"Hallucination rate {candidate.hallucination_rate:.3f} exceeded maximum ceiling {policy.max_hallucination_rate:.3f}.",
                 )
             )
 
-        # 4. Abstention Accuracy Threshold
+        # 5. Abstention Accuracy Threshold
         if candidate.abstention_accuracy < policy.min_abstention_accuracy:
             violations.append(
                 GateViolation(
@@ -150,11 +202,11 @@ class RegressionEngine:
                     candidate_value=candidate.abstention_accuracy,
                     threshold=policy.min_abstention_accuracy,
                     violation_type="THRESHOLD_BREACH",
-                    message=f"Abstention accuracy {candidate.abstention_accuracy} fell below required {policy.min_abstention_accuracy}.",
+                    message=f"Abstention accuracy {candidate.abstention_accuracy:.3f} fell below required {policy.min_abstention_accuracy:.3f}.",
                 )
             )
 
-        # 5. Baseline Regression Budgets (Latency & Cost)
+        # 6. Baseline Regression Budgets (Latency & Cost)
         if baseline:
             # Latency regression budget
             max_lat = baseline.p95_latency_ms * (1.0 + (policy.max_latency_regression_pct / 100.0))
@@ -166,7 +218,7 @@ class RegressionEngine:
                         candidate_value=candidate.p95_latency_ms,
                         threshold=round(max_lat, 2),
                         violation_type="REGRESSION_BUDGET",
-                        message=f"P95 latency {candidate.p95_latency_ms}ms regressed more than {policy.max_latency_regression_pct}% over baseline ({baseline.p95_latency_ms}ms).",
+                        message=f"P95 latency {candidate.p95_latency_ms:.1f}ms regressed more than {policy.max_latency_regression_pct}% over baseline ({baseline.p95_latency_ms:.1f}ms).",
                     )
                 )
 
@@ -180,12 +232,12 @@ class RegressionEngine:
                         candidate_value=candidate.total_cost_usd,
                         threshold=round(max_cost, 4),
                         violation_type="REGRESSION_BUDGET",
-                        message=f"Cost ${candidate.total_cost_usd} regressed more than {policy.max_cost_regression_pct}% over baseline (${baseline.total_cost_usd}).",
+                        message=f"Cost ${candidate.total_cost_usd:.4f} regressed more than {policy.max_cost_regression_pct}% over baseline (${baseline.total_cost_usd:.4f}).",
                     )
                 )
 
-        # 6. Critical Regressions Cap
-        critical_count = len(comparison.regressed_cases) if comparison else 0
+        # 7. Critical Regressions Cap
+        critical_count = len(comparison.newly_failed_cases) if comparison else 0
         if critical_count > policy.max_critical_regressions:
             violations.append(
                 GateViolation(
@@ -193,7 +245,7 @@ class RegressionEngine:
                     candidate_value=float(critical_count),
                     threshold=float(policy.max_critical_regressions),
                     violation_type="CRITICAL_FAILURE",
-                    message=f"{critical_count} critical test case regressions detected (maximum allowed: {policy.max_critical_regressions}).",
+                    message=f"{critical_count} critical test case regression(s) detected (maximum allowed: {policy.max_critical_regressions}).",
                 )
             )
 
