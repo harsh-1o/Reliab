@@ -319,6 +319,8 @@ def get_dataset(
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     authorize_project(ds.project_id, auth, required_role=Role.VIEWER)
+    repo = DatabaseRepo(db)
+    case_count = repo.get_dataset_case_count(ds.id)
     return {
         "id": ds.id,
         "project_id": ds.project_id,
@@ -327,7 +329,7 @@ def get_dataset(
         "status": ds.status,
         "checksum": ds.checksum_sha256,
         "description": ds.description,
-        "case_count": len(ds.cases),
+        "case_count": case_count,
     }
 
 
@@ -358,29 +360,39 @@ def list_runs(
 
     result = []
     for r in runs:
-        traces = [
-            (
-                RagTrace.model_validate_json(t.raw_trace_json),
-                [
-                    MetricResult(
-                        metric_name=m.metric_name,
-                        metric_family=MetricFamily(m.metric_family),
-                        score=m.score,
-                    )
-                    for m in t.metrics
-                ],
-            )
-            for t in r.traces
-        ]
-        summary = eval_engine.aggregate_run(traces) if traces else None
-        gate_res = None
-        if summary:
-            gate_res = reg_engine.evaluate_gate(
-                summary,
-                ReleasePolicy(policy_id=r.policy_id),
-                candidate_run_id=r.id,
-            ).model_dump()
+        summary_dict = json.loads(r.summary_json) if r.summary_json else None
+        gate_dict = json.loads(r.gate_result_json) if r.gate_result_json else None
 
+        # Fallback only for legacy runs missing persisted summaries
+        if summary_dict is None and r.traces:
+            traces = [
+                (
+                    RagTrace.model_validate_json(t.raw_trace_json),
+                    [
+                        MetricResult(
+                            metric_name=m.metric_name,
+                            metric_family=MetricFamily(m.metric_family),
+                            score=m.score,
+                        )
+                        for m in t.metrics
+                    ],
+                )
+                for t in r.traces
+            ]
+            summary = eval_engine.aggregate_run(traces) if traces else None
+            summary_dict = summary.model_dump() if summary else None
+            if summary:
+                gate_dict = reg_engine.evaluate_gate(
+                    summary,
+                    ReleasePolicy(policy_id=r.policy_id),
+                    candidate_run_id=r.id,
+                ).model_dump()
+
+        trace_count = (
+            summary_dict.get("total_cases")
+            if (summary_dict and "total_cases" in summary_dict)
+            else len(r.traces)
+        )
         result.append({
             "id": r.id,
             "project_id": r.project_id,
@@ -390,9 +402,9 @@ def list_runs(
             "status": r.status,
             "policy_id": r.policy_id,
             "created_at": r.created_at.isoformat(),
-            "trace_count": len(r.traces),
-            "summary": summary.model_dump() if summary else None,
-            "gate_result": gate_res,
+            "trace_count": trace_count,
+            "summary": summary_dict,
+            "gate_result": gate_dict,
         })
     return {"runs": result, "limit": limit, "offset": offset, "total": total}
 
@@ -417,10 +429,13 @@ def _resolve_adapter(req: "CreateRunReq") -> Any:
         endpoint_url = req.adapter_config.get("endpoint_url", "")
         if not endpoint_url:
             raise HTTPException(status_code=422, detail="HTTP adapter requires adapter_config.endpoint_url")
+        case_timeout = float(req.timeout_seconds if hasattr(req, "timeout_seconds") and req.timeout_seconds else 60.0)
+        # Cleanly enforce overall case timeout >= HTTP connection/read timeout
+        http_timeout = float(req.adapter_config.get("timeout_seconds", min(30.0, case_timeout)))
         return HttpRagAdapter(
             endpoint_url=endpoint_url,
             headers=req.adapter_config.get("headers"),
-            timeout_seconds=float(req.adapter_config.get("timeout_seconds", 30.0)),
+            timeout_seconds=http_timeout,
         )
 
     if adapter_type_key == "python":
@@ -443,8 +458,9 @@ def _resolve_adapter(req: "CreateRunReq") -> Any:
     return AdapterRegistry.get(adapter_type_key, **req.adapter_config)
 
 
-# Global in-memory evaluation cache shared across runs
-_eval_cache: dict[str, MetricResult] = {}
+# Shared two-tier evaluation cache (L1 in-memory LRU + L2 database persistence across processes)
+from rag_platform.evaluators import TwoTierEvaluationCache
+_eval_cache = TwoTierEvaluationCache(l1_capacity=10_000, l2_capacity=50_000)
 
 
 async def _execute_evaluation_run(
@@ -464,7 +480,13 @@ async def _execute_evaluation_run(
     owned_session = db_session is None
     sess = db_session if db_session is not None else create_session()
     repo = DatabaseRepo(sess)
-    repo.update_run_status(run_id, RunStatus.RUNNING)
+    now = datetime.now(timezone.utc)
+    run_row = sess.get(RunRow, run_id)
+    if run_row:
+        if not run_row.started_at:
+            run_row.started_at = now
+        run_row.heartbeat_at = now
+        run_row.status = RunStatus.RUNNING.value
     sess.commit()
 
     timeout_sec = float(getattr(config.options, "timeout_seconds", 60) or 60)
@@ -573,14 +595,36 @@ async def _execute_evaluation_run(
         if workers:
             await asyncio.gather(*workers)
 
+        now = datetime.now(timezone.utc)
+        run_row = sess.get(RunRow, run_id)
         if had_fatal_failure and fail_fast:
             repo.update_run_status(run_id, RunStatus.FAILED)
-            run_row = sess.get(RunRow, run_id)
             if run_row:
                 run_row.failure_reason = "Run aborted due to fatal case failure (fail_fast=true)"
                 run_row.failure_type = "FAIL_FAST"
         else:
             repo.update_run_status(run_id, RunStatus.COMPLETED)
+
+        # Pre-compute and persist run summary and gate result to avoid N+1 recalculation on list/get
+        summary_obj = eval_engine.aggregate_run([(t, m) for t, m, _ in results]) if results else None
+        gate_obj = None
+        if summary_obj and run_row:
+            from rag_platform.regression import RegressionEngine, ReleasePolicy
+            reg_engine = RegressionEngine()
+            gate_obj = reg_engine.evaluate_gate(
+                summary_obj,
+                ReleasePolicy(policy_id=run_row.policy_id),
+                candidate_run_id=run_row.id,
+            )
+
+        if run_row:
+            run_row.finished_at = now
+            run_row.heartbeat_at = now
+            if summary_obj:
+                run_row.summary_json = summary_obj.model_dump_json()
+            if gate_obj:
+                run_row.gate_result_json = gate_obj.model_dump_json()
+                run_row.gate_status = gate_obj.status.value
         sess.commit()
 
         import logging
@@ -686,14 +730,23 @@ async def create_run(
         ),
     )
 
-    run = repo.create_run(config, provenance)
+    initial_status = RunStatus.QUEUED if req.async_exec else RunStatus.CREATED
+    run = repo.create_run(
+        config,
+        provenance,
+        initial_status=initial_status,
+        options_override_json=req.model_dump_json(),
+    )
     db.commit()
 
     cases = [db_row_to_test_case(r) for r in ds.cases]
 
     if req.async_exec:
-        # Asynchronous execution with 202 Accepted response
-        background_tasks.add_task(_execute_evaluation_run, run.id, req, config, cases)
+        # Asynchronous execution via durable database-backed worker
+        from rag_platform.worker import DurableRunWorker, WorkerNotificationBus
+        # Wake up any waiting daemon workers immediately via push notification
+        WorkerNotificationBus.notify_new_run(run.id, db_session=db)
+        background_tasks.add_task(DurableRunWorker.process_next_queued_run)
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
@@ -744,31 +797,41 @@ def get_run(
 
     authorize_project(run.project_id, auth, required_role=Role.VIEWER)
 
-    eval_engine = EvaluationEngine()
-    traces = [
-        (
-            RagTrace.model_validate_json(t.raw_trace_json),
-            [
-                MetricResult(
-                    metric_name=m.metric_name,
-                    metric_family=MetricFamily(m.metric_family),
-                    score=m.score,
-                )
-                for m in t.metrics
-            ],
-        )
-        for t in run.traces
-    ]
-    summary = eval_engine.aggregate_run(traces) if traces else None
-    gate_res = None
-    if summary:
-        reg_engine = RegressionEngine()
-        gate_res = reg_engine.evaluate_gate(
-            summary,
-            ReleasePolicy(policy_id=run.policy_id),
-            candidate_run_id=run.id,
-        ).model_dump()
+    summary_dict = json.loads(run.summary_json) if run.summary_json else None
+    gate_dict = json.loads(run.gate_result_json) if run.gate_result_json else None
 
+    # Fallback only for legacy runs
+    if summary_dict is None and run.traces:
+        eval_engine = EvaluationEngine()
+        traces = [
+            (
+                RagTrace.model_validate_json(t.raw_trace_json),
+                [
+                    MetricResult(
+                        metric_name=m.metric_name,
+                        metric_family=MetricFamily(m.metric_family),
+                        score=m.score,
+                    )
+                    for m in t.metrics
+                ],
+            )
+            for t in run.traces
+        ]
+        summary = eval_engine.aggregate_run(traces) if traces else None
+        summary_dict = summary.model_dump() if summary else None
+        if summary:
+            reg_engine = RegressionEngine()
+            gate_dict = reg_engine.evaluate_gate(
+                summary,
+                ReleasePolicy(policy_id=run.policy_id),
+                candidate_run_id=run.id,
+            ).model_dump()
+
+    trace_count = (
+        summary_dict.get("total_cases")
+        if (summary_dict and "total_cases" in summary_dict)
+        else len(run.traces)
+    )
     return {
         "id": run.id,
         "project_id": run.project_id,
@@ -778,9 +841,9 @@ def get_run(
         "status": run.status,
         "policy_id": run.policy_id,
         "created_at": run.created_at.isoformat(),
-        "trace_count": len(run.traces),
-        "summary": summary.model_dump() if summary else None,
-        "gate_result": gate_res,
+        "trace_count": trace_count,
+        "summary": summary_dict,
+        "gate_result": gate_dict,
     }
 
 
@@ -861,6 +924,11 @@ def list_failures(
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         authorize_project(run.project_id, auth, required_role=Role.VIEWER)
+        if project_id and run.project_id != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Run '{run_id}' does not belong to project '{project_id}'."
+            )
 
     query = select(FailureRow)
     count_query = select(func.count(FailureRow.id))

@@ -798,6 +798,269 @@ class AbstentionAccuracyMetric(BaseMetric):
         )
 
 
+from collections import OrderedDict
+import json
+import logging
+import threading
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+
+class BaseEvaluationCache(ABC):
+    """Abstract interface for evaluation metric result caches."""
+
+    @abstractmethod
+    def get(self, key: str) -> MetricResult | None:
+        """Retrieve cached result or None."""
+
+    @abstractmethod
+    def set(self, key: str, value: MetricResult) -> None:
+        """Store result in cache."""
+
+    @abstractmethod
+    def clear(self) -> None:
+        """Clear cache entries."""
+
+    @abstractmethod
+    def stats(self) -> dict[str, Any]:
+        """Return cache metrics and diagnostics."""
+
+
+class BoundedLRUCache(BaseEvaluationCache):
+    """Thread-safe bounded in-process LRU cache for evaluation metric results.
+
+    Prevents unbounded memory growth via strict capacity enforcement and
+    least-recently-used eviction. Process restarts naturally clear the cache.
+    """
+
+    def __init__(self, capacity: int = 10_000) -> None:
+        self.capacity = max(1, capacity)
+        self._cache: OrderedDict[str, MetricResult] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def get(self, key: str) -> MetricResult | None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self.hits += 1
+                return self._cache[key]
+            self.misses += 1
+            return None
+
+    def set(self, key: str, value: MetricResult) -> None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            else:
+                if len(self._cache) >= self.capacity:
+                    self._cache.popitem(last=False)  # Evict least recently used entry
+            self._cache[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        with self._lock:
+            return key in self._cache
+
+    def __getitem__(self, key: str) -> MetricResult:
+        with self._lock:
+            val = self._cache[key]
+            self._cache.move_to_end(key)
+            return val
+
+    def __setitem__(self, key: str, value: MetricResult) -> None:
+        self.set(key, value)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self.hits = 0
+            self.misses = 0
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "size": len(self._cache),
+                "capacity": self.capacity,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+
+class DatabaseEvaluationCache(BaseEvaluationCache):
+    """Database-backed persistent evaluation cache shared across multi-process workers.
+
+    Allows worker processes on separate nodes or containers to share evaluated
+    metric results without requiring an external Redis instance.
+    """
+
+    def __init__(self, capacity: int = 50_000, session_factory: Callable | None = None) -> None:
+        self.capacity = max(1, capacity)
+        self.session_factory = session_factory
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def _get_session(self):
+        if self.session_factory is not None:
+            return self.session_factory()
+        from rag_platform.db import create_session
+        return create_session()
+
+    def get(self, key: str) -> MetricResult | None:
+        from datetime import datetime, timezone
+        from rag_platform.db import EvaluationCacheRow
+
+        try:
+            with self._get_session() as sess:
+                row = sess.get(EvaluationCacheRow, key)
+                if row:
+                    row.last_accessed_at = datetime.now(timezone.utc)
+                    sess.commit()
+                    self.hits += 1
+                    data = json.loads(row.result_json)
+                    return MetricResult.model_validate(data)
+                self.misses += 1
+                return None
+        except Exception as exc:
+            logger.debug("DatabaseEvaluationCache get error: %s", exc)
+            self.misses += 1
+            return None
+
+    def set(self, key: str, value: MetricResult) -> None:
+        from datetime import datetime, timezone
+        from sqlalchemy import select, func, delete
+        from rag_platform.db import EvaluationCacheRow
+
+        try:
+            with self._get_session() as sess:
+                now = datetime.now(timezone.utc)
+                row = sess.get(EvaluationCacheRow, key)
+                if row:
+                    row.result_json = value.model_dump_json()
+                    row.last_accessed_at = now
+                else:
+                    new_row = EvaluationCacheRow(
+                        cache_key=key,
+                        result_json=value.model_dump_json(),
+                        created_at=now,
+                        last_accessed_at=now,
+                    )
+                    sess.add(new_row)
+
+                    # Enforce capacity bound by pruning oldest accessed entries if limit exceeded
+                    total_count = sess.scalar(select(func.count(EvaluationCacheRow.cache_key))) or 0
+                    if total_count > self.capacity:
+                        oldest_subq = (
+                            select(EvaluationCacheRow.cache_key)
+                            .order_by(EvaluationCacheRow.last_accessed_at.asc())
+                            .limit(total_count - self.capacity)
+                        )
+                        sess.execute(
+                            delete(EvaluationCacheRow).where(
+                                EvaluationCacheRow.cache_key.in_(oldest_subq)
+                            )
+                        )
+                sess.commit()
+        except Exception as exc:
+            logger.debug("DatabaseEvaluationCache set error: %s", exc)
+
+    def clear(self) -> None:
+        from sqlalchemy import delete
+        from rag_platform.db import EvaluationCacheRow
+
+        try:
+            with self._get_session() as sess:
+                sess.execute(delete(EvaluationCacheRow))
+                sess.commit()
+                self.hits = 0
+                self.misses = 0
+        except Exception as exc:
+            logger.debug("DatabaseEvaluationCache clear error: %s", exc)
+
+    def stats(self) -> dict[str, Any]:
+        from sqlalchemy import select, func
+        from rag_platform.db import EvaluationCacheRow
+
+        try:
+            with self._get_session() as sess:
+                count = sess.scalar(select(func.count(EvaluationCacheRow.cache_key))) or 0
+                return {
+                    "size": count,
+                    "capacity": self.capacity,
+                    "hits": self.hits,
+                    "misses": self.misses,
+                }
+        except Exception:
+            return {
+                "size": 0,
+                "capacity": self.capacity,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+
+class TwoTierEvaluationCache(BaseEvaluationCache):
+    """Two-tier evaluation cache combining L1 in-process memory LRU and L2 shared DB table.
+
+    Eliminates multi-process cache isolation while preserving high-speed in-memory reads:
+    - L1 (In-Memory BoundedLRUCache): Sub-millisecond hits for the local worker process.
+    - L2 (DatabaseEvaluationCache): Shared across all distributed worker nodes/processes.
+    """
+
+    def __init__(
+        self,
+        l1_capacity: int = 10_000,
+        l2_capacity: int = 50_000,
+        session_factory: Callable | None = None,
+    ) -> None:
+        self.l1 = BoundedLRUCache(capacity=l1_capacity)
+        self.l2 = DatabaseEvaluationCache(capacity=l2_capacity, session_factory=session_factory)
+        self.capacity = l1_capacity + l2_capacity
+
+    @property
+    def hits(self) -> int:
+        return self.l1.hits + self.l2.hits
+
+    @property
+    def misses(self) -> int:
+        return self.l2.misses
+
+    def get(self, key: str) -> MetricResult | None:
+        # Check L1 memory first
+        res = self.l1.get(key)
+        if res is not None:
+            return res
+        # Check L2 shared DB
+        res = self.l2.get(key)
+        if res is not None:
+            # Populate L1 for future fast local reads
+            self.l1.set(key, res)
+            return res
+        return None
+
+    def set(self, key: str, value: MetricResult) -> None:
+        self.l1.set(key, value)
+        self.l2.set(key, value)
+
+    def clear(self) -> None:
+        self.l1.clear()
+        self.l2.clear()
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "l1": self.l1.stats(),
+            "l2": self.l2.stats(),
+            "hits": self.hits,
+            "misses": self.misses,
+            "capacity": self.capacity,
+        }
+
+
 # --- Evaluation Engine, Cache, & Statistics ---
 class EvaluationEngine:
     """Orchestrates metric execution with hashed caching, statistical confidence intervals, and aggregation."""
@@ -805,7 +1068,7 @@ class EvaluationEngine:
     def __init__(
         self,
         metrics: list[BaseMetric] | None = None,
-        cache: dict[str, MetricResult] | None = None,
+        cache: BaseEvaluationCache | dict[str, MetricResult] | None = None,
     ) -> None:
         self.metrics = metrics or [
             RecallAtKMetric(k=5),
@@ -816,7 +1079,7 @@ class EvaluationEngine:
             CitationSupportMetric(),
             AbstentionAccuracyMetric(),
         ]
-        self._cache: dict[str, MetricResult] = cache if cache is not None else {}
+        self._cache = cache if cache is not None else BoundedLRUCache(capacity=10_000)
 
     def _cache_key(self, metric: BaseMetric, trace: RagTrace, case: TestCase) -> str:
         """Cache key incorporating ALL inputs that affect evaluation output.
@@ -853,14 +1116,23 @@ class EvaluationEngine:
         results: list[MetricResult] = []
         for metric in self.metrics:
             key = self._cache_key(metric, trace, case)
-            if use_cache and key in self._cache:
-                cached_res = self._cache[key].model_copy(update={"cached": True})
-                results.append(cached_res)
-                continue
+            if use_cache:
+                if hasattr(self._cache, "get"):
+                    cached_val = self._cache.get(key)
+                    if cached_val is not None:
+                        results.append(cached_val.model_copy(update={"cached": True}))
+                        continue
+                elif key in self._cache:
+                    cached_res = self._cache[key].model_copy(update={"cached": True})
+                    results.append(cached_res)
+                    continue
 
             result = await metric.compute(trace, case)
             if use_cache:
-                self._cache[key] = result
+                if hasattr(self._cache, "set"):
+                    self._cache.set(key, result)
+                else:
+                    self._cache[key] = result
             results.append(result)
         return results
 

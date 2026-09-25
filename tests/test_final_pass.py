@@ -763,7 +763,7 @@ class TestRealExternalRagIntegration:
     async def test_full_pipeline_with_real_http_adapter_and_gate(self, external_rag_server):
         """End-to-end integration test: Platform -> Real HttpRagAdapter -> External RAG HTTP service -> Trace -> Eval -> Gate."""
         endpoint_url = external_rag_server
-        adapter = HttpRagAdapter(endpoint_url=endpoint_url, timeout_seconds=5.0)
+        adapter = HttpRagAdapter(endpoint_url=endpoint_url, timeout_seconds=5.0, allow_private_ip=True)
 
         case = TestCase(
             id="tc_rev_growth",

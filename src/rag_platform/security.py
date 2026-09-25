@@ -325,6 +325,14 @@ class ClientIdentity(BaseModel):
     project_roles: dict[str, Role] = Field(default_factory=dict)
 
 
+import secrets
+
+
+def generate_secure_api_key() -> str:
+    """Generate a cryptographically secure 256-bit API key formatted as rag_<urlsafe_token>."""
+    return f"rag_{secrets.token_urlsafe(32)}"
+
+
 class ApiKeyRegistry:
     """Registry mapping API keys to client identities and project role memberships.
     
@@ -344,8 +352,7 @@ class ApiKeyRegistry:
         persist_db: bool = False,
         db_session: Any = None,
     ) -> str:
-        from rag_platform.core import generate_id
-        actual_key = api_key or f"rag_{generate_id('key')}"
+        actual_key = api_key or generate_secure_api_key()
         cls.register_key(
             api_key=actual_key,
             client_id=client_id,
@@ -398,8 +405,15 @@ class ApiKeyRegistry:
                     with Session(eng) as s:
                         s.merge(row)
                         s.commit()
-            except Exception:
-                pass
+            except Exception as exc:
+                import logging
+                logging.getLogger("rag_platform.security").error(
+                    "Failed to persist API key for client '%s': %s", client_id, type(exc).__name__
+                )
+                cls._registry.pop(api_key, None)
+                raise RuntimeError(
+                    f"Authentication persistence error: failed to store credential for client '{client_id}'"
+                ) from exc
 
     @classmethod
     def get(cls, api_key: str, db_session: Any = None) -> ClientIdentity | None:
@@ -432,8 +446,12 @@ class ApiKeyRegistry:
                 )
                 cls._registry[api_key] = identity
                 return identity
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger("rag_platform.security").error(
+                "Database error during API key authentication lookup: %s", type(exc).__name__
+            )
+            raise RuntimeError("Database error during authentication credential verification") from exc
         return None
 
     @classmethod
@@ -494,7 +512,19 @@ def authenticate_request(
         )
 
     # 1. Check registered client keys (in-memory cache or persistent DB)
-    client = ApiKeyRegistry.get(token, db_session=db_session)
+    try:
+        client = ApiKeyRegistry.get(token, db_session=db_session)
+    except Exception as exc:
+        import logging
+        logging.getLogger("rag_platform.security").error(
+            "Authentication database lookup error: %s", type(exc).__name__
+        )
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service temporarily unavailable due to internal error.",
+        )
+
     if client:
         return SecurityContext(
             authenticated=True,

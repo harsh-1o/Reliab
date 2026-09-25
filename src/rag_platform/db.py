@@ -17,6 +17,8 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    func,
+    select,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
@@ -117,7 +119,12 @@ class RunRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gate_result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gate_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
     traces: Mapped[list[TraceRow]] = relationship("TraceRow", back_populates="run", cascade="all, delete-orphan")
 
@@ -190,6 +197,19 @@ class ApiKeyRow(Base):
     )
 
 
+class EvaluationCacheRow(Base):
+    __tablename__ = "evaluation_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_accessed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 # --- Database Operations & Repository ---
 def create_db_engine(db_url: str | None = None):
     url = db_url or settings.database_url
@@ -201,8 +221,23 @@ def create_session(db_url: str | None = None) -> Session:
     return Session(create_db_engine(db_url))
 
 
-def init_db(engine=None) -> None:
+def init_db(engine=None, allow_non_memory: bool = False) -> None:
+    """Initialize database tables using Base.metadata.create_all().
+
+    ARCHITECTURAL RULE: Alembic is the authoritative schema owner for production.
+    `Base.metadata.create_all()` is strictly reserved for ephemeral in-memory test databases (`sqlite:///:memory:`).
+    Production environments must always apply schema changes via `alembic upgrade head`.
+    """
     eng = engine or create_db_engine()
+    url_str = str(eng.url)
+    if not allow_non_memory and ":memory:" not in url_str:
+        import warnings
+        warnings.warn(
+            "init_db() / create_all() should not be used on persistent databases. "
+            "Production schema authority is Alembic migrations (`alembic upgrade head`).",
+            UserWarning,
+            stacklevel=2,
+        )
     Base.metadata.create_all(bind=eng)
 
 
@@ -298,7 +333,25 @@ class DatabaseRepo:
     def get_dataset(self, dataset_id: str) -> DatasetRow | None:
         return self.session.get(DatasetRow, dataset_id)
 
-    def create_run(self, config: RunConfig, provenance: RunProvenance) -> RunRow:
+    def get_dataset_case_count(self, dataset_id: str) -> int:
+        """Database-level count avoiding loading full test case objects into memory."""
+        return self.session.scalar(
+            select(func.count(TestCaseRow.id)).where(TestCaseRow.dataset_id == dataset_id)
+        ) or 0
+
+    def get_run_trace_count(self, run_id: str) -> int:
+        """Database-level count avoiding loading full trace objects into memory."""
+        return self.session.scalar(
+            select(func.count(TraceRow.id)).where(TraceRow.run_id == run_id)
+        ) or 0
+
+    def create_run(
+        self,
+        config: RunConfig,
+        provenance: RunProvenance,
+        initial_status: RunStatus = RunStatus.CREATED,
+        options_override_json: str | None = None,
+    ) -> RunRow:
         ds = self.session.get(DatasetRow, config.dataset_id)
         if not ds:
             raise ValueError(f"Dataset {config.dataset_id} not found.")
@@ -317,10 +370,10 @@ class DatabaseRepo:
             evaluator_version=provenance.evaluator_version,
             experiment_hash=provenance.experiment_hash,
             manifest_hash=provenance.manifest_hash,
-            status=RunStatus.CREATED.value,
+            status=initial_status.value,
             policy_id=config.policy_id,
             suite=config.suite,
-            options_json=config.options.model_dump_json(),
+            options_json=options_override_json or config.options.model_dump_json(),
         )
         self.session.add(run)
         self.session.flush()
@@ -417,7 +470,8 @@ class DatabaseRepo:
         project_roles: dict[str, Any] | None = None,
         is_admin: bool = False,
     ) -> tuple[str, ApiKeyRow]:
-        raw_key = api_key or f"rag_{generate_id('key')}"
+        from rag_platform.security import generate_secure_api_key
+        raw_key = api_key or generate_secure_api_key()
         key_hash = sha256_hash(raw_key)
         roles = {p: (r.value if hasattr(r, "value") else str(r)) for p, r in (project_roles or {}).items()}
         row = ApiKeyRow(

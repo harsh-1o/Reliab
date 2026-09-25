@@ -121,12 +121,18 @@ function renderRunDashboard(run, baseline) {
         }
     }
 
-    // Backend regression/gate engine is the SINGLE source of truth (FIX #3)
+    // Backend regression/gate engine is the SINGLE source of truth
     const gate = run.gate_result || null;
     const isPassed = gate ? (gate.status === 'PASS') : false;
     const gateStatus = gate ? escapeHtml(gate.status) : 'NO_DATA';
     const policyId = gate ? escapeHtml(gate.policy_id) : escapeHtml(run.policy_id || 'prod-default');
     const violations = (gate && Array.isArray(gate.violations)) ? gate.violations : [];
+
+    const hasViolation = (metricKey) => violations.some(v => v.metric_name === metricKey || (v.metric_name && v.metric_name.toLowerCase().includes(metricKey)));
+    const faithViolated = hasViolation('faithfulness');
+    const recallViolated = hasViolation('recall');
+    const citViolated = hasViolation('citation');
+    const abstViolated = hasViolation('abstention');
 
     root.innerHTML = `
         <!-- Executive Story Bar (Derived 100% from backend GateResult) -->
@@ -137,8 +143,16 @@ function renderRunDashboard(run, baseline) {
                 </h2>
                 <p>Policy: <code>${policyId}</code> | Evaluated ${escapeHtml(String(run.trace_count || 0))} test cases on benchmark <code>${escapeHtml(run.dataset_id || '')}</code> against commit <code>${escapeHtml(run.system_version || '')}</code>.</p>
                 ${violations.length > 0 ? `
-                    <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:6px;">
-                        ${violations.map(v => `<span class="chip chip-fail" style="font-size:11px;">${escapeHtml(v.metric_name)}: ${v.actual_value !== null ? escapeHtml(String(v.actual_value)) : 'No data'} (threshold ${escapeHtml(v.direction || '')} ${escapeHtml(String(v.threshold || ''))})</span>`).join('')}
+                    <div style="margin-top:10px; display:flex; flex-direction:column; gap:6px;">
+                        ${violations.map(v => `
+                            <div class="violation-box" style="padding:6px 10px; background:#fff2f0; border-left:3px solid #ff4d4f; border-radius:4px; font-size:12px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center;">
+                                    <span><strong>${escapeHtml(v.metric_name)}</strong> &mdash; Candidate: <strong>${v.candidate_value !== undefined && v.candidate_value !== null ? escapeHtml(String(v.candidate_value)) : 'N/A'}</strong> | Required: <strong>&ge; ${escapeHtml(String(v.threshold))}</strong></span>
+                                    <span class="chip chip-fail" style="font-size:10px; padding:2px 6px;">${escapeHtml(v.violation_type || 'THRESHOLD_BREACH')}</span>
+                                </div>
+                                <div style="color:#555; margin-top:3px;">${escapeHtml(v.message || '')}</div>
+                            </div>
+                        `).join('')}
                     </div>
                 ` : ''}
             </div>
@@ -152,8 +166,8 @@ function renderRunDashboard(run, baseline) {
             <div class="metric-tile">
                 <div class="metric-header">
                     <span class="metric-label">Claim Faithfulness</span>
-                    <span class="chip ${faithMetric.isEvaluated && metrics.faithfulness.mean >= 0.85 ? 'chip-pass' : (faithMetric.isEvaluated ? 'chip-fail' : 'chip-neutral')}">
-                        ${faithMetric.isEvaluated ? (metrics.faithfulness.mean >= 0.85 ? 'HEALTHY' : 'DRIFT') : 'UNSET'}
+                    <span class="chip ${!faithMetric.isEvaluated ? 'chip-neutral' : (faithViolated ? 'chip-fail' : (isPassed ? 'chip-pass' : 'chip-neutral'))}">
+                        ${!faithMetric.isEvaluated ? 'UNSET' : (faithViolated ? 'VIOLATION' : 'COMPLIANT')}
                     </span>
                 </div>
                 <div class="metric-val">${faithMetric.display}</div>
@@ -168,8 +182,8 @@ function renderRunDashboard(run, baseline) {
             <div class="metric-tile">
                 <div class="metric-header">
                     <span class="metric-label">Evidence Recall@5</span>
-                    <span class="chip ${recallMetric.isEvaluated && metrics.recall_at_5.mean >= 0.90 ? 'chip-pass' : (recallMetric.isEvaluated ? 'chip-warn' : 'chip-neutral')}">
-                        ${recallMetric.isEvaluated ? 'RANKED' : 'UNSET'}
+                    <span class="chip ${!recallMetric.isEvaluated ? 'chip-neutral' : (recallViolated ? 'chip-fail' : (isPassed ? 'chip-pass' : 'chip-neutral'))}">
+                        ${!recallMetric.isEvaluated ? 'UNSET' : (recallViolated ? 'VIOLATION' : 'COMPLIANT')}
                     </span>
                 </div>
                 <div class="metric-val">${recallMetric.display}</div>
@@ -184,7 +198,9 @@ function renderRunDashboard(run, baseline) {
             <div class="metric-tile">
                 <div class="metric-header">
                     <span class="metric-label">Citation Accuracy</span>
-                    <span class="chip chip-neutral">${citMetric.isEvaluated ? 'VERIFIED' : 'UNSET'}</span>
+                    <span class="chip ${!citMetric.isEvaluated ? 'chip-neutral' : (citViolated ? 'chip-fail' : (isPassed ? 'chip-pass' : 'chip-neutral'))}">
+                        ${!citMetric.isEvaluated ? 'UNSET' : (citViolated ? 'VIOLATION' : 'COMPLIANT')}
+                    </span>
                 </div>
                 <div class="metric-val">${citMetric.display}</div>
                 <div class="metric-footer">
@@ -196,7 +212,9 @@ function renderRunDashboard(run, baseline) {
             <div class="metric-tile">
                 <div class="metric-header">
                     <span class="metric-label">Abstention Accuracy</span>
-                    <span class="chip ${summary.abstention_accuracy !== undefined && summary.abstention_accuracy >= 0.90 ? 'chip-pass' : (summary.abstention_accuracy !== undefined ? 'chip-fail' : 'chip-neutral')}">BOUNDARY</span>
+                    <span class="chip ${summary.abstention_accuracy === undefined ? 'chip-neutral' : (abstViolated ? 'chip-fail' : (isPassed ? 'chip-pass' : 'chip-neutral'))}">
+                        ${summary.abstention_accuracy === undefined ? 'UNSET' : (abstViolated ? 'VIOLATION' : 'COMPLIANT')}
+                    </span>
                 </div>
                 <div class="metric-val">${abstDisplay}</div>
                 <div class="metric-footer">
@@ -213,7 +231,7 @@ function renderRunDashboard(run, baseline) {
                 <div class="metric-val">${p95_lat !== '—' ? p95_lat + 'ms' : '—'}</div>
                 <div class="metric-footer">
                     <span class="delta-tag delta-neutral">Cost: ${cost}</span>
-                    <span class="ci-span">P95 Budget &le; 1200ms</span>
+                    <span class="ci-span">Observed Latency</span>
                 </div>
             </div>
         </div>

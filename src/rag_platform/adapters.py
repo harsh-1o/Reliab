@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from enum import Enum
 from typing import Any, Callable, Protocol
+from urllib.parse import urljoin
 
 import httpx
 
@@ -18,6 +19,7 @@ from rag_platform.models import (
     TestCase,
 )
 from rag_platform.security import SecretRedactor
+from rag_platform.ssrf import SSRFProtectionError, validate_url_ssrf
 
 
 class RagAdapter(Protocol):
@@ -86,6 +88,8 @@ class HttpRagAdapter:
     
     Supports reusable connection pooling via shared httpx.AsyncClient to minimize
     TCP handshake latency across high-throughput evaluation suites.
+    Includes strict SSRF protection: validates destinations before connect and re-validates
+    every redirect hop against private, link-local, loopback, and metadata ranges.
     """
 
     def __init__(
@@ -94,10 +98,16 @@ class HttpRagAdapter:
         headers: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
         client: httpx.AsyncClient | None = None,
+        allowed_hosts: list[str] | set[str] | None = None,
+        allow_private_ip: bool = False,
+        dns_resolver: Any = None,
     ) -> None:
         self.endpoint_url = endpoint_url
         self.headers = headers or {}
         self.timeout_seconds = timeout_seconds
+        self.allowed_hosts = allowed_hosts
+        self.allow_private_ip = allow_private_ip
+        self.dns_resolver = dns_resolver
         self._shared_client = client
         self._owns_client = client is None
 
@@ -106,6 +116,7 @@ class HttpRagAdapter:
             return self._shared_client
         self._shared_client = httpx.AsyncClient(
             timeout=self.timeout_seconds,
+            follow_redirects=False,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
         self._owns_client = True
@@ -124,7 +135,7 @@ class HttpRagAdapter:
 
     async def run(self, case: TestCase, config: RunConfig) -> RagTrace:
         start = time.perf_counter()
-        trace_id = generate_id("tr")
+        trace_id = generate_id("trace")
         payload = {
             "question": case.question,
             "test_case_id": case.id,
@@ -132,8 +143,39 @@ class HttpRagAdapter:
         }
 
         try:
+            current_url = self.endpoint_url
+            # Pre-flight SSRF validation immediately before connecting
+            validate_url_ssrf(
+                current_url,
+                allowed_hosts=self.allowed_hosts,
+                allow_private_ips=self.allow_private_ip,
+                dns_resolver=self.dns_resolver,
+            )
+
             client = await self._get_client()
-            resp = await client.post(self.endpoint_url, json=payload, headers=self.headers)
+
+            # Follow redirects manually with strict SSRF validation at every hop
+            max_redirects = 5
+            redirect_count = 0
+
+            while True:
+                resp = await client.post(current_url, json=payload, headers=self.headers)
+                if resp.is_redirect and "location" in resp.headers:
+                    redirect_count += 1
+                    if redirect_count > max_redirects:
+                        raise httpx.TooManyRedirects("Exceeded maximum redirect hops")
+                    location = resp.headers["location"]
+                    current_url = urljoin(current_url, location)
+                    # Revalidate every redirect destination before following
+                    validate_url_ssrf(
+                        current_url,
+                        allowed_hosts=self.allowed_hosts,
+                        allow_private_ips=self.allow_private_ip,
+                        dns_resolver=self.dns_resolver,
+                    )
+                    continue
+                break
+
             latency_ms = int((time.perf_counter() - start) * 1000)
 
             if resp.status_code >= 400:
@@ -187,6 +229,17 @@ class HttpRagAdapter:
                 cost_usd=data.get("cost_usd"),
                 model=data.get("model"),
                 telemetry=SecretRedactor.redact_dict(data.get("telemetry", {})),
+            )
+        except SSRFProtectionError as ex:
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            return RagTrace(
+                trace_id=trace_id,
+                run_id=generate_id("run"),
+                test_case_id=case.id,
+                question=case.question,
+                error_code="OPS-01",
+                latency_ms=latency_ms,
+                telemetry={"exception": str(ex), "type": "SSRFProtectionError"},
             )
         except (httpx.TimeoutException, httpx.RequestError) as ex:
             latency_ms = int((time.perf_counter() - start) * 1000)
