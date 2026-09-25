@@ -68,7 +68,7 @@ def compute_manifest_hash(
 @dataclass(frozen=True)
 class Settings:
     database_url: str = field(
-        default_factory=lambda: os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./rag_platform.db")
+        default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///./rag_platform.db")
     )
     redis_url: str = field(
         default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0")
