@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "rag-reliability-platform"
 version = "0.1.0"
 description = "RAG Reliability, Evaluation, Diagnosis and Regression Platform"
-readme = "MASTER_PLAN.md"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "Platform Team" }
