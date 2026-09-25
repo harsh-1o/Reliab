@@ -33,7 +33,7 @@ jobs:
 
       - name: Initialize Database (Alembic Migrations)
         run: |
-          alembic upgrade head
+          python -c "import alembic.config; alembic.config.main(argv=['upgrade', 'head'])"
 
       - name: Prepare Test Output Directory
         run: |
