@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Reliability & Release Engineering Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+    <!-- Header -->
+    <header>
+        <div class="header-title">
+            <h1>RAG Reliability Platform</h1>
+            <span class="badge-env">CI/CD Gate v0.2.0</span>
+            <span id="repro-badge" class="chip chip-neutral" style="display:none;"></span>
+        </div>
+        <div class="header-controls">
+            <select id="run-select" class="btn" onchange="loadSelectedRun()">
+                <option value="">Loading Evaluation Runs...</option>
+            </select>
+            <button class="btn" onclick="refreshDashboard()">Refresh</button>
+            <button class="btn btn-primary" onclick="triggerSeedRun()">Run Benchmark</button>
+        </div>
+    </header>
+
+    <!-- Main Container: Populated Dynamically -->
+    <main id="app-root">
+        <div class="empty-state">
+            <h4>Loading System State...</h4>
+            <p>Querying SQLite/Postgres datastore for evaluation runs.</p>
+        </div>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

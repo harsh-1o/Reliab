@@ -3,19 +3,37 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 from typing import Any
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Security, status
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from rag_platform.adapters import SyntheticRagAdapter, SyntheticRagMode
+from rag_platform.adapters import (
+    AdapterRegistry,
+    HttpRagAdapter,
+    PythonRagAdapter,
+    SyntheticRagAdapter,
+    SyntheticRagMode,
+)
 from rag_platform.attribution import FailureAttributionEngine
-from rag_platform.core import generate_id
-from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, RunRow, TraceRow, create_db_engine
+from rag_platform.core import generate_id, get_settings
+from rag_platform.db import (
+    Base,
+    DatabaseRepo,
+    DatasetRow,
+    ProjectRow,
+    RunRow,
+    TraceRow,
+    create_db_engine,
+)
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
@@ -28,17 +46,32 @@ from rag_platform.models import (
     RagTrace,
     ReleasePolicy,
     RunConfig,
+    RunOptions,
     RunProvenance,
     RunStatus,
     TestCase,
 )
 from rag_platform.regression import RegressionEngine
+from rag_platform.security import (
+    SecurityContext,
+    authenticate_request,
+    authorize_project,
+)
 
 # Initialize database
 engine = create_db_engine()
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="RAG Reliability & Hallucination Platform", version="0.2.0")
+app = FastAPI(
+    title="RAG Reliability Platform",
+    description="Automated failure attribution, regression testing, and quality release gates for RAG systems.",
+    version="2.1.0",
+)
+
+# Static directory setup
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 def get_db():
@@ -46,10 +79,38 @@ def get_db():
         yield session
 
 
-# --- API Request Models ---
+def create_session() -> Session:
+    """Create a database session, respecting any test dependency overrides."""
+    if get_db in app.dependency_overrides:
+        gen = app.dependency_overrides[get_db]()
+        return next(gen)
+    return Session(engine)
+
+
+
+def get_auth(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None),
+) -> SecurityContext:
+    """FastAPI dependency for authentication."""
+    return authenticate_request(x_api_key=x_api_key, authorization=authorization)
+
+
+@app.get("/health")
+@app.get("/v1/health")
+def health_check() -> dict[str, Any]:
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "version": "2.1.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --- API Request & Response Models ---
 class CreateProjectReq(BaseModel):
     name: str
-    settings: dict[str, Any] = {}
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class CreateDatasetReq(BaseModel):
@@ -57,7 +118,7 @@ class CreateDatasetReq(BaseModel):
     name: str
     version: str
     description: str | None = None
-    cases: list[TestCase] = []
+    cases: list[TestCase] = Field(default_factory=list)
 
 
 class CreateRunReq(BaseModel):
@@ -67,17 +128,29 @@ class CreateRunReq(BaseModel):
     system_version: str
     policy_id: str = "prod-default"
     mock_mode: str = "PERFECT"
+    adapter_type: str = "synthetic"
+    adapter_config: dict[str, Any] = Field(default_factory=dict)
+    model_name: str | None = None
+    model_version: str | None = None
+    temperature: float | None = 0.0
+    prompt_template: str | None = None
+    async_exec: bool = False
+    concurrency: int = 5
 
 
 class CompareReq(BaseModel):
     baseline_run_id: str
     candidate_run_id: str
-    policy: ReleasePolicy = ReleasePolicy()
+    policy: ReleasePolicy = Field(default_factory=ReleasePolicy)
 
 
 # --- REST API Endpoints ---
 @app.post("/v1/projects")
-def create_project(req: CreateProjectReq, db: Session = Depends(get_db)):
+def create_project(
+    req: CreateProjectReq,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
     repo = DatabaseRepo(db)
     proj = repo.create_project(name=req.name, settings=req.settings)
     db.commit()
@@ -85,13 +158,24 @@ def create_project(req: CreateProjectReq, db: Session = Depends(get_db)):
 
 
 @app.get("/v1/projects")
-def list_projects(db: Session = Depends(get_db)):
-    projects = db.scalars(select(ProjectRow)).all()
-    return {"projects": [{"id": p.id, "name": p.name} for p in projects]}
+def list_projects(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    query = select(ProjectRow).offset(offset).limit(limit)
+    projects = db.scalars(query).all()
+    return {"projects": [{"id": p.id, "name": p.name} for p in projects], "limit": limit, "offset": offset}
 
 
 @app.post("/v1/datasets")
-def create_dataset(req: CreateDatasetReq, db: Session = Depends(get_db)):
+def create_dataset(
+    req: CreateDatasetReq,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    authorize_project(req.project_id, auth)
     repo = DatabaseRepo(db)
     dataset = BenchmarkDataset(
         id=generate_id("ds"),
@@ -115,11 +199,52 @@ def create_dataset(req: CreateDatasetReq, db: Session = Depends(get_db)):
     return {"id": row.id, "checksum": row.checksum_sha256, "status": row.status}
 
 
+@app.get("/v1/datasets")
+def list_datasets(
+    project_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    if project_id:
+        authorize_project(project_id, auth)
+    query = select(DatasetRow)
+    if project_id:
+        query = query.where(DatasetRow.project_id == project_id)
+    query = query.offset(offset).limit(limit)
+    rows = db.scalars(query).all()
+    return {
+        "datasets": [
+            {
+                "id": r.id,
+                "project_id": r.project_id,
+                "name": r.name,
+                "version": r.version,
+                "status": r.status,
+                "checksum": r.checksum_sha256,
+            }
+            for r in rows
+        ],
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @app.get("/v1/runs")
-def list_runs(project_id: str | None = None, db: Session = Depends(get_db)):
+def list_runs(
+    project_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    if project_id:
+        authorize_project(project_id, auth)
     query = select(RunRow).order_by(RunRow.created_at.desc())
     if project_id:
         query = query.where(RunRow.project_id == project_id)
+    query = query.offset(offset).limit(limit)
     runs = db.scalars(query).all()
     eval_engine = EvaluationEngine()
 
@@ -152,11 +277,64 @@ def list_runs(project_id: str | None = None, db: Session = Depends(get_db)):
             "trace_count": len(r.traces),
             "summary": summary.model_dump() if summary else None,
         })
-    return {"runs": result}
+    return {"runs": result, "limit": limit, "offset": offset}
+
+
+async def _execute_evaluation_run(
+    run_id: str,
+    req: CreateRunReq,
+    config: RunConfig,
+    ds_cases: list[TestCase],
+    db_session: Session | None = None,
+) -> None:
+    """Execute evaluation run in background worker or synchronously with bounded concurrency."""
+    eval_engine = EvaluationEngine()
+    attr_engine = FailureAttributionEngine()
+
+    # Resolve adapter from registry or mock mode
+    if req.adapter_type == "synthetic" or req.mock_mode:
+        adapter = SyntheticRagAdapter(SyntheticRagMode(req.mock_mode or "PERFECT"))
+    else:
+        adapter = AdapterRegistry.get(req.adapter_type, **req.adapter_config)
+
+    sem = asyncio.Semaphore(req.concurrency)
+
+    # Acquire session (respecting dependency overrides if running in test)
+    sess = db_session if db_session is not None else create_session()
+    repo = DatabaseRepo(sess)
+    repo.update_run_status(run_id, RunStatus.RUNNING)
+    sess.commit()
+
+    async def _process_case(case: TestCase) -> tuple[RagTrace, list[MetricResult], Any]:
+        async with sem:
+            trace = await adapter.run(case, config)
+            trace.run_id = run_id
+            metrics = await eval_engine.evaluate_trace(trace, case)
+            diag = attr_engine.diagnose(trace, case, metrics)
+            return (trace, metrics, diag)
+
+    try:
+        tasks = [_process_case(c) for c in ds_cases]
+        results = await asyncio.gather(*tasks)
+
+        for trace, metrics, diag in results:
+            repo.record_trace(trace, metrics, diag)
+        repo.update_run_status(run_id, RunStatus.COMPLETED)
+        sess.commit()
+    except Exception:
+        repo.update_run_status(run_id, RunStatus.FAILED)
+        sess.commit()
+
 
 
 @app.post("/v1/runs")
-async def create_run(req: CreateRunReq, db: Session = Depends(get_db)):
+async def create_run(
+    req: CreateRunReq,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    authorize_project(req.project_id, auth)
     repo = DatabaseRepo(db)
     ds = repo.get_dataset(req.dataset_id)
     if not ds:
@@ -164,13 +342,15 @@ async def create_run(req: CreateRunReq, db: Session = Depends(get_db)):
 
     provenance = RunProvenance(
         dataset_checksum=ds.checksum_sha256,
-        rag_version=req.system_version,
-        model_config_hash="sha256_gpt4o_temp0",
-        prompt_hash="sha256_prompt_v1",
-        evaluator_version="2.0.0",
-        experiment_hash="sha256_exp_default",
         dataset_id=ds.id,
         dataset_version=ds.version,
+        rag_version=req.system_version,
+        model_name=req.model_name,
+        model_version=req.model_version,
+        temperature=req.temperature,
+        prompt_template=req.prompt_template,
+        adapter_type=req.adapter_type,
+        adapter_config=req.adapter_config,
     )
 
     config = RunConfig(
@@ -179,16 +359,11 @@ async def create_run(req: CreateRunReq, db: Session = Depends(get_db)):
         dataset_version=req.dataset_version or ds.version,
         system_version=req.system_version,
         policy_id=req.policy_id,
+        options=RunOptions(concurrency=req.concurrency),
     )
 
     run = repo.create_run(config, provenance)
-    repo.update_run_status(run.id, RunStatus.RUNNING)
     db.commit()
-
-    # Execute traces with synthetic adapter
-    adapter = SyntheticRagAdapter(SyntheticRagMode(req.mock_mode))
-    eval_engine = EvaluationEngine()
-    attr_engine = FailureAttributionEngine()
 
     cases = [
         TestCase(
@@ -201,32 +376,58 @@ async def create_run(req: CreateRunReq, db: Session = Depends(get_db)):
         for r in ds.cases
     ]
 
-    evaluated_pairs = []
-    for case in cases:
-        trace = await adapter.run(case, config)
-        trace.run_id = run.id
-        metrics = await eval_engine.evaluate_trace(trace, case)
-        attr = attr_engine.diagnose(trace, case, metrics)
-        repo.record_trace(trace, metrics, attr)
-        evaluated_pairs.append((trace, metrics))
+    if req.async_exec:
+        # Asynchronous execution with 202 Accepted response
+        background_tasks.add_task(_execute_evaluation_run, run.id, req, config, cases)
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "run_id": run.id,
+                "manifest_hash": run.manifest_hash,
+                "status": "QUEUED",
+                "message": "Evaluation run accepted for asynchronous execution.",
+            },
+        )
 
-    repo.update_run_status(run.id, RunStatus.COMPLETED)
-    db.commit()
+    # Synchronous execution
+    await _execute_evaluation_run(run.id, req, config, cases, db_session=db)
+    db.refresh(run)
 
-    summary = eval_engine.aggregate_run(evaluated_pairs)
+    eval_engine = EvaluationEngine()
+    traces = [
+        (
+            RagTrace.model_validate_json(t.raw_trace_json),
+            [
+                MetricResult(
+                    metric_name=m.metric_name,
+                    metric_family=MetricFamily(m.metric_family),
+                    score=m.score,
+                )
+                for m in t.metrics
+            ],
+        )
+        for t in run.traces
+    ]
+    summary = eval_engine.aggregate_run(traces) if traces else None
     return {
         "run_id": run.id,
         "manifest_hash": run.manifest_hash,
         "status": run.status,
-        "summary": summary.model_dump(),
+        "summary": summary.model_dump() if summary else None,
     }
 
 
 @app.get("/v1/runs/{run_id}")
-def get_run(run_id: str, db: Session = Depends(get_db)):
+def get_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
     run = db.get(RunRow, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    authorize_project(run.project_id, auth)
 
     eval_engine = EvaluationEngine()
     traces = [
@@ -260,26 +461,29 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/v1/runs/{run_id}/traces")
-def get_run_traces(run_id: str, failure_only: bool = False, db: Session = Depends(get_db)):
+def get_run_traces(
+    run_id: str,
+    failure_only: bool = False,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
     run = db.get(RunRow, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    authorize_project(run.project_id, auth)
+
     items = []
-    for t in run.traces:
+    traces_slice = run.traces[offset : offset + limit]
+    for t in traces_slice:
         if failure_only and not t.failure:
             continue
 
         raw = json.loads(t.raw_trace_json)
         chunks = raw.get("retrieved_chunks", [])
         citations = raw.get("citations", [])
-
-        # Extract claim verification from faithfulness metric if present
-        claims = []
-        for m in t.metrics:
-            if m.metric_name == "faithfulness" and m.reason:
-                # Metric reason captures claim-level verdict
-                claims.append({"reason": m.reason, "score": m.score})
 
         failure_obj = None
         if t.failure:
@@ -307,15 +511,22 @@ def get_run_traces(run_id: str, failure_only: bool = False, db: Session = Depend
             "metrics": [{"name": m.metric_name, "score": m.score, "reason": m.reason} for m in t.metrics],
             "failure": failure_obj,
         })
-    return {"run_id": run_id, "traces": items}
+    return {"run_id": run_id, "traces": items, "limit": limit, "offset": offset, "total": len(run.traces)}
 
 
 @app.post("/v1/compare")
-def compare_runs(req: CompareReq, db: Session = Depends(get_db)):
+def compare_runs(
+    req: CompareReq,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
     b_run = db.get(RunRow, req.baseline_run_id)
     c_run = db.get(RunRow, req.candidate_run_id)
     if not b_run or not c_run:
         raise HTTPException(status_code=404, detail="Baseline or candidate run not found")
+
+    authorize_project(b_run.project_id, auth)
+    authorize_project(c_run.project_id, auth)
 
     eval_engine = EvaluationEngine()
     b_traces = [
@@ -350,13 +561,12 @@ def compare_runs(req: CompareReq, db: Session = Depends(get_db)):
     b_summary = eval_engine.aggregate_run(b_traces)
     c_summary = eval_engine.aggregate_run(c_traces)
 
-    # Calculate per-case scores for regression tracking
     b_case_scores = {
-        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness"), 0.5)
+        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), 0.5)
         for t in b_run.traces
     }
     c_case_scores = {
-        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness"), 0.5)
+        t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), 0.5)
         for t in c_run.traces
     }
 
@@ -385,7 +595,10 @@ def compare_runs(req: CompareReq, db: Session = Depends(get_db)):
 
 
 @app.post("/v1/demo-run")
-async def seed_demo_run(db: Session = Depends(get_db)):
+async def seed_demo_run(
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
     """Convenience helper to bootstrap an evaluation run with real data for dashboard demonstration."""
     repo = DatabaseRepo(db)
     proj = db.query(ProjectRow).filter_by(name="Enterprise Knowledge Bot").first()
@@ -432,10 +645,6 @@ async def seed_demo_run(db: Session = Depends(get_db)):
     prov_b = RunProvenance(
         dataset_checksum=published_ds.checksum_sha256,
         rag_version="git-v1.0.0",
-        model_config_hash="sha256_gpt4o_baseline",
-        prompt_hash="sha256_prompt_v1",
-        evaluator_version="2.0.0",
-        experiment_hash="sha256_exp_baseline",
         dataset_id=published_ds.id,
         dataset_version=published_ds.version,
     )
@@ -467,10 +676,6 @@ async def seed_demo_run(db: Session = Depends(get_db)):
     prov_c = RunProvenance(
         dataset_checksum=published_ds.checksum_sha256,
         rag_version="git-v1.1.0-candidate",
-        model_config_hash="sha256_gpt4o_cand",
-        prompt_hash="sha256_prompt_v2",
-        evaluator_version="2.0.0",
-        experiment_hash="sha256_exp_cand",
         dataset_id=published_ds.id,
         dataset_version=published_ds.version,
     )
@@ -499,716 +704,9 @@ async def seed_demo_run(db: Session = Depends(get_db)):
 
 
 # --- Serious Engineering Dashboard UI ---
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/dashboard")
 def get_dashboard():
-    return """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RAG Reliability & Release Engineering Console</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg: #09090b;
-            --panel: #121316;
-            --panel-elevated: #18191e;
-            --border: #27272a;
-            --border-subtle: #1e1f24;
-            --text: #f4f4f5;
-            --text-muted: #a1a1aa;
-            --text-dim: #71717a;
-            --pass: #10b981;
-            --pass-bg: rgba(16, 185, 129, 0.08);
-            --fail: #f43f5e;
-            --fail-bg: rgba(244, 63, 94, 0.08);
-            --warn: #f59e0b;
-            --warn-bg: rgba(245, 158, 11, 0.08);
-            --neutral: #38bdf8;
-            --neutral-bg: rgba(56, 189, 248, 0.08);
-            --font-mono: 'JetBrains Mono', monospace;
-            --font-sans: 'Inter', -apple-system, sans-serif;
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            background-color: var(--bg);
-            color: var(--text);
-            font-family: var(--font-sans);
-            font-size: 13px;
-            line-height: 1.5;
-            padding: 24px 32px;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        /* Header */
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 24px;
-        }
-        .header-title {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .header-title h1 {
-            font-size: 15px;
-            font-weight: 600;
-            letter-spacing: -0.01em;
-            color: var(--text);
-        }
-        .badge-env {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            padding: 2px 8px;
-            background: #27272a;
-            border: 1px solid #3f3f46;
-            border-radius: 4px;
-            color: #d4d4d8;
-        }
-        .header-controls {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .btn {
-            font-family: var(--font-mono);
-            font-size: 12px;
-            padding: 6px 12px;
-            border-radius: 4px;
-            border: 1px solid var(--border);
-            background: var(--panel);
-            color: var(--text);
-            cursor: pointer;
-            transition: background 150ms ease, border-color 150ms ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .btn:hover {
-            border-color: #52525b;
-            background: var(--panel-elevated);
-        }
-        .btn-primary {
-            background: #2563eb;
-            border-color: #3b82f6;
-            color: #ffffff;
-        }
-        .btn-primary:hover {
-            background: #1d4ed8;
-        }
-        select.btn {
-            appearance: none;
-            padding-right: 24px;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-            background-repeat: no-repeat;
-            background-position: right 8px center;
-        }
-
-        /* Executive Story Banner */
-        .story-bar {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 14px 18px;
-            margin-bottom: 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .story-content h2 {
-            font-size: 14px;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .story-content p {
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-top: 2px;
-        }
-        .story-status {
-            font-family: var(--font-mono);
-            font-size: 12px;
-            font-weight: 600;
-            padding: 4px 12px;
-            border-radius: 4px;
-        }
-        .status-pass {
-            background: var(--pass-bg);
-            border: 1px solid rgba(16, 185, 129, 0.25);
-            color: var(--pass);
-        }
-        .status-fail {
-            background: var(--fail-bg);
-            border: 1px solid rgba(244, 63, 94, 0.25);
-            color: var(--fail);
-        }
-
-        /* Metric Grid */
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-            gap: 12px;
-            margin-bottom: 24px;
-        }
-        .metric-tile {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 14px 16px;
-        }
-        .metric-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-            margin-bottom: 6px;
-        }
-        .metric-label {
-            font-size: 11px;
-            font-weight: 500;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-        }
-        .metric-val {
-            font-family: var(--font-mono);
-            font-size: 24px;
-            font-weight: 600;
-            color: var(--text);
-            letter-spacing: -0.02em;
-        }
-        .metric-footer {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-top: 6px;
-            font-size: 11px;
-            font-family: var(--font-mono);
-        }
-        .delta-tag {
-            font-weight: 600;
-        }
-        .delta-improved { color: var(--pass); }
-        .delta-regressed { color: var(--fail); }
-        .delta-neutral { color: var(--text-dim); }
-        .ci-span {
-            color: var(--text-dim);
-            font-size: 10px;
-        }
-
-        /* Main Section Container */
-        .section-box {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            margin-bottom: 24px;
-        }
-        .section-title {
-            padding: 14px 18px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .section-title h3 {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text);
-        }
-
-        /* Trace Debugger Table */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12px;
-        }
-        th {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            color: var(--text-dim);
-            text-align: left;
-            padding: 10px 16px;
-            background: #101114;
-            border-bottom: 1px solid var(--border);
-        }
-        td {
-            padding: 12px 16px;
-            border-bottom: 1px solid var(--border-subtle);
-            vertical-align: top;
-        }
-        tr.trace-row {
-            cursor: pointer;
-            transition: background 120ms ease;
-        }
-        tr.trace-row:hover {
-            background: #16171b;
-        }
-        tr.expanded {
-            background: #16171b;
-        }
-
-        /* Chips & Badges */
-        .chip {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            font-weight: 600;
-            padding: 2px 6px;
-            border-radius: 4px;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-        }
-        .chip-pass { background: var(--pass-bg); border: 1px solid rgba(16, 185, 129, 0.25); color: var(--pass); }
-        .chip-fail { background: var(--fail-bg); border: 1px solid rgba(244, 63, 94, 0.25); color: var(--fail); }
-        .chip-warn { background: var(--warn-bg); border: 1px solid rgba(245, 158, 11, 0.25); color: var(--warn); }
-        .chip-neutral { background: var(--neutral-bg); border: 1px solid rgba(56, 189, 248, 0.25); color: var(--neutral); }
-
-        /* Detail Pane for Root Cause Analysis */
-        .detail-row {
-            background: #0f1013;
-        }
-        .detail-pane {
-            padding: 18px 24px;
-            border-bottom: 1px solid var(--border);
-        }
-        .pipeline-stepper {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 12px;
-            margin-bottom: 16px;
-        }
-        .step-card {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 12px;
-        }
-        .step-label {
-            font-family: var(--font-mono);
-            font-size: 10px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-dim);
-            margin-bottom: 6px;
-        }
-        .step-body {
-            font-size: 12px;
-            line-height: 1.4;
-            max-height: 140px;
-            overflow-y: auto;
-        }
-        .chunk-pill {
-            font-family: var(--font-mono);
-            font-size: 11px;
-            background: #1e1f24;
-            padding: 4px 8px;
-            border-radius: 4px;
-            margin-bottom: 4px;
-            border: 1px solid #2e2f38;
-        }
-        .claim-item {
-            padding: 6px 8px;
-            border-radius: 4px;
-            margin-bottom: 6px;
-            background: #15161a;
-            border: 1px solid #27272a;
-            font-size: 11px;
-        }
-
-        /* Empty State */
-        .empty-state {
-            padding: 60px 20px;
-            text-align: center;
-        }
-        .empty-state h4 {
-            font-size: 15px;
-            font-weight: 600;
-            margin-bottom: 8px;
-        }
-        .empty-state p {
-            color: var(--text-muted);
-            margin-bottom: 18px;
-            max-width: 480px;
-            margin-left: auto;
-            margin-right: auto;
-        }
-        .cli-box {
-            font-family: var(--font-mono);
-            font-size: 12px;
-            background: #000000;
-            border: 1px solid var(--border);
-            padding: 10px 14px;
-            border-radius: 4px;
-            display: inline-block;
-            color: #38bdf8;
-            margin-bottom: 16px;
-        }
-    </style>
-</head>
-<body>
-
-    <!-- Header -->
-    <header>
-        <div class="header-title">
-            <h1>RAG Reliability Platform</h1>
-            <span class="badge-env">CI/CD Gate v0.2.0</span>
-            <span id="repro-badge" class="chip chip-neutral" style="display:none;"></span>
-        </div>
-        <div class="header-controls">
-            <select id="run-select" class="btn" onchange="loadSelectedRun()">
-                <option value="">Loading Evaluation Runs...</option>
-            </select>
-            <button class="btn" onclick="refreshDashboard()">Refresh</button>
-            <button class="btn btn-primary" onclick="triggerSeedRun()">Run Benchmark</button>
-        </div>
-    </header>
-
-    <!-- Main Container: Populated Dynamically -->
-    <main id="app-root">
-        <div class="empty-state">
-            <h4>Loading System State...</h4>
-            <p>Querying SQLite/Postgres datastore for evaluation runs.</p>
-        </div>
-    </main>
-
-    <script>
-        let currentRun = null;
-        let baselineRun = null;
-        let runTraces = [];
-
-        async function init() {
-            await fetchRuns();
-        }
-
-        async function fetchRuns() {
-            try {
-                const res = await fetch('/v1/runs');
-                const data = await res.json();
-                const runs = data.runs || [];
-                const selector = document.getElementById('run-select');
-
-                if (runs.length === 0) {
-                    renderEmptyState();
-                    return;
-                }
-
-                selector.innerHTML = runs.map((r, i) =>
-                    `<option value="${r.id}" ${i === 0 ? 'selected' : ''}>${r.system_version} (${r.id.substring(0, 10)}) - ${r.trace_count} cases</option>`
-                ).join('');
-
-                currentRun = runs[0];
-                baselineRun = runs.length > 1 ? runs[1] : null;
-
-                renderRunDashboard(currentRun, baselineRun);
-                await loadTraces(currentRun.id);
-            } catch (err) {
-                console.error("Failed to load runs:", err);
-                renderEmptyState("Datastore unreachable. Ensure backend is running.");
-            }
-        }
-
-        async function loadSelectedRun() {
-            const runId = document.getElementById('run-select').value;
-            if (!runId) return;
-            const res = await fetch(`/v1/runs/${runId}`);
-            currentRun = await res.json();
-            renderRunDashboard(currentRun, baselineRun);
-            await loadTraces(runId);
-        }
-
-        async function loadTraces(runId) {
-            try {
-                const res = await fetch(`/v1/runs/${runId}/traces`);
-                const data = await res.json();
-                runTraces = data.traces || [];
-                renderTraceTable(runTraces);
-            } catch(e) {
-                console.error("Failed loading traces", e);
-            }
-        }
-
-        function renderRunDashboard(run, baseline) {
-            const root = document.getElementById('app-root');
-            const summary = run.summary || {};
-            const metrics = summary.metrics || {};
-
-            const faith = metrics.faithfulness || { mean: 0.0, count: 0, std_dev: 0 };
-            const recall = metrics.recall_at_5 || { mean: 0.0, count: 0, std_dev: 0 };
-            const cit = metrics.citation_accuracy || { mean: 0.0, count: 0, std_dev: 0 };
-            const abst = summary.abstention_accuracy !== undefined ? summary.abstention_accuracy : 1.0;
-            const p95_lat = summary.p95_latency_ms || 0;
-            const cost = summary.total_cost_usd || 0;
-            const halluc_rate = summary.hallucination_rate || 0.0;
-
-            // Baseline deltas if available
-            const bMetrics = baseline && baseline.summary ? baseline.summary.metrics || {} : {};
-            const dFaith = bMetrics.faithfulness ? (faith.mean - bMetrics.faithfulness.mean) : null;
-            const dRecall = bMetrics.recall_at_5 ? (recall.mean - bMetrics.recall_at_5.mean) : null;
-
-            // Update Provenance Hash Badge
-            const repro = document.getElementById('repro-badge');
-            if (run.manifest_hash) {
-                repro.style.display = 'inline-flex';
-                repro.textContent = `SHA256: ${run.manifest_hash.substring(0, 10)}`;
-            }
-
-            const isPassed = halluc_rate <= 0.05 && faith.mean >= 0.85;
-
-            root.innerHTML = `
-                <!-- Executive Story Bar -->
-                <div class="story-bar">
-                    <div class="story-content">
-                        <h2>
-                            ${isPassed ? '✓ Candidate Satisfies Release Guardrails' : '❌ Release Quality Gate Blocked'}
-                        </h2>
-                        <p>Evaluated ${run.trace_count} test cases on benchmark <code>${run.dataset_id}</code> against commit <code>${run.system_version}</code>.</p>
-                    </div>
-                    <div class="story-status ${isPassed ? 'status-pass' : 'status-fail'}">
-                        GATE: ${isPassed ? 'PASS' : 'BLOCKED'}
-                    </div>
-                </div>
-
-                <!-- Core Metric Tiles with 95% Confidence Intervals -->
-                <div class="metric-grid">
-                    <div class="metric-tile">
-                        <div class="metric-header">
-                            <span class="metric-label">Claim Faithfulness</span>
-                            <span class="chip ${faith.mean >= 0.85 ? 'chip-pass' : 'chip-fail'}">${faith.mean >= 0.85 ? 'HEALTHY' : 'DRIFT'}</span>
-                        </div>
-                        <div class="metric-val">${(faith.mean * 100).toFixed(1)}%</div>
-                        <div class="metric-footer">
-                            <span class="delta-tag ${dFaith && dFaith >= 0 ? 'delta-improved' : 'delta-regressed'}">
-                                ${dFaith !== null ? (dFaith >= 0 ? '+' : '') + (dFaith * 100).toFixed(1) + '% vs base' : 'N=' + faith.count}
-                            </span>
-                            <span class="ci-span">95% CI: [${faith.ci_lower || 0}, ${faith.ci_upper || 1}]</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-tile">
-                        <div class="metric-header">
-                            <span class="metric-label">Evidence Recall@5</span>
-                            <span class="chip ${recall.mean >= 0.90 ? 'chip-pass' : 'chip-warn'}">RANKED</span>
-                        </div>
-                        <div class="metric-val">${(recall.mean * 100).toFixed(1)}%</div>
-                        <div class="metric-footer">
-                            <span class="delta-tag ${dRecall && dRecall >= 0 ? 'delta-improved' : 'delta-regressed'}">
-                                ${dRecall !== null ? (dRecall >= 0 ? '+' : '') + (dRecall * 100).toFixed(1) + '% vs base' : 'N=' + recall.count}
-                            </span>
-                            <span class="ci-span">95% CI: [${recall.ci_lower || 0}, ${recall.ci_upper || 1}]</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-tile">
-                        <div class="metric-header">
-                            <span class="metric-label">Citation Accuracy</span>
-                            <span class="chip chip-neutral">VERIFIED</span>
-                        </div>
-                        <div class="metric-val">${(cit.mean * 100).toFixed(1)}%</div>
-                        <div class="metric-footer">
-                            <span class="delta-tag delta-neutral">Evidence Links</span>
-                            <span class="ci-span">N=${cit.count}</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-tile">
-                        <div class="metric-header">
-                            <span class="metric-label">Abstention Accuracy</span>
-                            <span class="chip ${abst >= 0.90 ? 'chip-pass' : 'chip-fail'}">BOUNDARY</span>
-                        </div>
-                        <div class="metric-val">${(abst * 100).toFixed(1)}%</div>
-                        <div class="metric-footer">
-                            <span class="delta-tag delta-neutral">Unanswerable Handling</span>
-                            <span class="ci-span">N=${run.trace_count}</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-tile">
-                        <div class="metric-header">
-                            <span class="metric-label">P95 Latency & Cost</span>
-                            <span class="chip chip-neutral">${p95_lat}ms</span>
-                        </div>
-                        <div class="metric-val">${p95_lat}ms</div>
-                        <div class="metric-footer">
-                            <span class="delta-tag delta-neutral">Cost: $${cost.toFixed(4)}</span>
-                            <span class="ci-span">P95 Budget &le; 1200ms</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Trace Debugger & Deep Causal Analysis -->
-                <div class="section-box">
-                    <div class="section-title">
-                        <h3>Evaluation Traces & Root Cause Inspector</h3>
-                        <div>
-                            <button class="btn" onclick="filterTraces('all')">All Traces</button>
-                            <button class="btn" onclick="filterTraces('fail')">Failed Traces Only</button>
-                        </div>
-                    </div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Trace ID</th>
-                                <th>Question</th>
-                                <th>Faithfulness</th>
-                                <th>Recall</th>
-                                <th>Primary Diagnosis</th>
-                                <th>Contributing Causes</th>
-                            </tr>
-                        </thead>
-                        <tbody id="trace-table-body">
-                            <tr><td colspan="6" style="text-align:center; color:var(--text-dim);">Loading execution traces...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            `;
-        }
-
-        function renderTraceTable(traces) {
-            const tbody = document.getElementById('trace-table-body');
-            if (!tbody) return;
-
-            if (traces.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding: 24px; color: var(--text-dim);">No traces recorded for this evaluation run.</td></tr>`;
-                return;
-            }
-
-            tbody.innerHTML = traces.map((t, idx) => {
-                const faith = t.metrics.find(m => m.name === 'faithfulness');
-                const recall = t.metrics.find(m => m.name === 'recall_at_5');
-                const fScore = faith ? faith.score.toFixed(2) : '-';
-                const rScore = recall ? recall.score.toFixed(2) : '-';
-
-                const fail = t.failure;
-                const pCode = fail ? fail.primary_code : 'PASS';
-                const contrib = fail && fail.contributing_codes && fail.contributing_codes.length > 0
-                    ? fail.contributing_codes.map(c => `<span class="chip chip-warn">${c}</span>`).join(' ')
-                    : '<span style="color:var(--text-dim);">-</span>';
-
-                const statusChip = fail
-                    ? `<span class="chip chip-fail">${pCode}</span>`
-                    : `<span class="chip chip-pass">PASS</span>`;
-
-                return `
-                    <tr class="trace-row" onclick="toggleTraceDetail('tr-detail-${idx}')">
-                        <td style="font-family:var(--font-mono); color:#38bdf8;">${t.trace_id.substring(0, 10)}</td>
-                        <td>${t.question}</td>
-                        <td style="font-family:var(--font-mono); color:${fScore >= 0.70 ? 'var(--pass)' : 'var(--fail)'};">${fScore}</td>
-                        <td style="font-family:var(--font-mono);">${rScore}</td>
-                        <td>${statusChip}</td>
-                        <td>${contrib}</td>
-                    </tr>
-                    <tr id="tr-detail-${idx}" class="detail-row" style="display:none;">
-                        <td colspan="6" class="detail-pane">
-                            <div class="pipeline-stepper">
-                                <!-- Step 1: Retrieval Chunks -->
-                                <div class="step-card">
-                                    <div class="step-label">1. Retrieved Context Chunks</div>
-                                    <div class="step-body">
-                                        ${t.chunks && t.chunks.length > 0 ? t.chunks.map(c =>
-                                            `<div class="chunk-pill"><strong>[Rank ${c.rank}] ${c.document_id}:${c.chunk_id}</strong><br/>${c.text.substring(0, 140)}...</div>`
-                                        ).join('') : '<p style="color:var(--text-dim);">No context retrieved.</p>'}
-                                    </div>
-                                </div>
-
-                                <!-- Step 2: Generated Response -->
-                                <div class="step-card">
-                                    <div class="step-label">2. Generated Answer & Citations</div>
-                                    <div class="step-body">
-                                        <p style="margin-bottom:6px;">${t.answer || (t.abstained ? '<em>Abstained: ' + (t.abstention_reason || 'insufficient evidence') + '</em>' : '<em>Empty</em>')}</p>
-                                        ${t.citations && t.citations.length > 0 ? t.citations.map(c =>
-                                            `<span class="chip chip-neutral" style="font-size:10px;">Cited: ${c.document_id}:${c.chunk_id}</span>`
-                                        ).join(' ') : ''}
-                                    </div>
-                                </div>
-
-                                <!-- Step 3: Diagnostic Findings -->
-                                <div class="step-card">
-                                    <div class="step-label">3. Root Cause Explanation</div>
-                                    <div class="step-body">
-                                        ${fail ? `
-                                            <p style="color:var(--fail); font-weight:600; margin-bottom:4px;">Primary: ${fail.primary_code} (Conf: ${(fail.confidence * 100).toFixed(0)}%)</p>
-                                            <p style="font-size:11px; color:#d4d4d8;">${fail.explanation}</p>
-                                        ` : '<p style="color:var(--pass);">✓ All claims verified against retrieved evidence.</p>'}
-                                    </div>
-                                </div>
-
-                                <!-- Step 4: Recommended Action -->
-                                <div class="step-card">
-                                    <div class="step-label">4. Remediation Action</div>
-                                    <div class="step-body">
-                                        ${fail && fail.recommended_actions && fail.recommended_actions.length > 0 ? `
-                                            <ul style="padding-left:14px; color:var(--text-muted); font-size:11px;">
-                                                ${fail.recommended_actions.map(a => `<li>${a}</li>`).join('')}
-                                            </ul>
-                                        ` : '<p style="color:var(--text-dim);">No corrective action required.</p>'}
-                                    </div>
-                                </div>
-                            </div>
-                        </td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        function toggleTraceDetail(id) {
-            const el = document.getElementById(id);
-            if (!el) return;
-            el.style.display = (el.style.display === 'table-row') ? 'none' : 'table-row';
-        }
-
-        function filterTraces(type) {
-            if (type === 'fail') {
-                const fails = runTraces.filter(t => t.failure !== null);
-                renderTraceTable(fails);
-            } else {
-                renderTraceTable(runTraces);
-            }
-        }
-
-        function renderEmptyState(msg) {
-            const root = document.getElementById('app-root');
-            root.innerHTML = `
-                <div class="empty-state">
-                    <h4>No Benchmark Evaluation Runs Found</h4>
-                    <p>${msg || 'Initialize your first evaluation run via the CLI, REST API, or click below to bootstrap an evaluation run with live golden benchmarks.'}</p>
-                    <div class="cli-box">python -m rag_platform.gate --project prj-001 --dataset ds-gold --system-version git-abc123</div>
-                    <br/>
-                    <button class="btn btn-primary" onclick="triggerSeedRun()">Initialize Sample Benchmark Run</button>
-                </div>
-            `;
-        }
-
-        async function triggerSeedRun() {
-            try {
-                const res = await fetch('/v1/demo-run', { method: 'POST' });
-                const data = await res.json();
-                if (data.status === 'SUCCESS') {
-                    await fetchRuns();
-                } else {
-                    alert('Error creating benchmark run: ' + JSON.stringify(data));
-                }
-            } catch(e) {
-                alert('Benchmark trigger failed: ' + e);
-            }
-        }
-
-        function refreshDashboard() {
-            fetchRuns();
-        }
-
-        window.onload = init;
-    </script>
-</body>
-</html>"""
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file), media_type="text/html")
+    return HTMLResponse("<h1>RAG Reliability Platform</h1><p>Dashboard static files missing.</p>")

@@ -1,13 +1,14 @@
-name: RAG Reliability Quality Gate
+name: RAG Reliability Quality Gate & CI/CD Pipeline
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ master, main ]
   push:
-    branches: [ main ]
+    branches: [ master, main ]
 
 jobs:
   rag-gate:
+    name: Build, Test & Release Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -19,22 +20,40 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Platform Dependencies
+      - name: Install Platform Dependencies & Verification
         run: |
-          pip install --upgrade pip
-          pip install -e .
+          python -m pip install --upgrade pip
+          pip install -e ".[ml]" pytest pytest-asyncio pytest-cov httpx
+          python -c "import rag_platform; import alembic; print('Platform dependencies verified successfully.')"
 
-      - name: Execute RAG Quality Gate (Fail-Closed)
+      - name: Initialize Database (Alembic Migrations)
+        run: |
+          python -m alembic upgrade head
+
+      - name: Run Unit & Integration Tests
+        run: |
+          pytest tests/ -v --junit-xml=test-results/unit-tests.xml
+
+      - name: Seed Benchmark & Execute RAG Quality Gate (Fail-Closed)
         run: |
           python -m rag_platform.gate \
-            --project proj_default \
-            --dataset ds_locked_benchmark \
+            --bootstrap \
+            --project proj_ci \
+            --dataset ds_ci_benchmark \
             --system-version ${{ github.sha }} \
             --policy prod-default \
             --junit-xml test-results/rag-gate.xml
+
+      - name: Upload Test and Gate Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rag-evaluation-reports
+          path: test-results/
 
       - name: Publish Test Results
         uses: EnricoMi/publish-unit-test-result-action@v2
         if: always()
         with:
           files: "test-results/**/*.xml"
+

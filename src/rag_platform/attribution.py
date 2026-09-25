@@ -197,7 +197,7 @@ class FailureAttributionEngine:
                         )
                     )
 
-                if faith_metric.score < 0.60:
+                if faith_metric.score is not None and faith_metric.score < 0.60:
                     findings.append(
                         DiagnosticFinding(
                             code=FailureCode.GEN_01,
@@ -265,6 +265,7 @@ class FailureAttributionEngine:
         corr_metric = metric_map.get("answer_correctness")
         if (
             corr_metric
+            and corr_metric.score is not None
             and corr_metric.score < 0.25
             and case.expected_answer
             and not trace.abstained

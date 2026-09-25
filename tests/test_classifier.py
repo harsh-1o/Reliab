@@ -47,7 +47,7 @@ def test_feature_extractor(sample_trace_and_case):
     assert len(features) == len(FeatureExtractor.FEATURE_NAMES)
     assert features[2] == 0.0  # abstained = False
     assert features[3] == 1.0  # num_chunks = 1
-    assert features[7] == 1.0  # faithfulness = 1.0
+    assert features[7] == 150.0  # latency_ms = 150.0
 
 
 def test_ml_classifier_training_and_prediction():

@@ -1,11 +1,10 @@
-"""CI/CD headless release quality gate CLI and JUnit XML reporter.
-
-# ponytail: single file for argparse CLI, gate evaluator, and JUnit XML generation.
-"""
+"""CI/CD headless release quality gate CLI and JUnit XML reporter."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -19,6 +18,8 @@ from rag_platform.core import generate_id
 from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, create_db_engine
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
+    Answerability,
+    BenchmarkDataset,
     DocumentReference,
     GateResult,
     GateStatus,
@@ -43,7 +44,7 @@ def format_junit_xml(gate_result: GateResult) -> str:
     )
 
     if not gate_result.violations:
-        tc = ET.SubElement(suite, "testcase", classname="rag.policy", name="ReleaseThresholds", time="0.0")
+        ET.SubElement(suite, "testcase", classname="rag.policy", name="ReleaseThresholds", time="0.0")
     else:
         for v in gate_result.violations:
             tc = ET.SubElement(suite, "testcase", classname="rag.policy", name=v.metric_name, time="0.0")
@@ -51,6 +52,136 @@ def format_junit_xml(gate_result: GateResult) -> str:
             fail.text = f"Candidate Value: {v.candidate_value}, Threshold: {v.threshold}"
 
     return ET.tostring(suites, encoding="utf-8", xml_declaration=True).decode("utf-8")
+
+
+def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str) -> None:
+    """Ensure project and benchmark dataset exist in database before evaluation."""
+    from rag_platform.models import compute_dataset_checksum
+    from rag_platform.db import TestCaseRow, DatasetStatus
+
+    project = db_session.get(ProjectRow, project_id)
+    if not project:
+        project = ProjectRow(
+            id=project_id,
+            name=f"CI Project {project_id}",
+            settings_json=json.dumps({"ci_bootstrap": True}),
+        )
+        db_session.add(project)
+        db_session.commit()
+
+    ds_row = db_session.get(DatasetRow, dataset_id)
+    if not ds_row:
+        cases = [
+            TestCase(
+                id="case_001_retrieval_facts",
+                question="What was Acme Corp's total Q3 revenue and year-over-year growth?",
+                expected_answer="Acme Corp's Q3 revenue was $142.5 million, representing a 14% year-over-year growth.",
+                expected_facts=["Acme Corp Q3 revenue was $142.5 million", "Year-over-year growth was 14%"],
+                relevant_documents=[
+                    DocumentReference(
+                        document_id="doc_q3_report",
+                        chunk_id="chunk_01",
+                        text="Acme Corp reported Q3 revenue of $142.5 million, an increase of 14% year-over-year.",
+                    )
+                ],
+                answerability=Answerability.ANSWERABLE,
+                tags=["financial", "factual"],
+            ),
+            TestCase(
+                id="case_002_multi_hop",
+                question="What is the CEO of Acme Corp's background prior to taking the role?",
+                expected_answer="Before becoming CEO of Acme Corp in 2021, Jane Doe was VP of Operations at Globex.",
+                expected_facts=["Jane Doe became CEO in 2021", "Prior role was VP of Operations at Globex"],
+                relevant_documents=[
+                    DocumentReference(
+                        document_id="doc_exec_bio",
+                        chunk_id="chunk_02",
+                        text="Jane Doe was appointed CEO of Acme Corp in 2021. Prior to this, she served as VP of Operations at Globex for six years.",
+                    )
+                ],
+                answerability=Answerability.ANSWERABLE,
+                tags=["multi-hop", "executive"],
+            ),
+            TestCase(
+                id="case_003_unanswerable_security",
+                question="What is the database root password for the internal production cluster?",
+                expected_answer="",
+                expected_facts=[],
+                relevant_documents=[],
+                answerability=Answerability.UNANSWERABLE,
+                tags=["unanswerable", "security"],
+            ),
+            TestCase(
+                id="case_004_refund_policy",
+                question="What is the standard refund window for software license renewals?",
+                expected_answer="Customers can receive refunds within 30 days of the renewal date.",
+                expected_facts=["Refunds are permitted within 30 days of renewal"],
+                relevant_documents=[
+                    DocumentReference(
+                        document_id="doc_tos",
+                        chunk_id="chunk_03",
+                        text="Refunds are permitted within one month of license renewal upon written request.",
+                    )
+                ],
+                answerability=Answerability.ANSWERABLE,
+                tags=["policy", "semantic-equivalence"],
+            ),
+            TestCase(
+                id="case_005_numerical_conflict",
+                question="What was the total capital expenditure in 2023?",
+                expected_answer="Capital expenditure for 2023 was $80M.",
+                expected_facts=["Capital expenditure was $80M in 2023"],
+                relevant_documents=[
+                    DocumentReference(
+                        document_id="doc_capex",
+                        chunk_id="chunk_04",
+                        text="Total capital expenditure for fiscal year 2023 was $80M, down from $95M in 2022.",
+                    )
+                ],
+                answerability=Answerability.ANSWERABLE,
+                tags=["numerical", "finance"],
+            ),
+            TestCase(
+                id="case_006_unsupported_claim_detection",
+                question="What were the headcount additions in 2023?",
+                expected_answer="Acme Corp added 450 engineers in 2023.",
+                expected_facts=["Added 450 engineers in 2023"],
+                relevant_documents=[
+                    DocumentReference(
+                        document_id="doc_hr",
+                        chunk_id="chunk_05",
+                        text="During 2023, Acme Corp expanded its engineering team by adding 450 engineers across existing hubs.",
+                    )
+                ],
+                answerability=Answerability.ANSWERABLE,
+                tags=["claims", "hr"],
+            ),
+        ]
+        checksum = compute_dataset_checksum(cases)
+        ds_row = DatasetRow(
+            id=dataset_id,
+            project_id=project_id,
+            name="Locked Gold CI Benchmark",
+            version="1.0.0",
+            description="Golden locked benchmark dataset for regression and gate evaluation.",
+            status=DatasetStatus.PUBLISHED.value,
+            checksum_sha256=checksum,
+        )
+        db_session.add(ds_row)
+        for c in cases:
+            tc_row = TestCaseRow(
+                id=c.id,
+                dataset_id=dataset_id,
+                question=c.question,
+                expected_answer=c.expected_answer,
+                expected_facts_json=json.dumps(c.expected_facts),
+                relevant_docs_json=json.dumps([d.model_dump() for d in c.relevant_documents]),
+                answerability=c.answerability.value,
+                tags_json=json.dumps(c.tags),
+                metadata_json=json.dumps(c.metadata),
+            )
+            db_session.add(tc_row)
+        db_session.commit()
 
 
 def execute_gate_evaluation(
@@ -61,22 +192,29 @@ def execute_gate_evaluation(
     policy: ReleasePolicy | None = None,
     mock_mode: SyntheticRagMode = SyntheticRagMode.PERFECT,
     junit_xml_path: str | None = None,
+    bootstrap: bool = False,
 ) -> tuple[int, GateResult]:
     """Execute evaluation run and evaluate against policy gate. Returns (exit_code, GateResult)."""
+    if bootstrap:
+        bootstrap_ci_database(db_session, project_id, dataset_id)
+
     repo = DatabaseRepo(db_session)
     active_policy = policy or ReleasePolicy()
 
     ds_row = db_session.get(DatasetRow, dataset_id)
     if not ds_row:
-        raise ValueError(f"Dataset {dataset_id} not found")
+        raise ValueError(f"Dataset {dataset_id} not found. Use --bootstrap to seed benchmark datasets automatically.")
 
     provenance = RunProvenance(
         dataset_checksum=ds_row.checksum_sha256,
+        dataset_id=dataset_id,
+        dataset_version=ds_row.version,
         rag_version=system_version,
-        model_config_hash="ci_model_default",
-        prompt_hash="ci_prompt_default",
-        evaluator_version="1.0.0",
-        experiment_hash="ci_exp_default",
+        model_name="synthetic-benchmark-engine",
+        model_version="1.0.0",
+        evaluator_version="2.0.0",
+        adapter_type=f"synthetic:{mock_mode.value}",
+        environment_info={"ci": "true", "platform": sys.platform, "python": sys.version.split()[0]},
     )
 
     config = RunConfig(
@@ -95,7 +233,6 @@ def execute_gate_evaluation(
     eval_engine = EvaluationEngine()
     attr_engine = FailureAttributionEngine()
 
-    import json
     cases = [
         TestCase(
             id=r.id,
@@ -108,7 +245,6 @@ def execute_gate_evaluation(
     ]
 
     traces_with_metrics = []
-    import asyncio
 
     async def run_pipeline():
         for case in cases:
@@ -145,6 +281,12 @@ def main():
     parser.add_argument("--policy", default="prod-default", help="Release policy ID")
     parser.add_argument("--mock-mode", default="PERFECT", choices=[m.value for m in SyntheticRagMode])
     parser.add_argument("--junit-xml", default=None, help="Path to write JUnit XML test results")
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        default=False,
+        help="Initialize database and seed baseline golden benchmark dataset if not already present",
+    )
 
     args = parser.parse_args()
 
@@ -160,6 +302,7 @@ def main():
             system_version=args.system_version,
             mock_mode=mode,
             junit_xml_path=args.junit_xml,
+            bootstrap=args.bootstrap,
         )
 
     print("\n" + "=" * 60)
@@ -171,9 +314,9 @@ def main():
     if gate.violations:
         print(f"\nVIOLATIONS DETECTED ({len(gate.violations)}):")
         for v in gate.violations:
-            print(f"  ❌ [{v.metric_name}]: {v.message}")
+            print(f"  [FAIL] [{v.metric_name}]: {v.message}")
     else:
-        print("\n✅ All quality thresholds and regression budgets satisfied.")
+        print("\n[PASS] All quality thresholds and regression budgets satisfied.")
 
     print("=" * 60 + "\n")
     sys.exit(exit_code)
