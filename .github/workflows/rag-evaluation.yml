@@ -10,6 +10,11 @@ jobs:
   rag-gate:
     name: Build, Test & Release Gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -28,7 +33,11 @@ jobs:
 
       - name: Initialize Database (Alembic Migrations)
         run: |
-          python -m alembic upgrade head
+          alembic upgrade head
+
+      - name: Prepare Test Output Directory
+        run: |
+          mkdir -p test-results
 
       - name: Run Unit & Integration Tests
         run: |
@@ -50,10 +59,13 @@ jobs:
         with:
           name: rag-evaluation-reports
           path: test-results/
+          if-no-files-found: ignore
 
       - name: Publish Test Results
         uses: EnricoMi/publish-unit-test-result-action@v2
         if: always()
+        continue-on-error: true
         with:
           files: "test-results/**/*.xml"
+
 
