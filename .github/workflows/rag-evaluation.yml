@@ -1,0 +1,40 @@
+name: RAG Reliability Quality Gate
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  rag-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Platform Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e .
+
+      - name: Execute RAG Quality Gate (Fail-Closed)
+        run: |
+          python -m rag_platform.gate \
+            --project proj_default \
+            --dataset ds_locked_benchmark \
+            --system-version ${{ github.sha }} \
+            --policy prod-default \
+            --junit-xml test-results/rag-gate.xml
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: "test-results/**/*.xml"
