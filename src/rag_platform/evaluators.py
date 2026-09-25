@@ -679,6 +679,7 @@ class CitationSupportMetric(BaseMetric):
         doc_map = {c.document_id: c for c in trace.retrieved_chunks}
 
         valid_count = 0
+        heuristic_validated: list[dict] = []
         total = len(trace.citations)
 
         for cit in trace.citations:
@@ -686,15 +687,24 @@ class CitationSupportMetric(BaseMetric):
             if not matched:
                 continue
 
-            # Verify claim against matched chunk using the grounding evaluator
-            status, _, _ = verify_claim_against_chunks(cit.claim_text, [matched])
-            if status == ClaimStatus.SUPPORTED:
+            # Primary: verify claim against matched chunk using the grounding evaluator
+            citation_status, _, _ = verify_claim_against_chunks(cit.claim_text, [matched])
+            if citation_status == ClaimStatus.SUPPORTED:
                 valid_count += 1
             else:
+                # FIX #17: Heuristic lexical fallback — explicitly disclosed in metadata.
+                # A weak lexical match must NOT silently override the primary evaluator.
                 claim_words = [w for w in re.findall(r"\w+", cit.claim_text.lower()) if len(w) > 2]
                 chunk_words = set(re.findall(r"\w+", matched.text.lower()))
-                if claim_words and sum(1 for w in claim_words if w in chunk_words) / len(claim_words) >= 0.40:
+                lexical_overlap = sum(1 for w in claim_words if w in chunk_words) / len(claim_words) if claim_words else 0.0
+                if lexical_overlap >= 0.40:
                     valid_count += 1
+                    # Tag this citation as heuristically validated (not semantically)
+                    heuristic_validated.append({
+                        "claim_id": cit.claim_id,
+                        "evaluation_method": "HEURISTIC_FALLBACK",
+                        "lexical_overlap": round(lexical_overlap, 3),
+                    })
 
         score = round(valid_count / total, 4)
         return MetricResult(
@@ -704,7 +714,13 @@ class CitationSupportMetric(BaseMetric):
             status=MetricStatus.PASS if score >= 0.70 else MetricStatus.FAIL,
             reason=f"{valid_count}/{total} citations substantiated by retrieved evidence chunks.",
             evaluator_version=self.version,
-            metadata={"valid_citations": valid_count, "total_citations": total},
+            metadata={
+                "valid_citations": valid_count,
+                "total_citations": total,
+                "heuristic_fallback_count": len(heuristic_validated),
+                "heuristic_validated": heuristic_validated,
+                "evaluation_method": "HEURISTIC_FALLBACK" if heuristic_validated else "LEXICAL_GROUNDING",
+            },
         )
 
 
@@ -755,14 +771,30 @@ class EvaluationEngine:
         self._cache: dict[str, MetricResult] = {}
 
     def _cache_key(self, metric: BaseMetric, trace: RagTrace, case: TestCase) -> str:
+        """Cache key incorporating ALL inputs that affect evaluation output.
+
+        FIX #36: chunk content is included (not just chunk IDs) because the same
+        chunk_id can have different content across dataset versions, causing
+        incorrect cache hits with the old (doc_id, chunk_id)-only key.
+        """
         payload = {
             "metric": metric.name,
             "version": metric.version,
             "case_id": case.id,
             "question": case.question,
+            "expected_answer": case.expected_answer,
+            "expected_facts": sorted(case.expected_facts),
             "trace_answer": trace.answer,
             "trace_abstained": trace.abstained,
-            "chunks": [(c.document_id, c.chunk_id) for c in trace.retrieved_chunks],
+            # Include chunk content hash, not just IDs (fixes stale cache on content change)
+            "chunks": [
+                {"document_id": c.document_id, "chunk_id": c.chunk_id, "content_hash": sha256_hash(c.text)}
+                for c in trace.retrieved_chunks
+            ],
+            "citations": [
+                {"claim_id": cit.claim_id, "chunk_id": cit.chunk_id}
+                for cit in trace.citations
+            ],
         }
         return sha256_hash(canonical_json(payload))
 

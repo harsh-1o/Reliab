@@ -279,10 +279,10 @@ class RunProvenance(BaseModel):
     model_name: str | None = None
     model_version: str | None = None
     model_parameters: dict[str, Any] = Field(default_factory=dict)
-    model_config_hash: str = "default_model_config_hash"
+    model_config_hash: str = ""
     temperature: float | None = None
     prompt_template: str | None = None
-    prompt_hash: str = "default_prompt_hash"
+    prompt_hash: str = ""
     system_prompt_hash: str | None = None
     embedding_model: str | None = None
     embedding_version: str | None = None
@@ -294,7 +294,7 @@ class RunProvenance(BaseModel):
     evaluator_version: str = "2.0.0"
     evaluation_config: dict[str, Any] = Field(default_factory=dict)
     experiment_config: dict[str, Any] = Field(default_factory=dict)
-    experiment_hash: str = "default_experiment_hash"
+    experiment_hash: str = ""
     python_version: str | None = None
     dependency_lock_hash: str | None = None
     environment_info: dict[str, Any] = Field(default_factory=dict)
@@ -302,10 +302,17 @@ class RunProvenance(BaseModel):
     manifest_hash: str = ""
 
     def model_post_init(self, __context: Any) -> None:
-        if self.model_parameters and self.model_config_hash == "default_model_config_hash":
+        if self.model_parameters and not self.model_config_hash:
             self.model_config_hash = sha256_hash(canonical_json(self.model_parameters))
-        if self.experiment_config and self.experiment_hash == "default_experiment_hash":
+        elif self.model_config_hash == "default_model_config_hash":
+            # Backward compat: recompute if old placeholder persists
+            self.model_config_hash = sha256_hash(canonical_json(self.model_parameters)) if self.model_parameters else ""
+        if self.experiment_config and not self.experiment_hash:
             self.experiment_hash = sha256_hash(canonical_json(self.experiment_config))
+        elif self.experiment_hash == "default_experiment_hash":
+            self.experiment_hash = sha256_hash(canonical_json(self.experiment_config)) if self.experiment_config else ""
+        if self.prompt_template and not self.prompt_hash:
+            self.prompt_hash = sha256_hash(self.prompt_template)
         if not self.manifest_hash:
             payload = {
                 "dataset_checksum": self.dataset_checksum,
@@ -357,10 +364,28 @@ class RunConfig(BaseModel):
 
 class MetricRegressionPolicy(BaseModel):
     metric_name: str
-    min_absolute_score: float | None = None
-    max_absolute_score: float | None = None
-    max_degradation_pct: float | None = None
-    max_absolute_degradation: float | None = None
+    # Absolute candidate value bounds
+    min_candidate_value: float | None = None
+    max_candidate_value: float | None = None
+    # Regression limits relative to baseline
+    max_absolute_drop: float | None = None
+    max_relative_drop_pct: float | None = None
+    # Legacy aliases kept for backward compatibility
+    min_absolute_score: float | None = None       # alias → min_candidate_value
+    max_absolute_score: float | None = None       # alias → max_candidate_value
+    max_degradation_pct: float | None = None      # alias → max_relative_drop_pct
+    max_absolute_degradation: float | None = None # alias → max_absolute_drop
+
+    def model_post_init(self, __context: Any) -> None:
+        # Resolve aliases so callers can use either spelling
+        if self.min_candidate_value is None and self.min_absolute_score is not None:
+            self.min_candidate_value = self.min_absolute_score
+        if self.max_candidate_value is None and self.max_absolute_score is not None:
+            self.max_candidate_value = self.max_absolute_score
+        if self.max_absolute_drop is None and self.max_absolute_degradation is not None:
+            self.max_absolute_drop = self.max_absolute_degradation
+        if self.max_relative_drop_pct is None and self.max_degradation_pct is not None:
+            self.max_relative_drop_pct = self.max_degradation_pct
 
 
 class ReleasePolicy(BaseModel):

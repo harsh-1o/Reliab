@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from rag_platform.adapters import SyntheticRagAdapter, SyntheticRagMode
 from rag_platform.attribution import FailureAttributionEngine
 from rag_platform.core import generate_id
-from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, create_db_engine
+from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, TestCaseRow, DatasetStatus, create_db_engine
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
@@ -30,6 +30,27 @@ from rag_platform.models import (
     TestCase,
 )
 from rag_platform.regression import RegressionEngine
+
+
+# ---------------------------------------------------------------------------
+# Canonical TestCase reconstruction (mirrors server.db_row_to_test_case)
+# Used by the CLI gate runner to preserve all test case fields.
+# ---------------------------------------------------------------------------
+def _gate_db_row_to_test_case(row: Any) -> TestCase:
+    """Convert a TestCaseRow to a TestCase, preserving all fields including expected_facts."""
+    return TestCase(
+        id=row.id,
+        question=row.question,
+        expected_answer=row.expected_answer,
+        expected_facts=json.loads(row.expected_facts_json) if row.expected_facts_json else [],
+        relevant_documents=[
+            DocumentReference(**d)
+            for d in json.loads(row.relevant_docs_json)
+        ] if row.relevant_docs_json else [],
+        answerability=row.answerability,
+        tags=json.loads(row.tags_json) if row.tags_json else [],
+        metadata=json.loads(row.metadata_json) if row.metadata_json else {},
+    )
 
 
 def format_junit_xml(gate_result: GateResult) -> str:
@@ -81,7 +102,6 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
                     DocumentReference(
                         document_id="doc_q3_report",
                         chunk_id="chunk_01",
-                        text="Acme Corp reported Q3 revenue of $142.5 million, an increase of 14% year-over-year.",
                     )
                 ],
                 answerability=Answerability.ANSWERABLE,
@@ -96,7 +116,6 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
                     DocumentReference(
                         document_id="doc_exec_bio",
                         chunk_id="chunk_02",
-                        text="Jane Doe was appointed CEO of Acme Corp in 2021. Prior to this, she served as VP of Operations at Globex for six years.",
                     )
                 ],
                 answerability=Answerability.ANSWERABLE,
@@ -120,7 +139,6 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
                     DocumentReference(
                         document_id="doc_tos",
                         chunk_id="chunk_03",
-                        text="Refunds are permitted within one month of license renewal upon written request.",
                     )
                 ],
                 answerability=Answerability.ANSWERABLE,
@@ -135,7 +153,6 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
                     DocumentReference(
                         document_id="doc_capex",
                         chunk_id="chunk_04",
-                        text="Total capital expenditure for fiscal year 2023 was $80M, down from $95M in 2022.",
                     )
                 ],
                 answerability=Answerability.ANSWERABLE,
@@ -150,7 +167,6 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
                     DocumentReference(
                         document_id="doc_hr",
                         chunk_id="chunk_05",
-                        text="During 2023, Acme Corp expanded its engineering team by adding 450 engineers across existing hubs.",
                     )
                 ],
                 answerability=Answerability.ANSWERABLE,
@@ -233,16 +249,7 @@ def execute_gate_evaluation(
     eval_engine = EvaluationEngine()
     attr_engine = FailureAttributionEngine()
 
-    cases = [
-        TestCase(
-            id=r.id,
-            question=r.question,
-            expected_answer=r.expected_answer,
-            relevant_documents=[DocumentReference(**d) for d in json.loads(r.relevant_docs_json)],
-            answerability=r.answerability,
-        )
-        for r in ds_row.cases
-    ]
+    cases = [_gate_db_row_to_test_case(r) for r in ds_row.cases]
 
     traces_with_metrics = []
 
