@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from rag_platform.core import canonical_json, compute_manifest_hash, sha256_hash
+from rag_platform.core import canonical_json, sha256_hash
 
 
 # --- Enums ---
@@ -88,16 +88,16 @@ class ClaimVerification(BaseModel):
     claim_text: str
     status: ClaimStatus
     supporting_chunk_id: str | None = None
-    confidence: float = 1.0
-    confidence_type: str = "heuristic"
+    confidence: float | None = None
+    confidence_type: str = "not_calibrated"
     reason: str = ""
 
 
 class DiagnosticFinding(BaseModel):
     code: FailureCode
     severity: Severity = Severity.MEDIUM
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    confidence_type: str = "heuristic"
+    confidence: float | None = None
+    confidence_type: str = "not_calibrated"
     explanation: str
     evidence: dict[str, Any] = Field(default_factory=dict)
     recommended_actions: list[str] = Field(default_factory=list)
@@ -124,6 +124,12 @@ class TestCase(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def to_canonical_dict(self) -> dict[str, Any]:
+        """Convert TestCase to a canonical dictionary representation for cryptographic checksumming.
+
+        Metadata is semantically relevant: it passes configuration, routing tags,
+        and domain parameters to SUT adapters and evaluators. Changes to metadata
+        alter evaluation behavior and therefore alter the dataset checksum.
+        """
         return {
             "id": self.id,
             "question": self.question.strip(),
@@ -135,6 +141,7 @@ class TestCase(BaseModel):
             ],
             "answerability": self.answerability.value,
             "tags": sorted(self.tags),
+            "metadata": {k: self.metadata[k] for k in sorted(self.metadata.keys())},
         }
 
 
@@ -247,8 +254,8 @@ class FailureAttribution(BaseModel):
     contributing_codes: list[FailureCode] = Field(default_factory=list)
     failure_type: FailureCode | None = None  # Backward-compatible alias for primary_code
     severity: Severity = Severity.MEDIUM
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    confidence_type: str = "heuristic"
+    confidence: float | None = None
+    confidence_type: str = "not_calibrated"
     explanation: str
     evidence: dict[str, Any] = Field(default_factory=dict)
     recommended_actions: list[str] = Field(default_factory=list)
@@ -283,6 +290,7 @@ class RunProvenance(BaseModel):
     temperature: float | None = None
     prompt_template: str | None = None
     prompt_hash: str = ""
+    system_prompt: str | None = None
     system_prompt_hash: str | None = None
     embedding_model: str | None = None
     embedding_version: str | None = None
@@ -301,11 +309,49 @@ class RunProvenance(BaseModel):
     random_seed: int | None = None
     manifest_hash: str = ""
 
+    def canonical_manifest(self) -> dict[str, Any]:
+        """Produce the canonical, deterministic dictionary representation of the provenance manifest.
+
+        Only non-empty, non-null fields that genuinely correspond to actual execution are included.
+        """
+        prompt_h = self.prompt_hash or (sha256_hash(self.prompt_template) if self.prompt_template else None)
+        sys_prompt_h = self.system_prompt_hash or (sha256_hash(self.system_prompt) if self.system_prompt else None)
+        payload = {
+            "dataset_checksum": self.dataset_checksum,
+            "dataset_id": self.dataset_id,
+            "dataset_version": self.dataset_version,
+            "rag_version": self.rag_version,
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "model_parameters": self.model_parameters if self.model_parameters else None,
+            "temperature": self.temperature,
+            "prompt_hash": prompt_h,
+            "system_prompt_hash": sys_prompt_h,
+            "embedding_model": self.embedding_model,
+            "embedding_version": self.embedding_version,
+            "retriever_config": self.retriever_config if self.retriever_config else None,
+            "reranker_config": self.reranker_config if self.reranker_config else None,
+            "chunking_config": self.chunking_config if self.chunking_config else None,
+            "adapter_type": self.adapter_type,
+            "adapter_config": self.adapter_config if self.adapter_config else None,
+            "evaluator_version": self.evaluator_version,
+            "evaluation_config": self.evaluation_config if self.evaluation_config else None,
+            "experiment_config": self.experiment_config if self.experiment_config else None,
+            "python_version": self.python_version,
+            "dependency_lock_hash": self.dependency_lock_hash,
+            "environment_info": self.environment_info if self.environment_info else None,
+            "random_seed": self.random_seed,
+        }
+        return {k: v for k, v in payload.items() if v not in (None, {}, "", [])}
+
+    def compute_hash(self) -> str:
+        """Compute standard cryptographic hash of the canonical manifest."""
+        return sha256_hash(canonical_json(self.canonical_manifest()))
+
     def model_post_init(self, __context: Any) -> None:
         if self.model_parameters and not self.model_config_hash:
             self.model_config_hash = sha256_hash(canonical_json(self.model_parameters))
         elif self.model_config_hash == "default_model_config_hash":
-            # Backward compat: recompute if old placeholder persists
             self.model_config_hash = sha256_hash(canonical_json(self.model_parameters)) if self.model_parameters else ""
         if self.experiment_config and not self.experiment_hash:
             self.experiment_hash = sha256_hash(canonical_json(self.experiment_config))
@@ -313,41 +359,16 @@ class RunProvenance(BaseModel):
             self.experiment_hash = sha256_hash(canonical_json(self.experiment_config)) if self.experiment_config else ""
         if self.prompt_template and not self.prompt_hash:
             self.prompt_hash = sha256_hash(self.prompt_template)
+        if self.system_prompt and not self.system_prompt_hash:
+            self.system_prompt_hash = sha256_hash(self.system_prompt)
         if not self.manifest_hash:
-            payload = {
-                "dataset_checksum": self.dataset_checksum,
-                "dataset_id": self.dataset_id,
-                "dataset_version": self.dataset_version,
-                "rag_version": self.rag_version,
-                "model_name": self.model_name,
-                "model_version": self.model_version,
-                "model_parameters": self.model_parameters,
-                "temperature": self.temperature,
-                "prompt_hash": self.prompt_hash,
-                "system_prompt_hash": self.system_prompt_hash,
-                "embedding_model": self.embedding_model,
-                "embedding_version": self.embedding_version,
-                "retriever_config": self.retriever_config,
-                "reranker_config": self.reranker_config,
-                "chunking_config": self.chunking_config,
-                "adapter_type": self.adapter_type,
-                "adapter_config": self.adapter_config,
-                "evaluator_version": self.evaluator_version,
-                "evaluation_config": self.evaluation_config,
-                "experiment_config": self.experiment_config,
-                "python_version": self.python_version,
-                "dependency_lock_hash": self.dependency_lock_hash,
-                "environment_info": self.environment_info,
-                "random_seed": self.random_seed,
-            }
-            clean_payload = {k: v for k, v in payload.items() if v not in (None, {}, "")}
-            self.manifest_hash = sha256_hash(canonical_json(clean_payload))
+            self.manifest_hash = self.compute_hash()
 
 
 class RunOptions(BaseModel):
     max_cases: int | None = None
     concurrency: int = 5
-    timeout_seconds: int = 60
+    timeout_seconds: float = 60.0
     fail_fast: bool = False
     use_cache: bool = True
 

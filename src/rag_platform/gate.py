@@ -14,12 +14,10 @@ from sqlalchemy.orm import Session
 
 from rag_platform.adapters import SyntheticRagAdapter, SyntheticRagMode
 from rag_platform.attribution import FailureAttributionEngine
-from rag_platform.core import generate_id
 from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, TestCaseRow, DatasetStatus, create_db_engine
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
-    BenchmarkDataset,
     DocumentReference,
     GateResult,
     GateStatus,
@@ -78,7 +76,6 @@ def format_junit_xml(gate_result: GateResult) -> str:
 def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str) -> None:
     """Ensure project and benchmark dataset exist in database before evaluation."""
     from rag_platform.models import compute_dataset_checksum
-    from rag_platform.db import TestCaseRow, DatasetStatus
 
     project = db_session.get(ProjectRow, project_id)
     if not project:
@@ -185,18 +182,29 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
         )
         db_session.add(ds_row)
         for c in cases:
-            tc_row = TestCaseRow(
-                id=c.id,
-                dataset_id=dataset_id,
-                question=c.question,
-                expected_answer=c.expected_answer,
-                expected_facts_json=json.dumps(c.expected_facts),
-                relevant_docs_json=json.dumps([d.model_dump() for d in c.relevant_documents]),
-                answerability=c.answerability.value,
-                tags_json=json.dumps(c.tags),
-                metadata_json=json.dumps(c.metadata),
-            )
-            db_session.add(tc_row)
+            tc_row = db_session.get(TestCaseRow, c.id)
+            if not tc_row:
+                tc_row = TestCaseRow(
+                    id=c.id,
+                    dataset_id=dataset_id,
+                    question=c.question,
+                    expected_answer=c.expected_answer,
+                    expected_facts_json=json.dumps(c.expected_facts),
+                    relevant_docs_json=json.dumps([d.model_dump() for d in c.relevant_documents]),
+                    answerability=c.answerability.value,
+                    tags_json=json.dumps(c.tags),
+                    metadata_json=json.dumps(c.metadata),
+                )
+                db_session.add(tc_row)
+            else:
+                tc_row.dataset_id = dataset_id
+                tc_row.question = c.question
+                tc_row.expected_answer = c.expected_answer
+                tc_row.expected_facts_json = json.dumps(c.expected_facts)
+                tc_row.relevant_docs_json = json.dumps([d.model_dump() for d in c.relevant_documents])
+                tc_row.answerability = c.answerability.value
+                tc_row.tags_json = json.dumps(c.tags)
+                tc_row.metadata_json = json.dumps(c.metadata)
         db_session.commit()
 
 

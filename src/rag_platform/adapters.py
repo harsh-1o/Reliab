@@ -28,10 +28,37 @@ class RagAdapter(Protocol):
         ...
 
 
+class PythonAdapterRegistry:
+    """Trusted server-side registry mapping adapter names to verified Python callables.
+
+    Prevents untrusted remote code execution from JSON payloads while allowing
+    pre-registered Python callables to be referenced safely by name via API.
+    """
+
+    _registry: dict[str, Callable[[TestCase, RunConfig], RagTrace | Any]] = {}
+
+    @classmethod
+    def register(cls, name: str, fn: Callable[[TestCase, RunConfig], RagTrace | Any]) -> None:
+        cls._registry[name] = fn
+
+    @classmethod
+    def get(cls, name: str) -> Callable[[TestCase, RunConfig], RagTrace | Any]:
+        if name not in cls._registry:
+            available = sorted(list(cls._registry.keys()))
+            raise ValueError(f"Unknown registered python adapter '{name}'. Available: {available}")
+        return cls._registry[name]
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._registry.clear()
+
+
 class PythonRagAdapter:
     """Wraps an in-process Python callable into a RagAdapter."""
 
     def __init__(self, target_fn: Callable[[TestCase, RunConfig], RagTrace | Any]) -> None:
+        if target_fn is None or not callable(target_fn):
+            raise ValueError("PythonRagAdapter requires a non-None, callable target_fn.")
         self.target_fn = target_fn
 
     async def run(self, case: TestCase, config: RunConfig) -> RagTrace:
@@ -88,6 +115,12 @@ class HttpRagAdapter:
         """Close internal HTTP client pool if owned."""
         if self._owns_client and self._shared_client is not None and not self._shared_client.is_closed:
             await self._shared_client.aclose()
+
+    async def __aenter__(self) -> HttpRagAdapter:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
 
     async def run(self, case: TestCase, config: RunConfig) -> RagTrace:
         start = time.perf_counter()
@@ -320,6 +353,21 @@ class SyntheticRagAdapter:
         )
 
 
+def _make_python_adapter(
+    target_fn: Callable[[TestCase, RunConfig], RagTrace | Any] | None = None,
+    adapter_name: str | None = None,
+    **_: Any,
+) -> PythonRagAdapter:
+    if target_fn is not None:
+        return PythonRagAdapter(target_fn)
+    if adapter_name is not None:
+        fn = PythonAdapterRegistry.get(adapter_name)
+        return PythonRagAdapter(fn)
+    raise ValueError(
+        "Python adapter requires a registered 'adapter_name' in adapter_config or a callable 'target_fn'."
+    )
+
+
 # Register standard built-in adapters
 AdapterRegistry.register(
     "synthetic",
@@ -327,6 +375,12 @@ AdapterRegistry.register(
         SyntheticRagMode(mode) if isinstance(mode, str) else mode
     ),
 )
-AdapterRegistry.register("python", lambda target_fn=None, **_: PythonRagAdapter(target_fn))
-AdapterRegistry.register("http", lambda endpoint_url="", headers=None, timeout_seconds=30.0, **_: HttpRagAdapter(endpoint_url=endpoint_url, headers=headers, timeout_seconds=timeout_seconds))
+AdapterRegistry.register("python", _make_python_adapter)
+AdapterRegistry.register(
+    "http",
+    lambda endpoint_url="", headers=None, timeout_seconds=30.0, **_: HttpRagAdapter(
+        endpoint_url=endpoint_url, headers=headers, timeout_seconds=timeout_seconds
+    ),
+)
+
 

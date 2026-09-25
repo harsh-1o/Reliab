@@ -7,7 +7,6 @@ from __future__ import annotations
 import math
 import re
 from abc import ABC, abstractmethod
-from typing import Any
 
 from rag_platform.core import canonical_json, sha256_hash
 from rag_platform.models import (
@@ -178,7 +177,7 @@ def verify_claim_against_chunks(
     best_match_chunk: RetrievedChunk | None = None
     best_overlap = 0.0
 
-    # Explicit antonym / predicate opposition pairs
+    # Explicit antonym / predicate opposition pairs (strict semantic opposites only)
     contradiction_pairs = [
         ("increased", "decreased"),
         ("expanded", "contracted"),
@@ -190,12 +189,14 @@ def verify_claim_against_chunks(
         ("higher", "lower"),
         ("rose", "fell"),
         ("free", "paid"),
-        ("no", "manual"),
-        ("none", "all"),
         ("enabled", "disabled"),
         ("success", "failure"),
         ("supported", "unsupported"),
         ("permitted", "forbidden"),
+        ("active", "inactive"),
+        ("valid", "invalid"),
+        ("present", "absent"),
+        ("true", "false"),
     ]
 
     for chunk in chunks:
@@ -207,39 +208,40 @@ def verify_claim_against_chunks(
             if t.strip(".,;:!?\"'()[]{}")
         }
 
-        # 1. Antonym / Predicate Opposition Check
+        # 1. Antonym / Predicate Opposition Check with shared topic
         for w1, w2 in contradiction_pairs:
             if (w1 in claim_lower and w2 in chunk_text_lower) or (w2 in claim_lower and w1 in chunk_text_lower):
                 shared = {
                     t for t in claim_tokens.intersection(chunk_tokens)
-                    if len(t) > 2 and t not in (w1, w2, "the", "and", "for", "with", "this", "that")
+                    if len(t) > 2 and t not in (w1, w2, "the", "and", "for", "with", "this", "that", "was", "were", "are", "is")
                 }
                 if len(shared) >= 1:
                     return (
                         ClaimStatus.CONTRADICTED,
                         chunk,
-                        f"Lexical Claim Grounding contradiction: claim asserts '{w1}' while evidence states '{w2}' (chunk {chunk.chunk_id}).",
+                        f"Heuristic contradiction: claim asserts '{w1}' while evidence states '{w2}' for '{', '.join(sorted(shared))}' (chunk {chunk.chunk_id}).",
                     )
 
-        # 2. Numerical / Monetary / Quantitative Conflict Check (e.g. $100M vs $80M)
+        # 2. Numerical / Monetary / Quantitative / Date Conflict Check (e.g. $100M vs $80M, 2021 vs 2024)
         claim_amounts = {
             a.strip(".,;:!?")
-            for a in re.findall(r"\$?\d+(?:\.\d+)?(?:%|[bkmBKM]|(?:\s*(?:million|billion|thousand)))?\b", claim_lower)
+            for a in re.findall(r"\$?\d+(?:\.\d+)?(?:%|[bkmBKM]|(?:\s*(?:million|billion|thousand)))?\b|\b(?:19|20)\d{2}\b", claim_lower)
             if a.strip(".,;:!?")
         }
         chunk_amounts = {
             a.strip(".,;:!?")
-            for a in re.findall(r"\$?\d+(?:\.\d+)?(?:%|[bkmBKM]|(?:\s*(?:million|billion|thousand)))?\b", chunk_text_lower)
+            for a in re.findall(r"\$?\d+(?:\.\d+)?(?:%|[bkmBKM]|(?:\s*(?:million|billion|thousand)))?\b|\b(?:19|20)\d{2}\b", chunk_text_lower)
             if a.strip(".,;:!?")
         }
 
         if claim_amounts and chunk_amounts and not claim_amounts.intersection(chunk_amounts):
             # Contradiction requires shared subject/noun entities, not just common predicate verbs
-            predicate_verbs = (
+            predicate_verbs = {
                 "the", "and", "for", "with", "this", "that", "was", "were", "are", "is",
                 "has", "had", "have", "been", "increased", "decreased", "grew", "rose",
                 "fell", "dropped", "added", "expanded", "reported", "reached", "to", "by",
-            )
+                "in", "at", "on", "from", "of", "an", "a",
+            }
             shared_topic = {
                 t for t in claim_tokens.intersection(chunk_tokens)
                 if len(t) > 2 and t not in predicate_verbs
@@ -248,8 +250,50 @@ def verify_claim_against_chunks(
                 return (
                     ClaimStatus.CONTRADICTED,
                     chunk,
-                    f"Numerical conflict with chunk {chunk.chunk_id}: claim asserts {claim_amounts} while evidence states {chunk_amounts}.",
+                    f"Heuristic contradiction (numerical/quantitative conflict with chunk {chunk.chunk_id}): claim asserts {claim_amounts} while evidence states {chunk_amounts} for '{', '.join(sorted(shared_topic))}'.",
                 )
+
+        # 3. Explicit Negation / Polarity Conflict on Shared Predicate & Object
+        neg_nouns_claim = set(re.findall(r"\b(?:no|without|zero)\s+([a-zA-Z]+)\b", claim_lower))
+        neg_nouns_chunk = set(re.findall(r"\b(?:no|without|zero)\s+([a-zA-Z]+)\b", chunk_text_lower))
+
+        conflict_nouns = (neg_nouns_claim.intersection(chunk_tokens) - neg_nouns_chunk) | (
+            neg_nouns_chunk.intersection(claim_tokens) - neg_nouns_claim
+        )
+        if conflict_nouns:
+            action_verbs = {
+                "requires", "required", "needs", "needed", "provides", "provided",
+                "supports", "supported", "includes", "included", "allows", "allowed",
+                "contains", "contained", "has", "have", "had", "uses", "used", "shows", "showed",
+            }
+            shared_action = claim_tokens.intersection(chunk_tokens).intersection(action_verbs)
+            if shared_action:
+                return (
+                    ClaimStatus.CONTRADICTED,
+                    chunk,
+                    f"Heuristic contradiction (negation conflict: action '{', '.join(sorted(shared_action))}' with negated '{', '.join(sorted(conflict_nouns))}' in chunk {chunk.chunk_id}).",
+                )
+
+        # 4. Explicit Predicate Negation Check (e.g. "is not supported" vs "is supported")
+        key_predicates = [
+            "supported", "approved", "permitted", "allowed", "included",
+            "required", "active", "enabled", "available", "completed", "found",
+        ]
+        for pred in key_predicates:
+            if pred in claim_tokens and pred in chunk_tokens:
+                claim_neg = any(f"{n} {pred}" in claim_lower or f"{n} be {pred}" in claim_lower for n in ("not", "never", "cannot"))
+                chunk_neg = any(f"{n} {pred}" in chunk_text_lower or f"{n} be {pred}" in chunk_text_lower for n in ("not", "never", "cannot"))
+                if claim_neg != chunk_neg:
+                    shared_subj = {
+                        t for t in claim_tokens.intersection(chunk_tokens)
+                        if len(t) > 2 and t != pred and t not in ("the", "and", "for", "with", "this", "that", "was", "were", "are", "is")
+                    }
+                    if shared_subj:
+                        return (
+                            ClaimStatus.CONTRADICTED,
+                            chunk,
+                            f"Heuristic contradiction (predicate negation on '{pred}' for '{', '.join(sorted(shared_subj))}' in chunk {chunk.chunk_id}).",
+                        )
 
         # 3. Normalized Token / Entity Alignment
         if claim_tokens:
@@ -529,8 +573,8 @@ class FaithfulnessMetric(BaseMetric):
                     claim_text=claim_text,
                     status=status,
                     supporting_chunk_id=matched_chunk.chunk_id if matched_chunk else None,
-                    confidence=0.95 if status == ClaimStatus.SUPPORTED else 0.90,
-                    confidence_type="heuristic",
+                    confidence=None,
+                    confidence_type="not_calibrated",
                     reason=reason,
                 )
             )
@@ -758,7 +802,11 @@ class AbstentionAccuracyMetric(BaseMetric):
 class EvaluationEngine:
     """Orchestrates metric execution with hashed caching, statistical confidence intervals, and aggregation."""
 
-    def __init__(self, metrics: list[BaseMetric] | None = None) -> None:
+    def __init__(
+        self,
+        metrics: list[BaseMetric] | None = None,
+        cache: dict[str, MetricResult] | None = None,
+    ) -> None:
         self.metrics = metrics or [
             RecallAtKMetric(k=5),
             MeanReciprocalRankMetric(),
@@ -768,14 +816,13 @@ class EvaluationEngine:
             CitationSupportMetric(),
             AbstentionAccuracyMetric(),
         ]
-        self._cache: dict[str, MetricResult] = {}
+        self._cache: dict[str, MetricResult] = cache if cache is not None else {}
 
     def _cache_key(self, metric: BaseMetric, trace: RagTrace, case: TestCase) -> str:
         """Cache key incorporating ALL inputs that affect evaluation output.
 
-        FIX #36: chunk content is included (not just chunk IDs) because the same
-        chunk_id can have different content across dataset versions, causing
-        incorrect cache hits with the old (doc_id, chunk_id)-only key.
+        Includes case questions, facts, relevant documents, answer, chunks (with content hash),
+        citations, and metric version to prevent stale cache entries.
         """
         payload = {
             "metric": metric.name,
@@ -784,6 +831,10 @@ class EvaluationEngine:
             "question": case.question,
             "expected_answer": case.expected_answer,
             "expected_facts": sorted(case.expected_facts),
+            "relevant_documents": [
+                {"document_id": d.document_id, "chunk_id": d.chunk_id, "page": d.page, "span": d.span}
+                for d in case.relevant_documents
+            ],
             "trace_answer": trace.answer,
             "trace_abstained": trace.abstained,
             # Include chunk content hash, not just IDs (fixes stale cache on content change)
@@ -792,7 +843,7 @@ class EvaluationEngine:
                 for c in trace.retrieved_chunks
             ],
             "citations": [
-                {"claim_id": cit.claim_id, "chunk_id": cit.chunk_id}
+                {"claim_id": cit.claim_id, "chunk_id": cit.chunk_id, "claim_text": cit.claim_text}
                 for cit in trace.citations
             ],
         }

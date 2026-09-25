@@ -61,25 +61,33 @@ def sha256_hash(content: str | bytes) -> str:
 def compute_manifest_hash(
     *,
     dataset_checksum: str,
-    rag_version: str,
-    model_config_hash: str,
-    prompt_hash: str,
-    evaluator_version: str,
-    experiment_hash: str,
+    rag_version: str = "rag_v1",
+    model_name: str | None = None,
+    model_version: str | None = None,
+    model_parameters: dict[str, Any] | None = None,
+    model_config_hash: str | None = None,
+    prompt_hash: str | None = None,
+    evaluator_version: str = "2.0.0",
+    experiment_hash: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> str:
-    """Compute reproducible run manifest hash from all runtime inputs and configs."""
-    payload = {
-        "dataset_checksum": dataset_checksum,
-        "rag_version": rag_version,
-        "model_config_hash": model_config_hash,
-        "prompt_hash": prompt_hash,
-        "evaluator_version": evaluator_version,
-        "experiment_hash": experiment_hash,
-    }
-    if extra_metadata:
-        payload["extra_metadata"] = extra_metadata
-    return sha256_hash(canonical_json(payload))
+    """Compute reproducible run manifest hash from canonical RunProvenance manifest."""
+    from rag_platform.models import RunProvenance
+
+    prov = RunProvenance(
+        dataset_checksum=dataset_checksum,
+        rag_version=rag_version,
+        model_name=model_name,
+        model_version=model_version,
+        model_parameters=model_parameters or {},
+        model_config_hash=model_config_hash or "",
+        prompt_hash=prompt_hash or "",
+        evaluator_version=evaluator_version,
+        experiment_hash=experiment_hash or "",
+        **kwargs,
+    )
+    return prov.compute_hash()
 
 # --- Config ---
 def _resolve_api_key() -> str:

@@ -5,7 +5,6 @@ and contributing failure classification, canonical taxonomy, and remediation act
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from rag_platform.evaluators import is_evidence_match
 from rag_platform.models import (

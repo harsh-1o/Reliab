@@ -19,7 +19,6 @@ except ImportError:
 
 from rag_platform.models import (
     Answerability,
-    FailureCode,
     MetricResult,
     RagTrace,
     TestCase,

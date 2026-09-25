@@ -177,12 +177,13 @@ class TestAdapterSelection:
         assert not isinstance(adapter, SyntheticRagAdapter)
 
     def test_python_adapter_with_mock_mode_does_NOT_use_synthetic(self):
+        from rag_platform.adapters import PythonAdapterRegistry
         from rag_platform.server import _resolve_adapter
-        AdapterRegistry.register("python", lambda target_fn=None, **_: MagicMock())
+        PythonAdapterRegistry.register("mock_named_rag", lambda case, config: MagicMock())
         req = MagicMock()
         req.adapter_type = "python"
         req.mock_mode = "DISTRACTOR"  # truthy but must be ignored
-        req.adapter_config = {}
+        req.adapter_config = {"adapter_name": "mock_named_rag"}
         adapter = _resolve_adapter(req)
         # Should not be a SyntheticRagAdapter
         assert not isinstance(adapter, SyntheticRagAdapter)

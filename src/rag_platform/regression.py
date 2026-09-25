@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 from pydantic import BaseModel, Field
 
@@ -11,7 +10,6 @@ from rag_platform.models import (
     GateResult,
     GateStatus,
     GateViolation,
-    MetricRegressionPolicy,
     ReleasePolicy,
     RunMetricsSummary,
 )

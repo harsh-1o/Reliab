@@ -6,11 +6,12 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from enum import Enum
 from typing import Any
 
 from rag_platform.core import PolicyViolationError
 from rag_platform.models import RunOptions
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # --- 1. Comprehensive Enterprise Secret Redactor ---
@@ -304,28 +305,100 @@ class RecursiveTraceSanitizer:
         return trace
 
 
-# --- 6. Authentication and Project-Level Authorization ---
+# --- 6. Authentication and Project-Level RBAC Authorization ---
+class Role(str, Enum):
+    ADMIN = "ADMIN"
+    EDITOR = "EDITOR"
+    VIEWER = "VIEWER"
+
+
+_ROLE_WEIGHTS: dict[Role, int] = {
+    Role.ADMIN: 3,
+    Role.EDITOR: 2,
+    Role.VIEWER: 1,
+}
+
+
+class ClientIdentity(BaseModel):
+    client_id: str
+    is_admin: bool = False
+    project_roles: dict[str, Role] = Field(default_factory=dict)
+
+
+class ApiKeyRegistry:
+    """Registry mapping API keys to client identities and project role memberships."""
+
+    _registry: dict[str, ClientIdentity] = {}
+
+    @classmethod
+    def register_key(
+        cls,
+        api_key: str,
+        client_id: str,
+        project_roles: dict[str, Role | str] | None = None,
+        is_admin: bool = False,
+    ) -> None:
+        roles: dict[str, Role] = {}
+        for p_id, r in (project_roles or {}).items():
+            roles[p_id] = Role(r) if isinstance(r, str) else r
+        cls._registry[api_key] = ClientIdentity(
+            client_id=client_id,
+            is_admin=is_admin,
+            project_roles=roles,
+        )
+
+    @classmethod
+    def get(cls, api_key: str) -> ClientIdentity | None:
+        return cls._registry.get(api_key)
+
+    @classmethod
+    def clear(cls) -> None:
+        cls._registry.clear()
+
+
 class SecurityContext(BaseModel):
     authenticated: bool
-    project_id: str | None = None
     client_id: str | None = None
     is_admin: bool = False
+    project_roles: dict[str, Role] = Field(default_factory=dict)
+    project_id: str | None = None  # backward-compat single-project alias
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.project_id and self.project_id not in self.project_roles:
+            self.project_roles[self.project_id] = Role.EDITOR
+
+    def can_access_project(self, project_id: str, required_role: Role = Role.VIEWER) -> bool:
+        """Verify client has at least the required role for the target project."""
+        if self.is_admin:
+            return True
+        user_role = self.project_roles.get(project_id)
+        if not user_role:
+            return False
+        return _ROLE_WEIGHTS.get(user_role, 0) >= _ROLE_WEIGHTS.get(required_role, 1)
+
+    def get_authorized_projects(self) -> list[str] | None:
+        """Return list of allowed project IDs, or None if global admin (unrestricted)."""
+        if self.is_admin:
+            return None
+        return list(self.project_roles.keys())
 
 
 def authenticate_request(
     x_api_key: str | None = None,
     authorization: str | None = None,
 ) -> SecurityContext:
-    """Verify API credential or allow pass-through if development mode is enabled."""
+    """Verify API credential and resolve client identity with project memberships."""
     from rag_platform.core import get_settings
 
     app_settings = get_settings()
-    if not app_settings.auth_enabled or app_settings.dev_mode:
-        return SecurityContext(authenticated=True, project_id=None, is_admin=True)
 
     token = x_api_key
     if not token and authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+
+    # Pass-through as dev admin ONLY when auth is disabled and no credential was supplied
+    if (not app_settings.auth_enabled or app_settings.dev_mode) and not token:
+        return SecurityContext(authenticated=True, client_id="dev", is_admin=True)
 
     if not token:
         from fastapi import HTTPException, status
@@ -334,32 +407,49 @@ def authenticate_request(
             detail="Authentication required: missing API key or Bearer token.",
         )
 
-    if token != app_settings.api_key:
-        from fastapi import HTTPException, status
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key or credential.",
+    # 1. Check registered client keys
+    client = ApiKeyRegistry.get(token)
+    if client:
+        return SecurityContext(
+            authenticated=True,
+            client_id=client.client_id,
+            is_admin=client.is_admin,
+            project_roles=client.project_roles,
         )
 
-    return SecurityContext(authenticated=True, client_id="authorized_client", is_admin=True)
+    # 2. Check global admin key configured in application settings
+    if token == app_settings.api_key:
+        return SecurityContext(
+            authenticated=True,
+            client_id="global_admin",
+            is_admin=True,
+        )
+
+    from fastapi import HTTPException, status
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key or credential.",
+    )
 
 
 def authorize_project(
     project_id: str,
     context: SecurityContext,
+    required_role: Role = Role.VIEWER,
 ) -> None:
-    """Validate project-level authorization boundary."""
+    """Validate project-level authorization boundary and required role."""
     from rag_platform.core import get_settings
 
     app_settings = get_settings()
-    if not app_settings.auth_enabled or app_settings.dev_mode:
+    # Dev pass-through only applies when no explicit project memberships exist on dev context
+    if (not app_settings.auth_enabled or app_settings.dev_mode) and context.client_id == "dev" and not context.project_roles:
         return
     if context.is_admin:
         return
-    if context.project_id and context.project_id != project_id:
+    if not context.can_access_project(project_id, required_role):
         from fastapi import HTTPException, status
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Access forbidden: unauthorized for project '{project_id}'.",
+            detail=f"Access forbidden: unauthorized for project '{project_id}' with required role '{required_role.value}'.",
         )
 

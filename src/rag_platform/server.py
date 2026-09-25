@@ -7,9 +7,12 @@ import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import platform
+import sys
+import time
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Security, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +22,7 @@ from sqlalchemy.orm import Session
 from rag_platform.adapters import (
     AdapterRegistry,
     HttpRagAdapter,
+    PythonAdapterRegistry,
     PythonRagAdapter,
     SyntheticRagAdapter,
     SyntheticRagMode,
@@ -29,18 +33,15 @@ from rag_platform.db import (
     Base,
     DatabaseRepo,
     DatasetRow,
+    FailureRow,
     ProjectRow,
     RunRow,
-    TraceRow,
     create_db_engine,
 )
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
-    BenchmarkDataset,
     DocumentReference,
-    FailureCode,
-    GateStatus,
     MetricFamily,
     MetricResult,
     RagTrace,
@@ -49,10 +50,12 @@ from rag_platform.models import (
     RunOptions,
     RunProvenance,
     RunStatus,
+    Severity,
     TestCase,
 )
 from rag_platform.regression import RegressionEngine
 from rag_platform.security import (
+    Role,
     SecurityContext,
     authenticate_request,
     authorize_project,
@@ -163,13 +166,21 @@ class CreateRunReq(BaseModel):
     adapter_config: dict[str, Any] = Field(default_factory=dict)
     model_name: str | None = None
     model_version: str | None = None
+    model_parameters: dict[str, Any] = Field(default_factory=dict)
     temperature: float | None = 0.0
     prompt_template: str | None = None
+    system_prompt: str | None = None
+    embedding_model: str | None = None
+    embedding_version: str | None = None
+    retriever_config: dict[str, Any] = Field(default_factory=dict)
+    reranker_config: dict[str, Any] = Field(default_factory=dict)
+    chunking_config: dict[str, Any] = Field(default_factory=dict)
+    random_seed: int | None = None
     async_exec: bool = False
     # RunOptions fields — all honoured in _execute_evaluation_run (FIX #7)
     concurrency: int = 5
     max_cases: int | None = None
-    timeout_seconds: int = 60
+    timeout_seconds: float = 60.0
     fail_fast: bool = False
     use_cache: bool = True
 
@@ -187,6 +198,11 @@ def create_project(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
+    if not auth.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: project creation requires ADMIN role.",
+        )
     repo = DatabaseRepo(db)
     proj = repo.create_project(name=req.name, settings=req.settings)
     db.commit()
@@ -200,9 +216,26 @@ def list_projects(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
-    query = select(ProjectRow).offset(offset).limit(limit)
+    query = select(ProjectRow)
+    allowed = auth.get_authorized_projects()
+    if allowed is not None:
+        query = query.where(ProjectRow.id.in_(allowed))
+    query = query.offset(offset).limit(limit)
     projects = db.scalars(query).all()
     return {"projects": [{"id": p.id, "name": p.name} for p in projects], "limit": limit, "offset": offset}
+
+
+@app.get("/v1/projects/{project_id}")
+def get_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    authorize_project(project_id, auth, required_role=Role.VIEWER)
+    proj = db.get(ProjectRow, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"id": proj.id, "name": proj.name}
 
 
 @app.post("/v1/datasets")
@@ -211,17 +244,8 @@ def create_dataset(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
-    authorize_project(req.project_id, auth)
+    authorize_project(req.project_id, auth, required_role=Role.EDITOR)
     repo = DatabaseRepo(db)
-    dataset = BenchmarkDataset(
-        id=generate_id("ds"),
-        project_id=req.project_id,
-        name=req.name,
-        version=req.version,
-        description=req.description,
-        cases=req.cases,
-    )
-    dataset.publish()
     row = repo.create_dataset(
         project_id=req.project_id,
         name=req.name,
@@ -244,10 +268,13 @@ def list_datasets(
     auth: SecurityContext = Depends(get_auth),
 ):
     if project_id:
-        authorize_project(project_id, auth)
-    query = select(DatasetRow)
-    if project_id:
-        query = query.where(DatasetRow.project_id == project_id)
+        authorize_project(project_id, auth, required_role=Role.VIEWER)
+        query = select(DatasetRow).where(DatasetRow.project_id == project_id)
+    else:
+        query = select(DatasetRow)
+        allowed = auth.get_authorized_projects()
+        if allowed is not None:
+            query = query.where(DatasetRow.project_id.in_(allowed))
     query = query.offset(offset).limit(limit)
     rows = db.scalars(query).all()
     return {
@@ -267,6 +294,28 @@ def list_datasets(
     }
 
 
+@app.get("/v1/datasets/{dataset_id}")
+def get_dataset(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    ds = db.get(DatasetRow, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    authorize_project(ds.project_id, auth, required_role=Role.VIEWER)
+    return {
+        "id": ds.id,
+        "project_id": ds.project_id,
+        "name": ds.name,
+        "version": ds.version,
+        "status": ds.status,
+        "checksum": ds.checksum_sha256,
+        "description": ds.description,
+        "case_count": len(ds.cases),
+    }
+
+
 @app.get("/v1/runs")
 def list_runs(
     project_id: str | None = None,
@@ -276,10 +325,13 @@ def list_runs(
     auth: SecurityContext = Depends(get_auth),
 ):
     if project_id:
-        authorize_project(project_id, auth)
-    query = select(RunRow).order_by(RunRow.created_at.desc())
-    if project_id:
-        query = query.where(RunRow.project_id == project_id)
+        authorize_project(project_id, auth, required_role=Role.VIEWER)
+        query = select(RunRow).where(RunRow.project_id == project_id).order_by(RunRow.created_at.desc())
+    else:
+        query = select(RunRow).order_by(RunRow.created_at.desc())
+        allowed = auth.get_authorized_projects()
+        if allowed is not None:
+            query = query.where(RunRow.project_id.in_(allowed))
     query = query.offset(offset).limit(limit)
     runs = db.scalars(query).all()
     eval_engine = EvaluationEngine()
@@ -319,11 +371,8 @@ def list_runs(
 def _resolve_adapter(req: "CreateRunReq") -> Any:
     """Resolve the correct adapter based on adapter_type.
 
-    FIX #1: adapter_type is the sole authoritative selector.
-    mock_mode ONLY applies when adapter_type == "synthetic".
-    Before this fix: `if req.adapter_type == "synthetic" or req.mock_mode:`
-    caused any non-empty mock_mode string (e.g. "PERFECT") to be truthy,
-    routing HTTP/Python requests through SyntheticRagAdapter silently.
+    adapter_type is the sole authoritative selector.
+    Python adapters are resolved strictly from the trusted server-side PythonAdapterRegistry.
     """
     adapter_type_key = req.adapter_type.lower().strip()
 
@@ -345,8 +394,31 @@ def _resolve_adapter(req: "CreateRunReq") -> Any:
             timeout_seconds=float(req.adapter_config.get("timeout_seconds", 30.0)),
         )
 
-    # python and any custom registered adapters
+    if adapter_type_key == "python":
+        adapter_name = req.adapter_config.get("adapter_name")
+        target_fn = req.adapter_config.get("target_fn")
+        if target_fn is not None:
+            return PythonRagAdapter(target_fn)
+        if adapter_name:
+            try:
+                fn = PythonAdapterRegistry.get(adapter_name)
+                return PythonRagAdapter(fn)
+            except ValueError as err:
+                raise HTTPException(status_code=422, detail=str(err))
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Python adapter requires 'adapter_name' in adapter_config referencing "
+                "a pre-registered callable in PythonAdapterRegistry."
+            ),
+        )
+
+    # Any other custom registered adapters
     return AdapterRegistry.get(adapter_type_key, **req.adapter_config)
+
+
+# Global in-memory evaluation cache shared across runs
+_eval_cache: dict[str, MetricResult] = {}
 
 
 async def _execute_evaluation_run(
@@ -356,13 +428,11 @@ async def _execute_evaluation_run(
     ds_cases: list[TestCase],
     db_session: Session | None = None,
 ) -> None:
-    """Execute evaluation run in background worker or synchronously with bounded concurrency."""
-    eval_engine = EvaluationEngine()
+    """Execute evaluation run with bounded concurrency, strict timeout, fail-fast, and resource lifecycle."""
+    eval_engine = EvaluationEngine(cache=_eval_cache)
     attr_engine = FailureAttributionEngine()
 
     adapter = _resolve_adapter(req)
-
-    sem = asyncio.Semaphore(req.concurrency)
 
     # Acquire session (respecting dependency overrides if running in test)
     sess = db_session if db_session is not None else create_session()
@@ -370,29 +440,126 @@ async def _execute_evaluation_run(
     repo.update_run_status(run_id, RunStatus.RUNNING)
     sess.commit()
 
-    async def _process_case(case: TestCase) -> tuple[RagTrace, list[MetricResult], Any]:
-        async with sem:
-            trace = await adapter.run(case, config)
-            trace.run_id = run_id
-            metrics = await eval_engine.evaluate_trace(trace, case)
-            diag = attr_engine.diagnose(trace, case, metrics)
-            return (trace, metrics, diag)
+    timeout_sec = float(getattr(config.options, "timeout_seconds", 60) or 60)
+    fail_fast = bool(getattr(config.options, "fail_fast", False))
+    use_cache = bool(getattr(config.options, "use_cache", True))
+
+    async def _process_case_safe(case: TestCase) -> tuple[RagTrace, list[MetricResult], Any]:
+        start_time = time.perf_counter()
+        try:
+            if timeout_sec > 0:
+                trace = await asyncio.wait_for(adapter.run(case, config), timeout=timeout_sec)
+            else:
+                trace = await adapter.run(case, config)
+        except asyncio.TimeoutError:
+            elapsed = int((time.perf_counter() - start_time) * 1000)
+            trace = RagTrace(
+                trace_id=generate_id("tr"),
+                run_id=run_id,
+                test_case_id=case.id,
+                question=case.question,
+                error_code="OPS-01",
+                latency_ms=elapsed,
+                telemetry={
+                    "error": f"Adapter execution timed out after {timeout_sec}s",
+                    "timeout_seconds": timeout_sec,
+                    "stage": "adapter_run",
+                },
+            )
+        except Exception as exc:
+            elapsed = int((time.perf_counter() - start_time) * 1000)
+            from rag_platform.security import SecretRedactor
+            trace = RagTrace(
+                trace_id=generate_id("tr"),
+                run_id=run_id,
+                test_case_id=case.id,
+                question=case.question,
+                error_code="OPS-01",
+                latency_ms=elapsed,
+                telemetry={
+                    "error": SecretRedactor.redact_text(str(exc)),
+                    "exception_type": type(exc).__name__,
+                    "stage": "adapter_run",
+                },
+            )
+
+        trace.run_id = run_id
+        if not trace.trace_id or not trace.trace_id.startswith(f"tr_{run_id}"):
+            trace.trace_id = f"tr_{run_id}_{case.id}"
+        metrics = await eval_engine.evaluate_trace(trace, case, use_cache=use_cache)
+        diag = attr_engine.diagnose(trace, case, metrics)
+        return (trace, metrics, diag)
 
     try:
-        # FIX #7: Enforce RunOptions — max_cases, timeout_seconds, fail_fast, use_cache
         max_cases = getattr(config.options, "max_cases", None)
         cases_to_run = ds_cases[:max_cases] if (max_cases is not None and max_cases > 0) else ds_cases
 
-        tasks = [_process_case(c) for c in cases_to_run]
-        results = await asyncio.gather(*tasks)
+        case_queue: asyncio.Queue[TestCase] = asyncio.Queue()
+        for c in cases_to_run:
+            case_queue.put_nowait(c)
 
-        for trace, metrics, diag in results:
-            repo.record_trace(trace, metrics, diag)
-        repo.update_run_status(run_id, RunStatus.COMPLETED)
+        results: list[tuple[RagTrace, list[MetricResult], Any]] = []
+        results_lock = asyncio.Lock()
+        had_fatal_failure = False
+
+        async def worker():
+            nonlocal had_fatal_failure
+            while not case_queue.empty():
+                if had_fatal_failure and fail_fast:
+                    break
+                try:
+                    case = case_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                if had_fatal_failure and fail_fast:
+                    case_queue.task_done()
+                    break
+
+                trace, metrics, diag = await _process_case_safe(case)
+
+                async with results_lock:
+                    results.append((trace, metrics, diag))
+                    repo.record_trace(trace, metrics, diag)
+                    sess.commit()
+
+                case_queue.task_done()
+
+                # Determine if fatal failure
+                is_fatal = bool(
+                    trace.error_code is not None or
+                    (diag is not None and getattr(diag, "severity", None) in (Severity.CRITICAL, Severity.HIGH))
+                )
+                if is_fatal and fail_fast:
+                    had_fatal_failure = True
+                    # Drain remaining queue so workers terminate
+                    while not case_queue.empty():
+                        try:
+                            case_queue.get_nowait()
+                            case_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    break
+
+        worker_count = max(1, min(req.concurrency, len(cases_to_run))) if cases_to_run else 1
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        if workers:
+            await asyncio.gather(*workers)
+
+        if had_fatal_failure and fail_fast:
+            repo.update_run_status(run_id, RunStatus.FAILED)
+            run_row = sess.get(RunRow, run_id)
+            if run_row:
+                run_row.failure_reason = "Run aborted due to fatal case failure (fail_fast=true)"
+                run_row.failure_type = "FAIL_FAST"
+        else:
+            repo.update_run_status(run_id, RunStatus.COMPLETED)
         sess.commit()
+
         import logging
         logging.getLogger("rag_platform.server").info(
-            "run_id=%s completed with %d/%d cases processed", run_id, len(results), len(ds_cases)
+            "run_id=%s finished with %d/%d cases processed (had_fatal_failure=%s, fail_fast=%s)",
+            run_id, len(results), len(ds_cases), had_fatal_failure, fail_fast,
         )
     except Exception as exc:
         exc_type = type(exc).__name__
@@ -400,12 +567,10 @@ async def _execute_evaluation_run(
         logging.getLogger("rag_platform.server").exception(
             "run_id=%s run-level failure: %s", run_id, exc_type
         )
-        # Persist structured failure info for diagnostics
         try:
             repo.update_run_status(run_id, RunStatus.FAILED)
             run_row = sess.get(RunRow, run_id)
             if run_row:
-                # Store truncated safe failure reason — never expose secrets
                 from rag_platform.security import SecretRedactor
                 safe_reason = SecretRedactor.redact_text(str(exc))[:500]
                 run_row.failure_reason = safe_reason
@@ -413,7 +578,15 @@ async def _execute_evaluation_run(
             sess.commit()
         except Exception:
             pass
-
+    finally:
+        # Guarantee adapter resource closure (HTTP connection pools, sockets)
+        if hasattr(adapter, "close"):
+            try:
+                res = adapter.close()
+                if hasattr(res, "__await__"):
+                    await res
+            except Exception:
+                pass
 
 
 @app.post("/v1/runs")
@@ -423,14 +596,13 @@ async def create_run(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
-    authorize_project(req.project_id, auth)
+    authorize_project(req.project_id, auth, required_role=Role.EDITOR)
     repo = DatabaseRepo(db)
     ds = repo.get_dataset(req.dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # --- FIX #3: Dataset ownership validation ---
-    # Prevents cross-project dataset access: project A must not reference project B's dataset.
+    # Dataset ownership validation
     if ds.project_id != req.project_id:
         raise HTTPException(
             status_code=403,
@@ -440,6 +612,12 @@ async def create_run(
             ),
         )
 
+    env_info = {
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "python": sys.version.split()[0],
+    }
+
     provenance = RunProvenance(
         dataset_checksum=ds.checksum_sha256,
         dataset_id=ds.id,
@@ -447,10 +625,21 @@ async def create_run(
         rag_version=req.system_version,
         model_name=req.model_name,
         model_version=req.model_version,
+        model_parameters=req.model_parameters,
         temperature=req.temperature,
         prompt_template=req.prompt_template,
+        system_prompt=req.system_prompt,
+        embedding_model=req.embedding_model,
+        embedding_version=req.embedding_version,
+        retriever_config=req.retriever_config,
+        reranker_config=req.reranker_config,
+        chunking_config=req.chunking_config,
         adapter_type=req.adapter_type,
         adapter_config=req.adapter_config,
+        evaluator_version="2.0.0",
+        python_version=platform.python_version(),
+        environment_info=env_info,
+        random_seed=req.random_seed,
     )
 
     config = RunConfig(
@@ -459,7 +648,6 @@ async def create_run(
         dataset_version=req.dataset_version or ds.version,
         system_version=req.system_version,
         policy_id=req.policy_id,
-        # FIX #7: Wire ALL RunOptions fields so they're honoured in _execute_evaluation_run
         options=RunOptions(
             concurrency=req.concurrency,
             max_cases=getattr(req, "max_cases", None),
@@ -472,7 +660,6 @@ async def create_run(
     run = repo.create_run(config, provenance)
     db.commit()
 
-    # --- FIX #2: Use canonical reconstruction — preserves ALL fields ---
     cases = [db_row_to_test_case(r) for r in ds.cases]
 
     if req.async_exec:
@@ -526,7 +713,7 @@ def get_run(
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    authorize_project(run.project_id, auth)
+    authorize_project(run.project_id, auth, required_role=Role.VIEWER)
 
     eval_engine = EvaluationEngine()
     traces = [
@@ -572,7 +759,7 @@ def get_run_traces(
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    authorize_project(run.project_id, auth)
+    authorize_project(run.project_id, auth, required_role=Role.VIEWER)
 
     items = []
     traces_slice = run.traces[offset : offset + limit]
@@ -613,6 +800,53 @@ def get_run_traces(
     return {"run_id": run_id, "traces": items, "limit": limit, "offset": offset, "total": len(run.traces)}
 
 
+@app.get("/v1/failures")
+def list_failures(
+    project_id: str | None = None,
+    run_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    if project_id:
+        authorize_project(project_id, auth, required_role=Role.VIEWER)
+    if run_id:
+        run = db.get(RunRow, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        authorize_project(run.project_id, auth, required_role=Role.VIEWER)
+
+    query = select(FailureRow)
+    if run_id:
+        query = query.where(FailureRow.run_id == run_id)
+    elif project_id:
+        query = query.join(RunRow, FailureRow.run_id == RunRow.id).where(RunRow.project_id == project_id)
+    else:
+        allowed = auth.get_authorized_projects()
+        if allowed is not None:
+            query = query.join(RunRow, FailureRow.run_id == RunRow.id).where(RunRow.project_id.in_(allowed))
+
+    query = query.offset(offset).limit(limit)
+    failures = db.scalars(query).all()
+    return {
+        "failures": [
+            {
+                "id": f.id,
+                "trace_id": f.trace_id,
+                "run_id": f.run_id,
+                "failure_type": f.failure_type,
+                "severity": f.severity,
+                "confidence": f.confidence,
+                "explanation": f.explanation,
+            }
+            for f in failures
+        ],
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @app.post("/v1/compare")
 def compare_runs(
     req: CompareReq,
@@ -624,8 +858,8 @@ def compare_runs(
     if not b_run or not c_run:
         raise HTTPException(status_code=404, detail="Baseline or candidate run not found")
 
-    authorize_project(b_run.project_id, auth)
-    authorize_project(c_run.project_id, auth)
+    authorize_project(b_run.project_id, auth, required_role=Role.VIEWER)
+    authorize_project(c_run.project_id, auth, required_role=Role.VIEWER)
 
     eval_engine = EvaluationEngine()
     b_traces = [

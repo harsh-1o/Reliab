@@ -17,23 +17,19 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
-    select,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from rag_platform.core import (
     ImmutabilityError,
     generate_id,
     settings,
 )
-from rag_platform.security import RecursiveTraceSanitizer, SecretRedactor
+from rag_platform.security import RecursiveTraceSanitizer
 from rag_platform.models import (
-    BenchmarkDataset,
     DatasetStatus,
     DocumentReference,
     FailureAttribution,
-    FailureCode,
-    MetricFamily,
     MetricResult,
     RagTrace,
     RunConfig,
