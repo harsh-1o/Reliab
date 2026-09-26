@@ -167,12 +167,12 @@ def is_ip_allowed(ip: str | ipaddress.IPv4Address | ipaddress.IPv6Address) -> bo
 
     # Specific network block verification
     if isinstance(ip, ipaddress.IPv4Address):
-        for net in DISALLOWED_IPV4_NETWORKS:
-            if ip in net:
+        for net4 in DISALLOWED_IPV4_NETWORKS:
+            if ip in net4:
                 return False
     elif isinstance(ip, ipaddress.IPv6Address):
-        for net in DISALLOWED_IPV6_NETWORKS:
-            if ip in net:
+        for net6 in DISALLOWED_IPV6_NETWORKS:
+            if ip in net6:
                 return False
 
     return True
@@ -262,7 +262,7 @@ def validate_url_ssrf(
             try:
                 # Resolve all addresses (protects against multi-A DNS rebinding / mixed public-private records)
                 addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
-                raw_ips = [sockaddr[0] for _, _, _, _, sockaddr in addr_info]
+                raw_ips = [str(sockaddr[0]) for _, _, _, _, sockaddr in addr_info]
             except socket.gaierror as exc:
                 raise SSRFProtectionError(f"DNS resolution failed for host '{hostname}': {exc}") from exc
 

@@ -128,9 +128,7 @@ def health_check() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Canonical TestCase reconstruction — FIX #2
-# ---------------------------------------------------------------------------
+# Canonical TestCase reconstruction
 def db_row_to_test_case(row: Any) -> TestCase:
     """Single canonical function for DB TestCaseRow → TestCase domain model.
 
@@ -507,7 +505,7 @@ def add_cases_bulk(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
-    """Add test cases to a dataset in bulk chunks (Point 30)."""
+    """Add test cases to a dataset in bulk chunks."""
     repo = DatabaseRepo(db)
     ds = repo.get_dataset(dataset_id)
     if not ds:
@@ -842,7 +840,7 @@ async def _execute_evaluation_run(
                     case_queue.task_done()
                     break
 
-                # Rate limiting guardrail if configured (Point 27)
+                # Rate limiting guardrail if configured
                 if rate_limiter:
                     await rate_limiter.acquire(1.0)
 
@@ -1018,7 +1016,7 @@ async def create_run(
             ),
         )
 
-    # Validate dataset version (Point 13)
+    # Validate dataset version
     if req.dataset_version and req.dataset_version != ds.version:
         raise HTTPException(
             status_code=400,
@@ -1030,7 +1028,7 @@ async def create_run(
 
     cases = [db_row_to_test_case(r) for r in ds.cases]
 
-    # Validate safety limits via BudgetGuard (Points 10, 27)
+    # Validate safety limits via BudgetGuard
     effective_max_cases = req.max_cases if req.max_cases is not None else 500
     config_options = RunOptions(
         concurrency=req.concurrency,
@@ -1085,7 +1083,7 @@ async def create_run(
     )
 
     initial_status = RunStatus.QUEUED if req.async_exec else RunStatus.CREATED
-    # Sanitize options before persistence (Point 4)
+    # Sanitize options before persistence
     safe_options = SecretRedactor.redact_dict(req.model_dump())
     safe_options_json = json.dumps(safe_options)
 
@@ -1402,7 +1400,7 @@ def compare_runs(
     authorize_project(b_run.project_id, auth, required_role=Role.VIEWER)
     authorize_project(c_run.project_id, auth, required_role=Role.VIEWER)
 
-    # Validate baseline/candidate dataset compatibility (Point 14)
+    # Validate baseline/candidate dataset compatibility
     if not req.allow_cross_dataset and b_run.dataset_checksum != c_run.dataset_checksum:
         raise HTTPException(
             status_code=400,
@@ -1485,7 +1483,7 @@ def cleanup_retention(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
-    """Retention cleanup for evaluation traces (Point 33)."""
+    """Retention cleanup for evaluation traces."""
     if not auth.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

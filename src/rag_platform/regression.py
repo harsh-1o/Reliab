@@ -85,6 +85,7 @@ class RegressionEngine:
                 continue
 
             if not b_has and c_has:
+                assert c_metric is not None
                 deltas[m_name] = MetricDelta(
                     metric_name=m_name,
                     baseline=None,
@@ -98,6 +99,7 @@ class RegressionEngine:
                 continue
 
             if b_has and not c_has:
+                assert b_metric is not None
                 deltas[m_name] = MetricDelta(
                     metric_name=m_name,
                     baseline=round(b_metric.mean, 4),
@@ -111,6 +113,7 @@ class RegressionEngine:
                 continue
 
             # Both have measurements
+            assert b_metric is not None and c_metric is not None
             b_val = b_metric.mean
             c_val = c_metric.mean
 

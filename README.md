@@ -61,6 +61,12 @@ Reliab executes a deterministic evaluation and release gating pipeline:
 4. **Compare**: Candidate metrics and individual test cases are compared against a golden baseline run.
 5. **Gate**: Statistical thresholds and regression budgets determine the release verdict, returning exit code `0` or `1`.
 
+### Evaluation Methodology & Architecture
+
+Reliab currently provides **deterministic and heuristic evaluation primitives** (lexical claim decomposition, normalized token overlap, numerical/entity verification, and antonym opposition detection) designed for predictable, reproducible, zero-cost CI/CD quality gating without external API dependencies or nondeterministic LLM scoring variance.
+
+For applications requiring deep semantic inference beyond lexical grounding, Reliab features a **pluggable evaluator and adapter architecture** allowing engineering teams to seamlessly plug in neural cross-encoders, natural language inference (NLI) models, or model-graded evaluators.
+
 ## Key capabilities
 
 - **Retrieval Evaluation**: Measures Recall@K, Mean Reciprocal Rank (MRR), and Contextual Precision against golden documents.
@@ -183,7 +189,7 @@ Comprehensive technical documentation is available in the [`docs/`](docs/) direc
 Run local checks and validation suites:
 
 ```bash
-# Run unit and integration tests (186 tests)
+# Run unit, concurrency, and integration tests (200+ tests)
 python -m pytest tests/ -v
 
 # Run linting

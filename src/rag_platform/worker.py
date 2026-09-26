@@ -435,7 +435,7 @@ class DurableRunWorker:
             raw_options = json.loads(run.options_json) if run.options_json else {}
             from rag_platform.server import CreateRunReq
 
-            req_kwargs = {
+            req_kwargs: dict[str, Any] = {
                 "project_id": run.project_id,
                 "dataset_id": run.dataset_id,
                 "system_version": run.system_version,
@@ -497,9 +497,9 @@ class DurableRunWorker:
                 pass
 
             if evaluation_task in done:
-                eval_exc = evaluation_task.exception()
-                if eval_exc is not None:
-                    raise eval_exc
+                task_exc = evaluation_task.exception()
+                if task_exc is not None:
+                    raise task_exc
 
             # A lease can be invalidated immediately after evaluation completes.
             # Guard the final handoff so an obsolete worker never reports success.

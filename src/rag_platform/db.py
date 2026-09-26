@@ -33,6 +33,7 @@ from rag_platform.core import (
     sha256_hash,
 )
 from rag_platform.models import (
+    Answerability,
     DatasetStatus,
     DocumentReference,
     FailureAttribution,
@@ -120,7 +121,7 @@ class RunRow(Base):
     policy_id: Mapped[str] = mapped_column(String(64), default="prod-default")
     suite: Mapped[str] = mapped_column(String(64), default="full")
     options_json: Mapped[str] = mapped_column(Text, default="{}")
-    # Structured failure info (FIX #6): preserved when a run fails instead of silent exception swallow
+    # Structured failure info: preserved when a run fails instead of silent exception swallow
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -285,12 +286,10 @@ def init_db(engine=None, allow_non_memory: bool = False) -> None:
     eng = engine or create_db_engine()
     url_str = str(eng.url)
     if not allow_non_memory and ":memory:" not in url_str:
-        import warnings
-        warnings.warn(
-            "init_db() / create_all() should not be used on persistent databases. "
-            "Production schema authority is Alembic migrations (`alembic upgrade head`).",
-            UserWarning,
-            stacklevel=2,
+        raise RuntimeError(
+            "init_db() / create_all() is strictly prohibited on persistent databases. "
+            "Production schema authority is Alembic migrations (`alembic upgrade head`). "
+            "Pass allow_non_memory=True if running explicit non-production test harnesses."
         )
     Base.metadata.create_all(bind=eng)
 
@@ -372,7 +371,7 @@ class DatabaseRepo:
                     expected_answer=r.expected_answer,
                     expected_facts=json.loads(r.expected_facts_json),
                     relevant_documents=[DocumentReference(**d) for d in json.loads(r.relevant_docs_json)],
-                    answerability=r.answerability,
+                    answerability=Answerability(r.answerability),
                     tags=json.loads(r.tags_json),
                 )
             )
@@ -470,7 +469,7 @@ class DatabaseRepo:
             return run
 
     def purge_expired_data(self, trace_retention_days: int = 90) -> dict[str, int]:
-        """Purge historical evaluation traces older than retention threshold (Point 33)."""
+        """Purge historical evaluation traces older than retention threshold."""
         from datetime import timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(days=trace_retention_days)
         # Find runs finished before cutoff
@@ -549,8 +548,8 @@ class DatabaseRepo:
                 id=generate_id("fail"),
                 trace_id=trace.trace_id,
                 run_id=trace.run_id,
-                failure_type=attribution.failure_type.value,
-                severity=attribution.severity.value,
+                failure_type=attribution.failure_type.value if attribution.failure_type else "UNKNOWN",
+                severity=attribution.severity.value if hasattr(attribution.severity, "value") else str(attribution.severity),
                 confidence=attribution.confidence,
                 explanation=SecretRedactor.redact_text(attribution.explanation),
                 evidence_json=json.dumps(evidence_payload),

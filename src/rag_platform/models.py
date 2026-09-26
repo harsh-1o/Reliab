@@ -369,9 +369,15 @@ class RunProvenance(BaseModel):
         if not self.dependency_lock_hash:
             try:
                 from pathlib import Path
-                lock_file = Path("requirements.lock")
-                if lock_file.exists():
-                    self.dependency_lock_hash = sha256_hash(lock_file.read_text(encoding="utf-8"))
+                repo_root = Path(__file__).resolve().parent.parent.parent
+                candidate_paths = [
+                    repo_root / "requirements.lock",
+                    Path("requirements.lock"),
+                ]
+                for lock_file in candidate_paths:
+                    if lock_file.is_file():
+                        self.dependency_lock_hash = sha256_hash(lock_file.read_text(encoding="utf-8"))
+                        break
             except Exception:
                 pass
         if not self.manifest_hash:

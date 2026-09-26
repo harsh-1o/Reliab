@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import re
+import statistics
 from abc import ABC, abstractmethod
 
 from rag_platform.core import canonical_json, sha256_hash
@@ -326,10 +327,14 @@ def is_evidence_match(gold: DocumentReference, chunk: RetrievedChunk) -> bool:
 
 
 def wilson_score_interval(p: float, n: int, confidence: float = 0.95) -> tuple[float, float]:
-    """Compute the Wilson score confidence interval for a binomial proportion."""
+    """Compute the Wilson score confidence interval for a binomial proportion at the specified confidence level."""
     if n <= 0:
         return (0.0, 0.0)
-    z = 1.95996  # 95% standard normal quantile
+    if not (0.0 < confidence < 1.0):
+        raise ValueError(f"Confidence must be between 0.0 and 1.0, got {confidence}")
+    # Compute the standard normal two-tailed quantile corresponding to the requested confidence level
+    alpha = 1.0 - confidence
+    z = statistics.NormalDist().inv_cdf(1.0 - alpha / 2.0)
     denominator = 1.0 + (z**2) / n
     centre = (p + (z**2) / (2 * n)) / denominator
     half_width = (z / denominator) * math.sqrt((p * (1.0 - p) / n) + ((z**2) / (4 * (n**2))))
@@ -735,7 +740,7 @@ class CitationSupportMetric(BaseMetric):
             if citation_status == ClaimStatus.SUPPORTED:
                 valid_count += 1
             else:
-                # FIX #17: Heuristic lexical fallback — explicitly disclosed in metadata.
+                # Heuristic lexical fallback — explicitly disclosed in metadata.
                 # A weak lexical match must NOT silently override the primary evaluator.
                 claim_words = [w for w in re.findall(r"\w+", cit.claim_text.lower()) if len(w) > 2]
                 chunk_words = set(re.findall(r"\w+", matched.text.lower()))

@@ -414,6 +414,7 @@ def execute_gate_evaluation(
     repo.update_run_status(run.id, RunStatus.RUNNING)
     db_session.commit()
 
+    adapter: Any
     if adapter_type == "http" and endpoint_url:
         from rag_platform.adapters import HttpRagAdapter
         adapter = HttpRagAdapter(endpoint_url=endpoint_url)

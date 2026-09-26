@@ -173,11 +173,15 @@ class HttpRagAdapter:
             redirect_count = 0
             max_retries = 3
             retry_count = 0
+            # Build request headers with trace ID and idempotency key to protect SUT against duplicated side-effects during retries
+            req_headers = dict(self.headers)
+            req_headers.setdefault("X-Request-ID", trace_id)
+            req_headers.setdefault("Idempotency-Key", f"eval_{config.project_id}_{config.dataset_id}_{case.id}_{trace_id}")
             retry_status_codes = {429, 502, 503, 504}
 
             while True:
                 try:
-                    resp = await client.post(current_url, json=payload, headers=self.headers)
+                    resp = await client.post(current_url, json=payload, headers=req_headers)
                 except (httpx.ConnectError, httpx.RemoteProtocolError) as net_err:
                     if retry_count < max_retries:
                         retry_count += 1
