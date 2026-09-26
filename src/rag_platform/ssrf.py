@@ -8,11 +8,11 @@ Protects against DNS rebinding and redirect-based SSRF bypasses.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import socket
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -185,16 +185,16 @@ def validate_url_ssrf(
     dns_resolver: Callable[[str, int], list[str]] | None = None,
 ) -> list[str]:
     """Validate a URL against SSRF attack vectors immediately before outbound request.
-    
+
     Performs:
     1. URL parsing and scheme restriction (http/https only).
     2. Host validation and allowed_hosts enforcement.
     3. DNS resolution of hostname (via custom resolver, air-gapped static DNS map, or DNS).
     4. IP validation rejecting private, loopback, link-local, and reserved ranges.
-    
+
     Returns:
         List of resolved, validated IP address strings.
-        
+
     Raises:
         SSRFProtectionError: If any security check fails.
     """
@@ -286,8 +286,8 @@ def validate_url_ssrf(
 
 
 # --- DNS Rebinding Protection via Transport-Level IP Pinning ---
-from httpcore._backends.auto import AutoBackend
 import httpx
+from httpcore._backends.auto import AutoBackend
 
 
 class SSRFPinningNetworkBackend(AutoBackend):

@@ -24,7 +24,6 @@ from rag_platform.models import (
     TestCase,
 )
 
-
 EQUIVALENCE_MAPPINGS: list[tuple[str, str]] = [
     (r"\bone month\b", "30 days"),
     (r"\b1 month\b", "30 days"),
@@ -101,7 +100,7 @@ def _decompose_sentence_into_clauses(sentence: str) -> list[str]:
 
 def extract_claims(text: str) -> list[str]:
     """Extract atomic factual claim units from answer text.
-    
+
     Decomposes paragraphs and compound sentences into atomic declarative clauses,
     filtering conversational padding and meta-discourse.
     """
@@ -159,7 +158,7 @@ def verify_claim_against_chunks(
     claim: str, chunks: list[RetrievedChunk]
 ) -> tuple[ClaimStatus, RetrievedChunk | None, str]:
     """Verify an individual claim against retrieved context chunks using Lexical Claim Grounding.
-    
+
     Returns (ClaimStatus, supporting_chunk, explanation).
     Classifies as:
       - SUPPORTED: Key entities, predicates, and semantic alignments confirmed in evidence chunk.
@@ -798,10 +797,10 @@ class AbstentionAccuracyMetric(BaseMetric):
         )
 
 
-from collections import OrderedDict
 import json
 import logging
 import threading
+from collections import OrderedDict
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -913,6 +912,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
 
     def get(self, key: str) -> MetricResult | None:
         from datetime import datetime, timezone
+
         from rag_platform.db import EvaluationCacheRow
 
         try:
@@ -937,7 +937,9 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
 
     def set(self, key: str, value: MetricResult) -> None:
         from datetime import datetime, timezone
-        from sqlalchemy import select, func, delete
+
+        from sqlalchemy import delete, func, select
+
         from rag_platform.db import EvaluationCacheRow
 
         try:
@@ -979,6 +981,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
 
     def clear(self) -> None:
         from sqlalchemy import delete
+
         from rag_platform.db import EvaluationCacheRow
 
         try:
@@ -991,7 +994,8 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
             logger.debug("DatabaseEvaluationCache clear error: %s", exc)
 
     def stats(self) -> dict[str, Any]:
-        from sqlalchemy import select, func
+        from sqlalchemy import func, select
+
         from rag_platform.db import EvaluationCacheRow
 
         try:
@@ -1130,8 +1134,8 @@ class EvaluationEngine:
                     if cached_val is not None:
                         results.append(cached_val.model_copy(update={"cached": True}))
                         continue
-                elif key in self._cache:
-                    cached_res = self._cache[key].model_copy(update={"cached": True})
+                elif key in self._cache:  # type: ignore[operator]
+                    cached_res = self._cache[key].model_copy(update={"cached": True})  # type: ignore[index]
                     results.append(cached_res)
                     continue
 

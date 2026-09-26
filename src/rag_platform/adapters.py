@@ -86,7 +86,7 @@ class PythonRagAdapter:
 
 class HttpRagAdapter:
     """Invokes an external HTTP RAG endpoint and normalizes to canonical RagTrace.
-    
+
     Supports reusable connection pooling via shared httpx.AsyncClient to minimize
     TCP handshake latency across high-throughput evaluation suites.
     Includes strict SSRF protection: validates destinations before connect and re-validates
@@ -335,7 +335,7 @@ class SyntheticRagMode(str, Enum):
 
 class SyntheticRagAdapter:
     """Synthetic SUT adapter for offline development, integration tests, and platform calibration.
-    
+
     NOT intended for production SUT evaluation.
     """
     is_development_adapter: bool = True

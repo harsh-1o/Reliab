@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import platform
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response, status
@@ -20,7 +20,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from rag_platform import __version__
-
 from rag_platform.adapters import (
     AdapterRegistry,
     HttpRagAdapter,
@@ -549,6 +548,7 @@ def _resolve_adapter(req: "CreateRunReq") -> Any:
 
 # Shared two-tier evaluation cache (L1 in-memory LRU + L2 database persistence across processes)
 from rag_platform.evaluators import TwoTierEvaluationCache
+
 _eval_cache = TwoTierEvaluationCache(l1_capacity=10_000, l2_capacity=50_000)
 
 

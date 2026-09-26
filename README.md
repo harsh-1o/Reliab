@@ -407,10 +407,12 @@ Open [http://127.0.0.1:8080/dashboard](http://127.0.0.1:8080/dashboard).
 The GitHub Actions workflow (`.github/workflows/reliab-evaluation.yml`) is completely self-contained:
 1. Checks out repository on `main` or `master`.
 2. Installs Python 3.11 and locked dependencies from `requirements.lock`.
-3. Applies database migrations via Alembic.
-4. Executes unit and integration test suites (186 tests).
-5. Seeds golden benchmark dataset and executes the Reliab quality gate (`--bootstrap`).
-6. Publishes JUnit XML test reports and gate summaries.
+3. **Lint** — Ruff checks `src/` against E, F, W, and I rules with GitHub annotation output.
+4. **Type Check** — mypy checks `src/rag_platform/` with realistic per-module overrides.
+5. **Schema Consistency** — `alembic upgrade head && alembic check` verifies no pending migration drift.
+6. Executes unit and integration test suites (186 tests).
+7. Seeds golden benchmark dataset and executes the Reliab quality gate (`--bootstrap`).
+8. Publishes JUnit XML test reports and gate summaries.
 
 ---
 
@@ -420,6 +422,7 @@ In the spirit of engineering honesty:
 1. **Lexical Claim Grounding**: Claim verification currently uses lexical token alignment, synonym normalization, and rule-based numerical/antonym conflict detection. It is a fast, deterministic baseline, but not a full cross-encoder semantic entailment model.
 2. **ML Classifier Probability Estimates**: The ML classifier outputs raw tree probabilities from `predict_proba`. These are model probability estimates, not mathematically calibrated Bayesian posterior probabilities.
 3. **Database Leases vs Distributed Message Queues**: The durable worker utilizes PostgreSQL/SQLite lease locking with LISTEN/NOTIFY and polling backoff. For hyper-scale multi-datacenter topologies, an external message broker can be slotted in via the adapter interface.
+4. **Starlette/httpx Test Client Deprecation**: The test suite uses `starlette.testclient` with `httpx` 0.28.1, which emits a deprecation warning (`install httpx2 instead`). This is a Starlette 1.3.1 internal deprecation. Upgrading would require a coordinated bump of FastAPI, Starlette, and httpx; deferred until a stable upgrade path is confirmed. No functional impact.
 
 ---
 

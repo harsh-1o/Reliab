@@ -5,6 +5,7 @@ Supports SQLite and PostgreSQL via SQLAlchemy 2.0 ORM.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,7 +22,6 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
-import threading
 
 from rag_platform.core import (
     ImmutabilityError,
@@ -29,7 +29,6 @@ from rag_platform.core import (
     settings,
     sha256_hash,
 )
-from rag_platform.security import RecursiveTraceSanitizer, SecretRedactor
 from rag_platform.models import (
     DatasetStatus,
     DocumentReference,
@@ -43,6 +42,7 @@ from rag_platform.models import (
     TestCase,
     compute_dataset_checksum,
 )
+from rag_platform.security import RecursiveTraceSanitizer, SecretRedactor
 
 
 class Base(DeclarativeBase):
@@ -100,7 +100,7 @@ class RunRow(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False, index=True)
     system_version: Mapped[str] = mapped_column(String(128), nullable=False)
-    
+
     # 6-Dimension Provenance
     dataset_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     rag_version: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -443,7 +443,7 @@ class DatabaseRepo:
         # Find runs finished before cutoff
         expired_runs = self.session.scalars(
             select(RunRow).where(
-                RunRow.finished_at != None,
+                RunRow.finished_at.is_not(None),
                 RunRow.finished_at < cutoff,
             )
         ).all()

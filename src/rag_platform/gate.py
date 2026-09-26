@@ -14,13 +14,14 @@ from sqlalchemy.orm import Session
 
 from rag_platform.adapters import SyntheticRagAdapter, SyntheticRagMode
 from rag_platform.attribution import FailureAttributionEngine
-from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, TestCaseRow, DatasetStatus, create_db_engine
+from rag_platform.db import DatabaseRepo, DatasetRow, DatasetStatus, ProjectRow, TestCaseRow, create_db_engine
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
     DocumentReference,
     GateResult,
     GateStatus,
+    GateViolation,
     ReleasePolicy,
     RunConfig,
     RunProvenance,

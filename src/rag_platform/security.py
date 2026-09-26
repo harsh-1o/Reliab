@@ -9,9 +9,10 @@ import time
 from enum import Enum
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from rag_platform.core import PolicyViolationError
 from rag_platform.models import RunOptions
-from pydantic import BaseModel, Field
 
 
 # --- 1. Comprehensive Enterprise Secret Redactor ---
@@ -161,7 +162,7 @@ class EvaluatorPromptDefense:
     @classmethod
     def wrap_evidence(cls, chunk_text: str, chunk_id: str = "") -> str:
         """Wrap untrusted retrieved document in strict defensive containment tags.
-        
+
         Treats retrieved context as passive data, explicitly disarming commands.
         """
         is_inj, pattern = cls.detect_injection(chunk_text)
@@ -271,7 +272,7 @@ class BudgetGuard:
 # --- 5. Centralized Recursive Trace Sanitizer ---
 class RecursiveTraceSanitizer:
     """Centralized recursive sanitizer for traces and arbitrary nested structures before persistence.
-    
+
     Guarantees that sensitive credentials, tokens, DB URIs, and keys are removed from:
     question, answer, telemetry, chunks, chunk text, chunk metadata, citations, claims,
     and raw provider error payloads.
@@ -335,7 +336,7 @@ def generate_secure_api_key() -> str:
 
 class ApiKeyRegistry:
     """Registry mapping API keys to client identities and project role memberships.
-    
+
     Supports both fast in-memory registration and durable, multi-process database
     persistence via hashed API keys (SHA-256). Raw keys are never stored in the database.
     """
@@ -385,9 +386,11 @@ class ApiKeyRegistry:
         if persist_db or db_session is not None:
             try:
                 import json
+
+                from sqlalchemy.orm import Session
+
                 from rag_platform.core import sha256_hash
                 from rag_platform.db import ApiKeyRow, create_db_engine
-                from sqlalchemy.orm import Session
 
                 key_hash = sha256_hash(api_key)
                 roles_str = {p: r.value for p, r in roles.items()}
@@ -423,9 +426,11 @@ class ApiKeyRegistry:
         # Query database for persistent key hash across processes
         try:
             import json
+
+            from sqlalchemy.orm import Session
+
             from rag_platform.core import sha256_hash
             from rag_platform.db import ApiKeyRow, create_db_engine
-            from sqlalchemy.orm import Session
 
             key_hash = sha256_hash(api_key)
             row = None

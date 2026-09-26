@@ -29,7 +29,7 @@ FAILURE_CLASSES = ["PASS", "RET-01", "RET-02", "GEN-01", "CIT-01", "ABS-01", "OP
 
 class FeatureExtractor:
     """Extracts standardized tabular feature vectors from traces and cases.
-    
+
     Prefers structural, distributional, and retrieval signals over rule-generated metrics
     to prevent target leakage during training.
     """
@@ -86,7 +86,7 @@ class FeatureExtractor:
 
 class MLFailureClassifier:
     """Gradient-boosted failure diagnosis model with uncalibrated probability estimates.
-    
+
     Outputs raw model probability estimates. Does not claim calibrated confidence.
     """
 

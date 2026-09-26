@@ -7,15 +7,14 @@ and survival across API process restarts without requiring heavyweight message q
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone, timedelta
 import json
 import logging
 import signal
-import sys
 import threading
 import time
-from typing import Any
 import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -264,7 +263,7 @@ class DurableRunWorker:
             if last_activity.tzinfo is None:
                 last_activity = last_activity.replace(tzinfo=timezone.utc)
             age = (now - last_activity).total_seconds()
-            
+
             is_lease_expired = run.lease_expires_at is not None and (
                 (run.lease_expires_at.replace(tzinfo=timezone.utc) if run.lease_expires_at.tzinfo is None else run.lease_expires_at) < now
             )

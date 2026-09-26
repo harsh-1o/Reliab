@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+
 # --- Exceptions ---
 class PlatformError(Exception):
     def __init__(self, message: str, details: dict | None = None) -> None:
@@ -17,13 +18,32 @@ class PlatformError(Exception):
         self.message = message
         self.details = details or {}
 
-class ProvenanceError(PlatformError): pass
-class ImmutabilityError(PlatformError): pass
-class AdapterTimeoutError(PlatformError): pass
-class AdapterExecutionError(PlatformError): pass
-class PolicyViolationError(PlatformError): pass
-class AuthenticationError(PlatformError): pass
-class AuthorizationError(PlatformError): pass
+class ProvenanceError(PlatformError):
+    pass
+
+
+class ImmutabilityError(PlatformError):
+    pass
+
+
+class AdapterTimeoutError(PlatformError):
+    pass
+
+
+class AdapterExecutionError(PlatformError):
+    pass
+
+
+class PolicyViolationError(PlatformError):
+    pass
+
+
+class AuthenticationError(PlatformError):
+    pass
+
+
+class AuthorizationError(PlatformError):
+    pass
 
 # --- IDs ---
 def generate_id(prefix: str = "id") -> str:

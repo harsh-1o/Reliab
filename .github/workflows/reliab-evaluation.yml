@@ -30,9 +30,18 @@ jobs:
           pip install -e . --no-deps
           python -c "import rag_platform; import alembic; print('Platform dependencies verified successfully.')"
 
-      - name: Initialize Database (Alembic Migrations)
+      - name: Lint (Ruff)
+        run: |
+          ruff check src/ --output-format=github
+
+      - name: Type Check (mypy)
+        run: |
+          mypy src/rag_platform/
+
+      - name: Verify Schema Consistency (Alembic)
         run: |
           python -c "import alembic.config; alembic.config.main(argv=['upgrade', 'head'])"
+          python -c "import alembic.config; alembic.config.main(argv=['check'])"
 
       - name: Prepare Test Output Directory
         run: |
@@ -67,5 +76,3 @@ jobs:
         continue-on-error: true
         with:
           files: "test-results/**/*.xml"
-
-

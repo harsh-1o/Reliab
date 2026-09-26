@@ -21,7 +21,7 @@ from rag_platform.models import (
 
 class FailureAttributionEngine:
     """Diagnoses root cause of RAG failures using a causal decision pipeline.
-    
+
     Identifies the primary root-cause failure and all contributing failures across
     infrastructure, abstention, retrieval, generation, and citation stages.
     """
@@ -50,7 +50,7 @@ class FailureAttributionEngine:
         metrics: list[MetricResult] | None = None,
     ) -> FailureAttribution | None:
         """Run diagnostic attribution pipeline across all evaluation dimensions.
-        
+
         Returns FailureAttribution with primary_code, contributing_codes, and detailed findings,
         or None if all quality thresholds are satisfied.
         """
