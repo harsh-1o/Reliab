@@ -13,16 +13,14 @@ Explicitly tests:
 
 from __future__ import annotations
 
-import asyncio
-import json
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from rag_platform.adapters import AdapterRegistry, SyntheticRagAdapter, SyntheticRagMode
+from rag_platform.adapters import SyntheticRagAdapter, SyntheticRagMode
 from rag_platform.attribution import FailureAttributionEngine
-from rag_platform.db import Base, DatabaseRepo, RunRow, TraceRow
+from rag_platform.db import Base, DatabaseRepo, TraceRow
 from rag_platform.evaluators import (
     CitationSupportMetric,
     ContextualPrecisionMetric,
@@ -34,13 +32,10 @@ from rag_platform.evaluators import (
 )
 from rag_platform.models import (
     Answerability,
-    BenchmarkDataset,
     Citation,
     ClaimStatus,
     DocumentReference,
     GateStatus,
-    MetricFamily,
-    MetricResult,
     MetricStatus,
     RagTrace,
     ReleasePolicy,
@@ -53,7 +48,6 @@ from rag_platform.models import (
 from rag_platform.regression import RegressionEngine
 from rag_platform.security import (
     PromptInjectionDetector,
-    RecursiveTraceSanitizer,
     format_isolated_prompt,
 )
 

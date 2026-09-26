@@ -16,12 +16,12 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import shutil
 import socket
 import subprocess
-from unittest.mock import patch, MagicMock
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,8 +33,8 @@ from rag_platform.adapters import HttpRagAdapter
 from rag_platform.core import sha256_hash
 from rag_platform.db import (
     Base,
-    RunRow,
     DatabaseRepo,
+    RunRow,
 )
 from rag_platform.evaluators import BoundedLRUCache
 from rag_platform.models import (
@@ -58,7 +58,6 @@ from rag_platform.ssrf import (
     validate_url_ssrf,
 )
 from rag_platform.worker import DurableRunWorker
-
 
 # =====================================================================
 # 1. SSRF PROTECTION LAYER TESTS
@@ -170,7 +169,7 @@ class TestSSRFProtection:
         resp_redirect.is_redirect = True
         resp_redirect.status_code = 302
         resp_redirect.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
-        
+
         async def mock_post(*args, **kwargs):
             return resp_redirect
 

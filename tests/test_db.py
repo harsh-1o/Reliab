@@ -10,10 +10,6 @@ from rag_platform.core import ImmutabilityError
 from rag_platform.db import (
     Base,
     DatabaseRepo,
-    DatasetRow,
-    ProjectRow,
-    RunRow,
-    TraceRow,
 )
 from rag_platform.models import (
     Answerability,

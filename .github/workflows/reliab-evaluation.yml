@@ -1,4 +1,4 @@
-name: Reliab Quality Gate & CI/CD Pipeline
+name: "Reliab Quality Gate & CI/CD Pipeline"
 
 on:
   pull_request:
@@ -32,7 +32,7 @@ jobs:
 
       - name: Lint (Ruff)
         run: |
-          ruff check src/ --output-format=github
+          ruff check src/ tests/ --output-format=github
 
       - name: Type Check (mypy)
         run: |
@@ -51,7 +51,7 @@ jobs:
         run: |
           pytest tests/ -v --junit-xml=test-results/unit-tests.xml
 
-      - name: Platform Self-Test: Passing Quality Gate
+      - name: "Platform Self-Test: Passing Quality Gate"
         run: |
           python -m rag_platform.gate \
             --bootstrap \
@@ -63,7 +63,7 @@ jobs:
             --mock-mode PERFECT \
             --junit-xml test-results/reliab-gate-pass.xml
 
-      - name: Platform Self-Test: Failing Quality Gate
+      - name: "Platform Self-Test: Failing Quality Gate"
         run: |
           set +e
           python -m rag_platform.gate \

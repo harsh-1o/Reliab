@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -18,7 +19,6 @@ from rag_platform.models import (
     GateResult,
     GateStatus,
     GateViolation,
-    ReleasePolicy,
     TestCase,
 )
 

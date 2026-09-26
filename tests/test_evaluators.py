@@ -6,8 +6,6 @@ import pytest
 
 from rag_platform.evaluators import (
     AbstentionAccuracyMetric,
-    AnswerCorrectnessMetric,
-    ContextualPrecisionMetric,
     EvaluationEngine,
     FaithfulnessMetric,
     MeanReciprocalRankMetric,

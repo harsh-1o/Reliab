@@ -14,14 +14,12 @@ Verifies:
 """
 
 import asyncio
-from datetime import datetime, timezone
 import threading
 import time
-from typing import Any
 import uuid
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -57,7 +55,8 @@ def memory_db():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(bind=engine)
-    session_factory = lambda: Session(engine)
+    def session_factory() -> Session:
+        return Session(engine)
 
     # Seed test project and dataset
     with session_factory() as sess:

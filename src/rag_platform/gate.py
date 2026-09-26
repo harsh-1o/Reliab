@@ -341,14 +341,16 @@ def execute_gate_evaluation(
 
 def main():
     parser = argparse.ArgumentParser(description="Reliab CI/CD Quality Gate & Platform Self-Test")
-    parser.add_argument("--project", required=True, help="Project ID")
-    parser.add_argument("--dataset", required=True, help="Published Dataset ID")
-    parser.add_argument("--system-version", required=True, help="Candidate RAG Git commit SHA")
+    parser.add_argument("--project", "--project-id", dest="project", default="reliab-ci-project", help="Project ID")
+    parser.add_argument("--dataset", "--dataset-id", "--dataset-path", dest="dataset", default="ci_bench", help="Published Dataset ID or path")
+    parser.add_argument("--system-version", default="HEAD", help="Candidate RAG Git commit SHA")
     parser.add_argument("--policy", default="prod-default", help="Release policy ID")
     parser.add_argument("--adapter-type", default="synthetic", choices=["synthetic", "http"], help="Adapter type (Points 15)")
     parser.add_argument("--endpoint-url", default=None, help="HTTP SUT endpoint URL when evaluating real RAG system")
     parser.add_argument("--mock-mode", default="PERFECT", choices=[m.value for m in SyntheticRagMode])
     parser.add_argument("--junit-xml", default=None, help="Path to write JUnit XML test results")
+    parser.add_argument("--environment", default="production", help="Deployment environment")
+    parser.add_argument("--gate-mode", default="hard", choices=["hard", "soft"], help="Gate enforcement mode")
     parser.add_argument(
         "--bootstrap",
         action="store_true",

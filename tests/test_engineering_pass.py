@@ -7,45 +7,35 @@ These tests must PASS on every subsequent change.
 from __future__ import annotations
 
 import asyncio
-import json
-import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-
-from rag_platform.adapters import (
-    AdapterRegistry,
-    HttpRagAdapter,
-    SyntheticRagAdapter,
-    SyntheticRagMode,
-)
-from rag_platform.core import generate_id, sha256_hash
-from rag_platform.db import Base, DatabaseRepo, DatasetRow, ProjectRow, RunRow
-from rag_platform.evaluators import EvaluationEngine, extract_claims, verify_claim_against_chunks
-from rag_platform.models import (
-    Answerability,
-    ClaimStatus,
-    DocumentReference,
-    MetricRegressionPolicy,
-    MetricStatus,
-    RagTrace,
-    ReleasePolicy,
-    RetrievedChunk,
-    RunConfig,
-    RunOptions,
-    RunProvenance,
-    RunStatus,
-    TestCase,
-)
-from rag_platform.server import app, get_db, db_row_to_test_case
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 from sqlalchemy.pool import StaticPool
+
+from rag_platform.adapters import (
+    HttpRagAdapter,
+    SyntheticRagAdapter,
+    SyntheticRagMode,
+)
+from rag_platform.core import generate_id
+from rag_platform.db import Base, DatasetRow, ProjectRow
+from rag_platform.evaluators import EvaluationEngine
+from rag_platform.models import (
+    MetricRegressionPolicy,
+    MetricStatus,
+    RagTrace,
+    RetrievedChunk,
+    RunProvenance,
+    TestCase,
+)
+from rag_platform.server import app, db_row_to_test_case, get_db
 
 _test_engine = create_engine(
     "sqlite:///:memory:",
@@ -427,7 +417,6 @@ class TestEvaluatorCacheKey:
     """Same chunk_id with different content must produce a cache MISS."""
 
     def test_different_chunk_content_produces_cache_miss(self):
-        from rag_platform.evaluators import FaithfulnessMetric
 
         engine = EvaluationEngine()
         metric = engine.metrics[0]  # use first metric as proxy
@@ -566,6 +555,7 @@ class TestNoProdCreateAll:
     def test_server_module_does_not_unconditionally_call_create_all(self):
         """Inspect server module: create_all must only be called inside if ':memory:'."""
         import inspect
+
         import rag_platform.server as srv_mod
         src = inspect.getsource(srv_mod)
         # The pattern `Base.metadata.create_all` outside of the ':memory:' guard should not appear

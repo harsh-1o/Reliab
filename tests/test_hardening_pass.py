@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 from typing import Any
+
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -26,8 +27,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from rag_platform.adapters import PythonAdapterRegistry
 import rag_platform.core as core_module
+from rag_platform.adapters import PythonAdapterRegistry
 from rag_platform.core import Settings, generate_id
 from rag_platform.db import (
     Base,
