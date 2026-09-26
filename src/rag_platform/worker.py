@@ -70,7 +70,6 @@ class WorkerNotificationBus:
         with cls._lock:
             subscribers_snapshot = list(cls._subscribers.items())
 
-        # Thread-safe cross-thread event scheduling
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -97,8 +96,6 @@ class WorkerNotificationBus:
                     with cls._lock:
                         cls._subscribers.pop(ev, None)
 
-        # PostgreSQL LISTEN/NOTIFY push notification for multi-node deployments
-        # Invariant: Run is already committed by caller. NOTIFY helper does NOT commit db_session.
         target_engine = engine
         if target_engine is None and db_session is not None:
             try:
@@ -111,7 +108,6 @@ class WorkerNotificationBus:
                 dialect = getattr(getattr(target_engine, "dialect", None), "name", "")
                 if dialect == "postgresql":
                     from sqlalchemy import text
-                    # Use a standalone autocommit connection so caller transaction is never hijacked or committed
                     with target_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                         conn.execute(text("NOTIFY rag_runs_channel, :run_id"), {"run_id": run_id})
             except Exception as exc:
@@ -151,17 +147,14 @@ class WorkerNotificationBus:
                     logger.info("Active PostgreSQL LISTEN listener established on '%s'", channel)
 
                     while not thread_stop.is_set():
-                        # Support psycopg (v3) and psycopg2
                         if hasattr(raw_conn, "notifies"):
                             notifies_attr = getattr(raw_conn, "notifies")
                             if callable(notifies_attr):
-                                # psycopg 3 generator with timeout
                                 for n in raw_conn.notifies(timeout=0.5):
                                     cls.notify_new_run(getattr(n, "payload", "pg_notify"))
                                     if thread_stop.is_set():
                                         break
                             elif isinstance(notifies_attr, list):
-                                # psycopg2 list
                                 import select
                                 if select.select([raw_conn], [], [], 0.5) != ([], [], []):
                                     raw_conn.poll()
@@ -197,12 +190,7 @@ class DurableRunWorker:
         worker_id: str | None = None,
         lease_duration_seconds: float = 30.0,
     ) -> RunRow | None:
-        """Atomically claim the oldest QUEUED run in the database with worker lease ownership.
-
-        Sets started_at, heartbeat_at, worker_id, lease_id, and lease_expires_at upon claiming.
-        Uses an atomic conditional UPDATE (`status='RUNNING' WHERE id=:id AND status='QUEUED'`)
-        guaranteeing that exactly one worker claims a run even across multiple concurrent processes.
-        """
+        """Atomically claim the oldest QUEUED run in the database with worker lease ownership."""
         stmt = (
             select(RunRow.id)
             .where(RunRow.status == RunStatus.QUEUED.value)
@@ -218,7 +206,6 @@ class DurableRunWorker:
         lease_id = str(uuid.uuid4())
         lease_expires = now + timedelta(seconds=lease_duration_seconds)
 
-        # Atomic conditional update claiming run and stamping execution start and lease token
         res = sess.execute(
             update(RunRow)
             .where(RunRow.id == candidate_id, RunRow.status == RunStatus.QUEUED.value)
@@ -232,7 +219,6 @@ class DurableRunWorker:
             )
         )
         if res.rowcount == 0:
-            # Concurrently claimed by another worker
             sess.rollback()
             return None
 
@@ -248,11 +234,7 @@ class DurableRunWorker:
         sess: Session,
         max_age_seconds: float = 600.0,
     ) -> list[str]:
-        """Identify and recover runs stuck in RUNNING state beyond max_age_seconds without a heartbeat or expired lease.
-
-        Uses lease_expires_at and heartbeat_at so actively executing runs are protected,
-        while truly dead workers release ownership cleanly.
-        """
+        """Recover runs whose worker heartbeat is stale or lease has expired."""
         now = datetime.now(timezone.utc)
         stmt = select(RunRow).where(RunRow.status == RunStatus.RUNNING.value)
         running_runs = sess.scalars(stmt).all()
@@ -291,8 +273,7 @@ class DurableRunWorker:
         run_id: str,
         db_session: Session | None = None,
     ) -> bool:
-        """Execute a specific run that has already been claimed, with live heartbeat updates and lease verification."""
-        import asyncio
+        """Execute a claimed run and abort promptly if its worker lease is lost."""
         owned_session = False
         sess = db_session if db_session is not None else create_session()
         if db_session is None:
@@ -318,12 +299,9 @@ class DurableRunWorker:
                         with create_session() as hb_sess:
                             now_hb = datetime.now(timezone.utc)
                             new_expiry = now_hb + timedelta(seconds=30.0)
-                            stmt = (
-                                update(RunRow)
-                                .where(
-                                    RunRow.id == target_run_id,
-                                    RunRow.status == RunStatus.RUNNING.value,
-                                )
+                            stmt = update(RunRow).where(
+                                RunRow.id == target_run_id,
+                                RunRow.status == RunStatus.RUNNING.value,
                             )
                             if target_lease_id:
                                 stmt = stmt.where(RunRow.lease_id == target_lease_id)
@@ -350,6 +328,34 @@ class DurableRunWorker:
             except asyncio.CancelledError:
                 pass
 
+        async def _fail_if_still_owner(reason: str) -> None:
+            """Transition the run to FAILED only if this worker still owns the lease."""
+            try:
+                with create_session() as owner_sess:
+                    now = datetime.now(timezone.utc)
+                    stmt = (
+                        update(RunRow)
+                        .where(
+                            RunRow.id == run_id,
+                            RunRow.status == RunStatus.RUNNING.value,
+                        )
+                    )
+                    if active_lease_id:
+                        stmt = stmt.where(RunRow.lease_id == active_lease_id)
+                    result = owner_sess.execute(
+                        stmt.values(
+                            status=RunStatus.FAILED.value,
+                            finished_at=now,
+                            failure_type="WORKER_LEASE_LOST",
+                            failure_reason=reason[:500],
+                        )
+                    )
+                    owner_sess.commit()
+                    if result.rowcount:
+                        logger.warning("Run %s failed because worker lease was lost.", run_id)
+            except Exception:
+                logger.exception("Unable to persist lease-loss state for run %s", run_id)
+
         heartbeat_task = asyncio.create_task(_heartbeat_loop(run_id, active_lease_id))
 
         try:
@@ -364,12 +370,9 @@ class DurableRunWorker:
                 return False
 
             cases = [db_row_to_test_case(r) for r in ds.cases]
-
-            # Reconstruct request parameters from options_json
             raw_options = json.loads(run.options_json) if run.options_json else {}
             from rag_platform.server import CreateRunReq
 
-            # Reconstruct typed req and config
             req_kwargs = {
                 "project_id": run.project_id,
                 "dataset_id": run.dataset_id,
@@ -394,14 +397,53 @@ class DurableRunWorker:
                 ),
             )
 
-            await _execute_evaluation_run(
-                run_id=run.id,
-                req=req,
-                config=config,
-                ds_cases=cases,
-                db_session=sess,
+            # Race the evaluation against lease-loss detection. If ownership is lost,
+            # cancel the in-flight evaluation so an obsolete worker does not continue
+            # doing external work after another worker has recovered the run.
+            evaluation_task = asyncio.create_task(
+                _execute_evaluation_run(
+                    run_id=run.id,
+                    req=req,
+                    config=config,
+                    ds_cases=cases,
+                    db_session=sess,
+                )
             )
+            lease_task = asyncio.create_task(lease_lost_event.wait())
+
+            done, pending = await asyncio.wait(
+                {evaluation_task, lease_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if lease_task in done and lease_lost_event.is_set():
+                evaluation_task.cancel()
+                try:
+                    await evaluation_task
+                except asyncio.CancelledError:
+                    pass
+                await _fail_if_still_owner("Worker heartbeat/lease was lost while evaluation was running.")
+                return False
+
+            lease_task.cancel()
+            try:
+                await lease_task
+            except asyncio.CancelledError:
+                pass
+
+            # A lease can be invalidated immediately after evaluation completes.
+            # Guard the final handoff so an obsolete worker never reports success.
+            with create_session() as verify_sess:
+                current = verify_sess.get(RunRow, run_id)
+                if not current or current.status != RunStatus.COMPLETED.value:
+                    if not current or current.status == RunStatus.FAILED.value:
+                        return False
+                    if active_lease_id and current.lease_id != active_lease_id:
+                        return False
             return True
+        except asyncio.CancelledError:
+            await _fail_if_still_owner("Worker evaluation task was cancelled.")
+            raise
         except Exception as exc:
             logger.exception("Failed processing run %s: %s", run_id, exc)
             try:
@@ -450,13 +492,7 @@ class DurableRunWorker:
         stale_check_interval: float = 60.0,
         session_factory: Any | None = None,
     ) -> None:
-        """Adaptive worker daemon loop with push-notification wakeup.
-
-        - When runs are queued: Processes continuously without delay.
-        - When idle: Backs off exponentially up to max_interval to eliminate heavy DB polling.
-        - On new run notification (WorkerNotificationBus): Immediately wakes up with 0 latency.
-        - Periodically checks for and recovers stale runs.
-        """
+        """Adaptive worker daemon loop with push-notification wakeup."""
         notify_event = WorkerNotificationBus.subscribe()
         current_interval = min_interval
         last_stale_check = time.monotonic()
@@ -491,14 +527,12 @@ class DurableRunWorker:
                     did_work = await cls.process_next_queued_run()
 
                 if did_work:
-                    # Work was found and processed, immediately check for more
                     current_interval = min_interval
                     continue
 
                 if stop_event and stop_event.is_set():
                     break
 
-                # No work available right now: wait on notification event with adaptive backoff
                 notify_event.clear()
                 try:
                     if stop_event:
@@ -513,10 +547,8 @@ class DurableRunWorker:
                             break
                     else:
                         await asyncio.wait_for(notify_event.wait(), timeout=current_interval)
-                    # Woken up immediately by push notification
                     current_interval = min_interval
                 except asyncio.TimeoutError:
-                    # Idle timeout expired without notification: back off exponentially to reduce DB polling
                     current_interval = min(current_interval * backoff_factor, max_interval)
         finally:
             pg_stop_event.set()
@@ -524,13 +556,11 @@ class DurableRunWorker:
 
 
 def main() -> None:
-    """CLI entry point for running standalone durable evaluation worker process:
-    python -m rag_platform.worker
-    """
+    """CLI entry point for running standalone durable evaluation worker process."""
     import argparse
     parser = argparse.ArgumentParser(description="Reliab Standalone Durable Evaluation Worker")
     parser.add_argument("--min-interval", type=float, default=0.1, help="Minimum polling interval in seconds")
-    parser.add_argument("--max-interval", type=float, default=5.0, help="Maximum backoff interval in seconds")
+    parser.add_argument("--max-interval", type=float, default=5.0, help="Maximum polling interval in seconds")
     parser.add_argument("--stale-check", type=float, default=60.0, help="Interval for stale run recovery")
     args = parser.parse_args()
 
@@ -565,5 +595,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
