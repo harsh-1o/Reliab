@@ -51,7 +51,7 @@ jobs:
         run: |
           pytest tests/ -v --junit-xml=test-results/unit-tests.xml
 
-      - name: Platform Self-Test: Evaluator & Synthetic Quality Gate Verification
+      - name: Platform Self-Test: Passing Quality Gate
         run: |
           python -m rag_platform.gate \
             --bootstrap \
@@ -60,7 +60,27 @@ jobs:
             --dataset ds_ci_benchmark \
             --system-version ${{ github.sha }} \
             --policy prod-default \
-            --junit-xml test-results/reliab-gate.xml
+            --mock-mode PERFECT \
+            --junit-xml test-results/reliab-gate-pass.xml
+
+      - name: Platform Self-Test: Failing Quality Gate
+        run: |
+          set +e
+          python -m rag_platform.gate \
+            --bootstrap \
+            --adapter-type synthetic \
+            --project proj_ci_fail \
+            --dataset ds_ci_benchmark_fail \
+            --system-version ${{ github.sha }} \
+            --policy prod-default \
+            --mock-mode HALLUCINATING \
+            --junit-xml test-results/reliab-gate-fail.xml
+          exit_code=$?
+          if [ "$exit_code" -ne 1 ]; then
+            echo "Expected the failing quality gate to exit 1, got $exit_code"
+            exit 1
+          fi
+          echo "Failing quality gate correctly exited 1."
 
       - name: Upload Test and Gate Reports
         uses: actions/upload-artifact@v4
