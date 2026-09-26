@@ -52,23 +52,61 @@ def _gate_db_row_to_test_case(row: Any) -> TestCase:
 
 
 def format_junit_xml(gate_result: GateResult) -> str:
-    """Generate standard JUnit XML report for CI/CD test dashboards."""
+    """Generate standard JUnit XML report for CI/CD test dashboards with accurate 1:1 test accounting."""
     suites = ET.Element("testsuites", name="Reliab Release Quality Gate")
     suite = ET.SubElement(
         suites,
         "testsuite",
         name=f"Policy_{gate_result.policy_id}",
-        tests=str(max(len(gate_result.violations) + 1, 5)),
-        failures=str(len(gate_result.violations)),
     )
 
-    if not gate_result.violations:
-        ET.SubElement(suite, "testcase", classname="rag.policy", name="ReleaseThresholds", time="0.0")
-    else:
-        for v in gate_result.violations:
-            tc = ET.SubElement(suite, "testcase", classname="rag.policy", name=v.metric_name, time="0.0")
-            fail = ET.SubElement(tc, "failure", message=v.message, type=v.violation_type)
-            fail.text = f"Candidate Value: {v.candidate_value}, Threshold: {v.threshold}"
+    # Core release gate policy checks evaluated by Reliab
+    standard_checks = [
+        ("faithfulness", "Claim Faithfulness Threshold"),
+        ("recall_at_5", "Evidence Retrieval Recall@5"),
+        ("citation_accuracy", "Citation Grounding Accuracy"),
+        ("hallucination_rate", "Hallucination Rate Cap"),
+        ("abstention_accuracy", "Abstention & Refusal Quality"),
+    ]
+
+    violations_by_metric: dict[str, list[GateViolation]] = {}
+    for v in gate_result.violations:
+        violations_by_metric.setdefault(v.metric_name, []).append(v)
+
+    test_count = 0
+    failure_count = len(gate_result.violations)
+
+    for metric_key, check_label in standard_checks:
+        test_count += 1
+        tc = ET.SubElement(
+            suite,
+            "testcase",
+            classname=f"reliab.policy.{gate_result.policy_id}",
+            name=f"{metric_key} ({check_label})",
+            time="0.0",
+        )
+        if metric_key in violations_by_metric:
+            for v in violations_by_metric[metric_key]:
+                fail = ET.SubElement(tc, "failure", message=v.message, type=v.violation_type)
+                fail.text = f"Candidate Value: {v.candidate_value}, Threshold: {v.threshold}, Operator: {v.operator}"
+
+    # Handle any additional custom metric policies or regression budget violations
+    for metric_name, v_list in violations_by_metric.items():
+        if metric_name not in [k for k, _ in standard_checks]:
+            test_count += 1
+            tc = ET.SubElement(
+                suite,
+                "testcase",
+                classname=f"reliab.policy.{gate_result.policy_id}",
+                name=metric_name,
+                time="0.0",
+            )
+            for v in v_list:
+                fail = ET.SubElement(tc, "failure", message=v.message, type=v.violation_type)
+                fail.text = f"Candidate Value: {v.candidate_value}, Threshold: {v.threshold}, Operator: {v.operator}"
+
+    suite.set("tests", str(test_count))
+    suite.set("failures", str(failure_count))
 
     return ET.tostring(suites, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
@@ -182,7 +220,7 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
         )
         db_session.add(ds_row)
         for c in cases:
-            tc_row = db_session.get(TestCaseRow, c.id)
+            tc_row = db_session.get(TestCaseRow, (c.id, dataset_id))
             if not tc_row:
                 tc_row = TestCaseRow(
                     id=c.id,

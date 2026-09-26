@@ -12,12 +12,14 @@ import sys
 import time
 from typing import Any
 
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+from rag_platform import __version__
 
 from rag_platform.adapters import (
     AdapterRegistry,
@@ -78,7 +80,7 @@ if ":memory:" in _db_url:
 app = FastAPI(
     title="Reliab",
     description="Automated failure attribution, regression testing, and quality release gates for RAG systems.",
-    version="2.1.0",
+    version=__version__,
 )
 
 # Static directory setup
@@ -117,7 +119,7 @@ def health_check() -> dict[str, Any]:
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "version": "2.1.0",
+        "version": __version__,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -202,6 +204,39 @@ class CompareReq(BaseModel):
     candidate_run_id: str
     policy: ReleasePolicy = Field(default_factory=ReleasePolicy)
     allow_cross_dataset: bool = False
+
+
+class AuthSessionReq(BaseModel):
+    api_key: str
+
+
+# --- Session Auth Endpoints ---
+@app.post("/v1/auth/session")
+def create_auth_session(req: AuthSessionReq, response: Response):
+    """Authenticate and issue an HttpOnly, SameSite=Strict session cookie."""
+    settings = get_settings()
+    if settings.auth_enabled and req.api_key != settings.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+    response.set_cookie(
+        key="api_key",
+        value=req.api_key,
+        httponly=True,
+        samesite="strict",
+        secure=not settings.dev_mode,
+        max_age=86400,
+        path="/",
+    )
+    return {"status": "SUCCESS", "message": "Session authenticated via HttpOnly cookie."}
+
+
+@app.post("/v1/auth/logout")
+def clear_auth_session(response: Response):
+    """Clear authenticated session cookie."""
+    response.delete_cookie(key="api_key", path="/")
+    return {"status": "SUCCESS", "message": "Session cleared."}
 
 
 # --- REST API Endpoints ---

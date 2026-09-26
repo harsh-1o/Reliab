@@ -27,30 +27,48 @@ function formatMetric(metricObj, isPercentage = true) {
     return { display, sub: `N=${metricObj.count}`, isEvaluated: true };
 }
 
+let inMemoryApiKey = '';
+
 function getApiKey() {
     try {
-        return localStorage.getItem('reliab_api_key') || localStorage.getItem('rag_api_key') || '';
+        return inMemoryApiKey || sessionStorage.getItem('reliab_session_key') || '';
     } catch (e) {
-        return '';
+        return inMemoryApiKey;
     }
 }
 
 function setApiKey(key) {
+    inMemoryApiKey = key || '';
     try {
+        // Clear legacy persistent credentials from localStorage
+        localStorage.removeItem('reliab_api_key');
+        localStorage.removeItem('rag_api_key');
         if (key) {
-            localStorage.setItem('reliab_api_key', key);
+            sessionStorage.setItem('reliab_session_key', key);
         } else {
-            localStorage.removeItem('reliab_api_key');
-            localStorage.removeItem('rag_api_key');
+            sessionStorage.removeItem('reliab_session_key');
         }
     } catch (e) {}
 }
 
-function promptApiKey() {
-    const current = getApiKey();
-    const key = prompt("Enter API Key for Reliab:", current);
-    if (key !== null) {
-        setApiKey(key.trim());
+async function promptApiKey() {
+    const key = prompt("Enter API Key for Reliab:");
+    if (key !== null && key.trim()) {
+        const trimmed = key.trim();
+        try {
+            // Authenticate and issue secure HttpOnly cookie from server
+            const res = await fetch('/v1/auth/session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key: trimmed }),
+            });
+            if (res.ok) {
+                setApiKey(trimmed);
+                refreshDashboard();
+                return;
+            }
+        } catch (e) {}
+        setApiKey(trimmed);
         refreshDashboard();
     }
 }
@@ -58,6 +76,7 @@ function promptApiKey() {
 async function apiFetch(url, options = {}) {
     const opts = { ...options };
     opts.headers = { ...opts.headers };
+    opts.credentials = 'same-origin';
     const key = getApiKey();
     if (key && !opts.headers['X-API-Key'] && !opts.headers['Authorization']) {
         opts.headers['X-API-Key'] = key;
@@ -65,9 +84,17 @@ async function apiFetch(url, options = {}) {
     const res = await fetch(url, opts);
     if (res.status === 401) {
         const inputKey = prompt("Authentication Required (401). Enter API Key for Reliab:");
-        if (inputKey) {
-            setApiKey(inputKey.trim());
-            opts.headers['X-API-Key'] = inputKey.trim();
+        if (inputKey && inputKey.trim()) {
+            const trimmed = inputKey.trim();
+            try {
+                await fetch('/v1/auth/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: trimmed }),
+                });
+            } catch(e) {}
+            setApiKey(trimmed);
+            opts.headers['X-API-Key'] = trimmed;
             return fetch(url, opts);
         }
     }

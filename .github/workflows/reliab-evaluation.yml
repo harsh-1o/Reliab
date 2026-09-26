@@ -12,9 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: read
       checks: write
-      pull-requests: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4

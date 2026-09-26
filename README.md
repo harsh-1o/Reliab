@@ -9,8 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/harsh-1o/reliab"><img src="https://img.shields.io/badge/CI%20Gate-passing-success.svg?logo=githubactions&logoColor=white" alt="CI Gate"></a>
-  <a href="https://github.com/harsh-1o/reliab"><img src="https://img.shields.io/badge/tests-172%20passed-success.svg" alt="Tests"></a>
+  <a href="https://github.com/harsh-1o/reliab/actions/workflows/reliab-evaluation.yml"><img src="https://github.com/harsh-1o/reliab/actions/workflows/reliab-evaluation.yml/badge.svg" alt="Reliab Quality Gate &amp; CI/CD Pipeline"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python"></a>
   <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg?logo=fastapi&logoColor=white" alt="FastAPI"></a>
   <a href="https://docs.pydantic.dev/"><img src="https://img.shields.io/badge/pydantic-v2.0%2B-e92063.svg" alt="Pydantic"></a>
@@ -404,7 +403,7 @@ Open [http://127.0.0.1:8080/dashboard](http://127.0.0.1:8080/dashboard).
 
 ## 19. CI/CD Integration
 
-The GitHub Actions workflow (`.github/workflows/rag-evaluation.yml`) is completely self-contained:
+The GitHub Actions workflow (`.github/workflows/reliab-evaluation.yml`) is completely self-contained:
 1. Checks out repository on `main` or `master`.
 2. Installs Python 3.11 and package dependencies.
 3. Applies database migrations via Alembic.

@@ -79,6 +79,71 @@ class WorkerNotificationBus:
             except Exception as exc:
                 logger.debug("PostgreSQL NOTIFY failed or not supported: %s", exc)
 
+    @classmethod
+    def start_postgres_listener(cls, engine: Any, stop_event: threading.Event | None = None) -> threading.Thread | None:
+        """Start a background daemon thread that executes LISTEN rag_runs_channel on PostgreSQL.
+
+        When running against PostgreSQL, wakes up worker instances across processes/nodes
+        with zero latency when any API node executes NOTIFY rag_runs_channel.
+        If connected to SQLite, gracefully defers to the adaptive polling loop.
+        """
+        if not engine:
+            return None
+        dialect = getattr(getattr(engine, "dialect", None), "name", "")
+        if dialect != "postgresql":
+            logger.debug("Database dialect '%s' does not use PostgreSQL LISTEN/NOTIFY; using adaptive polling.", dialect)
+            return None
+
+        thread_stop = stop_event or threading.Event()
+
+        def _listen_worker():
+            channel = "rag_runs_channel"
+            while not thread_stop.is_set():
+                raw_conn = None
+                try:
+                    raw_conn = engine.raw_connection()
+                    if hasattr(raw_conn, "autocommit"):
+                        raw_conn.autocommit = True
+                    elif hasattr(raw_conn, "set_isolation_level"):
+                        raw_conn.set_isolation_level(0)
+
+                    cursor = raw_conn.cursor()
+                    cursor.execute(f"LISTEN {channel};")
+                    logger.info("Active PostgreSQL LISTEN listener established on '%s'", channel)
+
+                    while not thread_stop.is_set():
+                        # Support psycopg (v3) and psycopg2
+                        if hasattr(raw_conn, "notifies"):
+                            notifies_attr = getattr(raw_conn, "notifies")
+                            if callable(notifies_attr):
+                                # psycopg 3 generator with timeout
+                                for n in raw_conn.notifies(timeout=1.0):
+                                    cls.notify_new_run(getattr(n, "payload", "pg_notify"))
+                            elif isinstance(notifies_attr, list):
+                                # psycopg2 list
+                                import select
+                                if select.select([raw_conn], [], [], 1.0) != ([], [], []):
+                                    raw_conn.poll()
+                                    while raw_conn.notifies:
+                                        n = raw_conn.notifies.pop(0)
+                                        cls.notify_new_run(getattr(n, "payload", "pg_notify"))
+                        else:
+                            time.sleep(1.0)
+                except Exception as exc:
+                    if not thread_stop.is_set():
+                        logger.debug("PostgreSQL LISTEN loop error: %s (reconnecting in 2s)", exc)
+                        time.sleep(2.0)
+                finally:
+                    if raw_conn:
+                        try:
+                            raw_conn.close()
+                        except Exception:
+                            pass
+
+        listener_thread = threading.Thread(target=_listen_worker, daemon=True, name="pg-listen-listener")
+        listener_thread.start()
+        return listener_thread
+
 
 class DurableRunWorker:
     """Database-backed worker that polls, claims, and processes queued runs."""
@@ -353,6 +418,14 @@ class DurableRunWorker:
         notify_event = WorkerNotificationBus.subscribe()
         current_interval = min_interval
         last_stale_check = time.monotonic()
+        pg_stop_event = threading.Event()
+
+        try:
+            from rag_platform.db import get_db_engine
+            sample_engine = session_factory().get_bind() if session_factory else get_db_engine()
+            WorkerNotificationBus.start_postgres_listener(sample_engine, pg_stop_event)
+        except Exception as exc:
+            logger.debug("PostgreSQL LISTEN initialization skipped: %s", exc)
 
         try:
             while not (stop_event and stop_event.is_set()):
@@ -404,6 +477,7 @@ class DurableRunWorker:
                     # Idle timeout expired without notification: back off exponentially to reduce DB polling
                     current_interval = min(current_interval * backoff_factor, max_interval)
         finally:
+            pg_stop_event.set()
             WorkerNotificationBus.unsubscribe(notify_event)
 
 
