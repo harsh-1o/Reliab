@@ -33,49 +33,88 @@ logger = logging.getLogger("rag_platform.worker")
 class WorkerNotificationBus:
     """Notification bus for waking worker instances on new run events.
 
-    Combines in-process asyncio.Event broadcasting, thread-safe callbacks,
+    Combines in-process asyncio.Event broadcasting, thread-safe cross-thread scheduling,
     and PostgreSQL LISTEN/NOTIFY support to eliminate unnecessary polling
     load in high-concurrency deployments.
     """
-    _subscribers: list[asyncio.Event] = []
+    _subscribers: dict[asyncio.Event, asyncio.AbstractEventLoop | None] = {}
     _lock = threading.Lock()
 
     @classmethod
-    def subscribe(cls) -> asyncio.Event:
+    def subscribe(cls, loop: asyncio.AbstractEventLoop | None = None) -> asyncio.Event:
+        """Register an asyncio worker subscriber, capturing its event loop for thread-safe wakeup."""
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
         event = asyncio.Event()
         with cls._lock:
-            cls._subscribers.append(event)
+            cls._subscribers[event] = loop
         return event
 
     @classmethod
     def unsubscribe(cls, event: asyncio.Event) -> None:
+        """Unregister a subscriber and release references."""
         with cls._lock:
-            if event in cls._subscribers:
-                cls._subscribers.remove(event)
+            cls._subscribers.pop(event, None)
 
     @classmethod
-    def notify_new_run(cls, run_id: str, db_session: Session | None = None) -> None:
+    def notify_new_run(cls, run_id: str, db_session: Session | None = None, engine: Any | None = None) -> None:
         """Broadcast notification of a new queued run.
 
-        1. Sets all local in-process asyncio subscriber events.
-        2. If connected to PostgreSQL, executes `NOTIFY rag_runs_channel, :run_id`.
+        1. Wakes all local in-process asyncio subscribers using thread-safe loop scheduling
+           (`loop.call_soon_threadsafe(event.set)`), safely bridging OS listener threads to worker event loops.
+        2. If connected to PostgreSQL, broadcasts `NOTIFY rag_runs_channel, :run_id` on a standalone
+           autocommit connection without hijacking or committing caller transactions.
         """
         with cls._lock:
-            for ev in list(cls._subscribers):
+            subscribers_snapshot = list(cls._subscribers.items())
+
+        # Thread-safe cross-thread event scheduling
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        for ev, loop in subscribers_snapshot:
+            if loop is not None:
+                if loop.is_closed():
+                    with cls._lock:
+                        cls._subscribers.pop(ev, None)
+                    continue
+                try:
+                    if current_loop is loop:
+                        ev.set()
+                    else:
+                        loop.call_soon_threadsafe(ev.set)
+                except RuntimeError:
+                    with cls._lock:
+                        cls._subscribers.pop(ev, None)
+            else:
                 try:
                     ev.set()
-                except (RuntimeError, Exception):
-                    if ev in cls._subscribers:
-                        cls._subscribers.remove(ev)
+                except Exception:
+                    with cls._lock:
+                        cls._subscribers.pop(ev, None)
 
         # PostgreSQL LISTEN/NOTIFY push notification for multi-node deployments
-        if db_session is not None:
+        # Invariant: Run is already committed by caller. NOTIFY helper does NOT commit db_session.
+        target_engine = engine
+        if target_engine is None and db_session is not None:
             try:
-                bind = db_session.get_bind()
-                if bind and bind.dialect.name == "postgresql":
+                target_engine = db_session.get_bind()
+            except Exception:
+                target_engine = None
+
+        if target_engine is not None:
+            try:
+                dialect = getattr(getattr(target_engine, "dialect", None), "name", "")
+                if dialect == "postgresql":
                     from sqlalchemy import text
-                    db_session.execute(text("NOTIFY rag_runs_channel, :run_id"), {"run_id": run_id})
-                    db_session.commit()
+                    # Use a standalone autocommit connection so caller transaction is never hijacked or committed
+                    with target_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                        conn.execute(text("NOTIFY rag_runs_channel, :run_id"), {"run_id": run_id})
             except Exception as exc:
                 logger.debug("PostgreSQL NOTIFY failed or not supported: %s", exc)
 
@@ -85,6 +124,7 @@ class WorkerNotificationBus:
 
         When running against PostgreSQL, wakes up worker instances across processes/nodes
         with zero latency when any API node executes NOTIFY rag_runs_channel.
+        Cross-thread wakeups are routed safely via loop.call_soon_threadsafe.
         If connected to SQLite, gracefully defers to the adaptive polling loop.
         """
         if not engine:
@@ -117,22 +157,25 @@ class WorkerNotificationBus:
                             notifies_attr = getattr(raw_conn, "notifies")
                             if callable(notifies_attr):
                                 # psycopg 3 generator with timeout
-                                for n in raw_conn.notifies(timeout=1.0):
+                                for n in raw_conn.notifies(timeout=0.5):
                                     cls.notify_new_run(getattr(n, "payload", "pg_notify"))
+                                    if thread_stop.is_set():
+                                        break
                             elif isinstance(notifies_attr, list):
                                 # psycopg2 list
                                 import select
-                                if select.select([raw_conn], [], [], 1.0) != ([], [], []):
+                                if select.select([raw_conn], [], [], 0.5) != ([], [], []):
                                     raw_conn.poll()
                                     while raw_conn.notifies:
                                         n = raw_conn.notifies.pop(0)
                                         cls.notify_new_run(getattr(n, "payload", "pg_notify"))
                         else:
-                            time.sleep(1.0)
+                            if thread_stop.wait(0.5):
+                                break
                 except Exception as exc:
                     if not thread_stop.is_set():
-                        logger.debug("PostgreSQL LISTEN loop error: %s (reconnecting in 2s)", exc)
-                        time.sleep(2.0)
+                        logger.debug("PostgreSQL LISTEN loop error: %s (reconnecting in 1s)", exc)
+                        thread_stop.wait(1.0)
                 finally:
                     if raw_conn:
                         try:

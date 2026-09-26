@@ -27,49 +27,47 @@ function formatMetric(metricObj, isPercentage = true) {
     return { display, sub: `N=${metricObj.count}`, isEvaluated: true };
 }
 
-let inMemoryApiKey = '';
-
-function getApiKey() {
-    try {
-        return inMemoryApiKey || sessionStorage.getItem('reliab_session_key') || '';
-    } catch (e) {
-        return inMemoryApiKey;
-    }
-}
-
-function setApiKey(key) {
-    inMemoryApiKey = key || '';
-    try {
-        // Clear legacy persistent credentials from localStorage
-        localStorage.removeItem('reliab_api_key');
-        localStorage.removeItem('rag_api_key');
-        if (key) {
-            sessionStorage.setItem('reliab_session_key', key);
-        } else {
-            sessionStorage.removeItem('reliab_session_key');
-        }
-    } catch (e) {}
-}
+// Purge legacy browser credentials from storage
+try {
+    localStorage.removeItem('reliab_api_key');
+    localStorage.removeItem('rag_api_key');
+    sessionStorage.removeItem('reliab_session_key');
+} catch (e) {}
 
 async function promptApiKey() {
     const key = prompt("Enter API Key for Reliab:");
     if (key !== null && key.trim()) {
         const trimmed = key.trim();
         try {
-            // Authenticate and issue secure HttpOnly cookie from server
+            // Establish secure server-managed HttpOnly cookie
             const res = await fetch('/v1/auth/session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
                 body: JSON.stringify({ api_key: trimmed }),
             });
             if (res.ok) {
-                setApiKey(trimmed);
-                refreshDashboard();
+                await refreshDashboard();
                 return;
             }
-        } catch (e) {}
-        setApiKey(trimmed);
-        refreshDashboard();
+            const errData = await res.json().catch(() => ({}));
+            alert(`Authentication failed: ${errData.detail || 'Invalid API key.'}`);
+        } catch (e) {
+            alert("Authentication request failed. Check server connection.");
+        }
+    }
+}
+
+async function logout() {
+    try {
+        await fetch('/v1/auth/logout', {
+            method: 'POST',
+            credentials: 'same-origin',
+        });
+        alert("Session cleared. You have logged out.");
+        await refreshDashboard();
+    } catch (e) {
+        console.error("Logout error:", e);
     }
 }
 
@@ -77,29 +75,38 @@ async function apiFetch(url, options = {}) {
     const opts = { ...options };
     opts.headers = { ...opts.headers };
     opts.credentials = 'same-origin';
-    const key = getApiKey();
-    if (key && !opts.headers['X-API-Key'] && !opts.headers['Authorization']) {
-        opts.headers['X-API-Key'] = key;
-    }
-    const res = await fetch(url, opts);
+    // Browser flow relies strictly on server-managed HttpOnly cookie.
+    // Credentials are never stored in or sent from localStorage/sessionStorage.
+
+    let res = await fetch(url, opts);
     if (res.status === 401) {
         const inputKey = prompt("Authentication Required (401). Enter API Key for Reliab:");
         if (inputKey && inputKey.trim()) {
             const trimmed = inputKey.trim();
             try {
-                await fetch('/v1/auth/session', {
+                const sessionRes = await fetch('/v1/auth/session', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
                     body: JSON.stringify({ api_key: trimmed }),
                 });
-            } catch(e) {}
-            setApiKey(trimmed);
-            opts.headers['X-API-Key'] = trimmed;
-            return fetch(url, opts);
+                if (sessionRes.ok) {
+                    // Retry request with the newly established HttpOnly cookie
+                    return fetch(url, opts);
+                } else {
+                    const errData = await sessionRes.json().catch(() => ({}));
+                    alert(`Authentication failed: ${errData.detail || 'Invalid API key.'}`);
+                    return res;
+                }
+            } catch (e) {
+                alert("Authentication request failed. Check server connection.");
+                return res;
+            }
         }
     }
     return res;
 }
+
 
 async function init() {
     await fetchRuns();

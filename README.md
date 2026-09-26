@@ -386,8 +386,9 @@ The Reliab console provides a dense, data-first observability view:
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\Activate.ps1
 
-# Install in editable mode with development & ML extras
-pip install -e ".[ml]" pytest pytest-asyncio pytest-cov httpx
+# Install reproducible dependencies from lockfile
+pip install -r requirements.lock
+pip install -e . --no-deps
 
 # Run database migrations
 python -m alembic upgrade head
@@ -405,9 +406,9 @@ Open [http://127.0.0.1:8080/dashboard](http://127.0.0.1:8080/dashboard).
 
 The GitHub Actions workflow (`.github/workflows/reliab-evaluation.yml`) is completely self-contained:
 1. Checks out repository on `main` or `master`.
-2. Installs Python 3.11 and package dependencies.
+2. Installs Python 3.11 and locked dependencies from `requirements.lock`.
 3. Applies database migrations via Alembic.
-4. Executes unit and integration test suites (172 tests).
+4. Executes unit and integration test suites (186 tests).
 5. Seeds golden benchmark dataset and executes the Reliab quality gate (`--bootstrap`).
 6. Publishes JUnit XML test reports and gate summaries.
 

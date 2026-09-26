@@ -109,8 +109,12 @@ def get_auth(
     db: Session = Depends(get_db),
 ) -> SecurityContext:
     """FastAPI dependency for authentication (supports Header, Bearer, and Cookie)."""
-    key = x_api_key or cookie_api_key
-    return authenticate_request(x_api_key=key, authorization=authorization, db_session=db)
+    return authenticate_request(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        cookie_token=cookie_api_key,
+        db_session=db,
+    )
 
 
 @app.get("/health")
@@ -212,14 +216,21 @@ class AuthSessionReq(BaseModel):
 
 # --- Session Auth Endpoints ---
 @app.post("/v1/auth/session")
-def create_auth_session(req: AuthSessionReq, response: Response):
+def create_auth_session(
+    req: AuthSessionReq,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     """Authenticate and issue an HttpOnly, SameSite=Strict session cookie."""
     settings = get_settings()
-    if settings.auth_enabled and req.api_key != settings.api_key:
+    try:
+        ctx = authenticate_request(x_api_key=req.api_key, db_session=db)
+    except HTTPException:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
+            detail="Invalid API key or credential.",
         )
+
     response.set_cookie(
         key="api_key",
         value=req.api_key,
@@ -229,7 +240,12 @@ def create_auth_session(req: AuthSessionReq, response: Response):
         max_age=86400,
         path="/",
     )
-    return {"status": "SUCCESS", "message": "Session authenticated via HttpOnly cookie."}
+    return {
+        "status": "SUCCESS",
+        "client_id": ctx.client_id,
+        "is_admin": ctx.is_admin,
+        "message": "Session authenticated via HttpOnly cookie.",
+    }
 
 
 @app.post("/v1/auth/logout")

@@ -126,7 +126,7 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
         db_session.commit()
 
     ds_row = db_session.get(DatasetRow, dataset_id)
-    if not ds_row:
+    if not ds_row or not ds_row.cases:
         cases = [
             TestCase(
                 id="case_001_retrieval_facts",
@@ -209,16 +209,20 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
             ),
         ]
         checksum = compute_dataset_checksum(cases)
-        ds_row = DatasetRow(
-            id=dataset_id,
-            project_id=project_id,
-            name="Locked Gold CI Benchmark",
-            version="1.0.0",
-            description="Golden locked benchmark dataset for regression and gate evaluation.",
-            status=DatasetStatus.PUBLISHED.value,
-            checksum_sha256=checksum,
-        )
-        db_session.add(ds_row)
+        if not ds_row:
+            ds_row = DatasetRow(
+                id=dataset_id,
+                project_id=project_id,
+                name="Locked Gold CI Benchmark",
+                version="1.0.0",
+                description="Golden locked benchmark dataset for regression and gate evaluation.",
+                status=DatasetStatus.PUBLISHED.value,
+                checksum_sha256=checksum,
+            )
+            db_session.add(ds_row)
+        else:
+            ds_row.checksum_sha256 = checksum
+            ds_row.status = DatasetStatus.PUBLISHED.value
         for c in cases:
             tc_row = db_session.get(TestCaseRow, (c.id, dataset_id))
             if not tc_row:
