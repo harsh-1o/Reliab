@@ -198,8 +198,8 @@ class ApiKeyRow(Base):
     client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     project_roles_json: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=lambda: datetime.now(timezone.utc)
     )
 
 
