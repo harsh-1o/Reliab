@@ -55,7 +55,7 @@ def import_dataset_jsonl(
 
 
 def export_dataset_csv(dataset: BenchmarkDataset, target_path: str | Path) -> None:
-    """Export benchmark dataset cases to a flat CSV file preserving granular document references."""
+    """Export benchmark dataset cases to CSV without losing case metadata."""
     path = Path(target_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -69,6 +69,7 @@ def export_dataset_csv(dataset: BenchmarkDataset, target_path: str | Path) -> No
             "relevant_documents_json",
             "answerability",
             "tags",
+            "metadata_json",
         ])
         for c in dataset.cases:
             writer.writerow([
@@ -80,6 +81,7 @@ def export_dataset_csv(dataset: BenchmarkDataset, target_path: str | Path) -> No
                 json.dumps([d.model_dump() for d in c.relevant_documents]),
                 c.answerability.value,
                 ";".join(c.tags),
+                json.dumps(c.metadata, ensure_ascii=False, sort_keys=True),
             ])
 
 
@@ -90,7 +92,7 @@ def import_dataset_csv(
     version: str,
     description: str | None = None,
 ) -> BenchmarkDataset:
-    """Import benchmark dataset from a CSV file, preserving granular evidence chunk, page, and span."""
+    """Import benchmark dataset from CSV while preserving metadata and granular evidence."""
     path = Path(source_path)
     cases: list[TestCase] = []
     with path.open("r", encoding="utf-8") as f:
@@ -99,7 +101,6 @@ def import_dataset_csv(
             facts = [ft.strip() for ft in row.get("expected_facts", "").split(";") if ft.strip()]
             tags = [t.strip() for t in row.get("tags", "").split(";") if t.strip()]
 
-            # Preserve granular evidence if JSON is present, otherwise fallback to doc_ids
             raw_docs_json = row.get("relevant_documents_json")
             if raw_docs_json and raw_docs_json.strip():
                 try:
@@ -112,6 +113,16 @@ def import_dataset_csv(
                 doc_ids = [d.strip() for d in row.get("doc_ids", "").split(";") if d.strip()]
                 relevant_docs = [DocumentReference(document_id=did) for did in doc_ids]
 
+            raw_metadata = row.get("metadata_json", "")
+            metadata: dict = {}
+            if raw_metadata and raw_metadata.strip():
+                try:
+                    parsed_metadata = json.loads(raw_metadata)
+                    if isinstance(parsed_metadata, dict):
+                        metadata = parsed_metadata
+                except (TypeError, ValueError):
+                    metadata = {}
+
             cases.append(
                 TestCase(
                     id=row["id"],
@@ -121,6 +132,7 @@ def import_dataset_csv(
                     relevant_documents=relevant_docs,
                     answerability=Answerability(row.get("answerability", "ANSWERABLE")),
                     tags=tags,
+                    metadata=metadata,
                 )
             )
 
@@ -204,7 +216,7 @@ def split_benchmark_dataset(
     test_ratio: float = 0.60,
     seed: int = 42,
 ) -> tuple[BenchmarkDataset, BenchmarkDataset, BenchmarkDataset]:
-    """Split a dataset deterministically into (dev, val, locked_test) sets."""
+    """Split a dataset deterministically into non-empty (dev, val, locked_test) sets."""
     total_ratio = dev_ratio + val_ratio + test_ratio
     if abs(total_ratio - 1.0) > 1e-4:
         raise ValueError(
@@ -212,12 +224,18 @@ def split_benchmark_dataset(
         )
 
     cases = list(dataset.cases)
+    if len(cases) < 3:
+        raise ValueError("Benchmark splitting requires at least 3 test cases so dev, validation, and locked test sets remain non-empty.")
+
     rng = random.Random(seed)
     rng.shuffle(cases)
 
     n = len(cases)
-    n_dev = int(n * dev_ratio)
-    n_val = int(n * val_ratio)
+    n_dev = max(1, int(n * dev_ratio))
+    n_val = max(1, int(n * val_ratio))
+    if n_dev + n_val >= n:
+        n_val = 1
+        n_dev = 1
 
     dev_cases = cases[:n_dev]
     val_cases = cases[n_dev : n_dev + n_val]
@@ -248,4 +266,3 @@ def split_benchmark_dataset(
     ).publish()
 
     return dev_ds, val_ds, test_ds
-
