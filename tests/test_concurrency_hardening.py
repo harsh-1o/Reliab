@@ -13,6 +13,7 @@ Validates:
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -460,6 +461,183 @@ class TestLeaseLossObsoleteWorkerIsolation:
             assert current.status == RunStatus.FAILED.value
             assert current.failure_type == "DATASET_NOT_FOUND"
 
+    def test_cancellation_worker_finalization_race_deterministic(self, shared_db):
+        """Worker completion racing against concurrent cancellation.
+
+        Deterministic sequence:
+        1. Worker finishes evaluation, prepares atomic finalization (WHERE status='RUNNING').
+        2. Worker pauses right before executing its final UPDATE.
+        3. Concurrent thread calls cancel_run_atomic() (WHERE status IN ('CREATED','QUEUED','RUNNING')).
+           Cancellation succeeds, rowcount=1, status becomes CANCELLED.
+        4. Worker resumes and executes its final UPDATE.
+           Because status is now CANCELLED, worker update matches rowcount=0.
+        5. Run status deterministically remains CANCELLED; worker does not overwrite cancellation.
+        """
+        engine, session_factory = shared_db
+        config = RunConfig(
+            project_id="proj_concurrency",
+            dataset_id="ds_concurrency",
+            dataset_version="1.0.0",
+            system_version="v0.1.0-race",
+        )
+        provenance = _make_provenance()
+
+        with session_factory() as sess:
+            repo = DatabaseRepo(sess)
+            run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
+            run.worker_id = "worker_1"
+            run.lease_id = "lease_1"
+            sess.commit()
+            run_id = run.id
+
+        worker_about_to_finalize = threading.Event()
+        cancellation_committed = threading.Event()
+        worker_res_rowcount: list[int] = []
+        worker_errors: list[Exception] = []
+
+        def worker_thread():
+            try:
+                with session_factory() as worker_sess:
+                    orig_execute = worker_sess.execute
+
+                    def hooked_execute(statement, *args, **kwargs):
+                        if hasattr(statement, "is_update") and statement.is_update:
+                            worker_about_to_finalize.set()
+                            if not cancellation_committed.wait(timeout=10.0):
+                                raise TimeoutError("Timed out waiting for cancellation to commit")
+                        return orig_execute(statement, *args, **kwargs)
+
+                    worker_sess.execute = hooked_execute  # type: ignore[method-assign]
+                    now = datetime.now(timezone.utc)
+                    final_stmt = (
+                        update(RunRow)
+                        .where(
+                            RunRow.id == run_id,
+                            RunRow.status == RunStatus.RUNNING.value,
+                            RunRow.lease_id == "lease_1",
+                        )
+                        .values(
+                            status=RunStatus.COMPLETED.value,
+                            finished_at=now,
+                        )
+                    )
+                    res = worker_sess.execute(final_stmt)
+                    worker_sess.commit()
+                    worker_res_rowcount.append(res.rowcount)
+            except Exception as e:
+                worker_errors.append(e)
+
+        t = threading.Thread(target=worker_thread, daemon=True)
+        t.start()
+
+        assert worker_about_to_finalize.wait(timeout=10.0), "Worker did not reach finalization pause"
+
+        with session_factory() as cancel_sess:
+            repo = DatabaseRepo(cancel_sess)
+            cancelled, run = repo.cancel_run_atomic(run_id, reason="Cancelled during race test")
+            cancel_sess.commit()
+            assert cancelled is True
+            assert run.status == RunStatus.CANCELLED.value
+
+        cancellation_committed.set()
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+        assert not worker_errors, f"Worker thread encountered error: {worker_errors}"
+
+        assert worker_res_rowcount == [0], f"Expected worker rowcount 0, got {worker_res_rowcount}"
+
+        with session_factory() as verify_sess:
+            final_run = verify_sess.get(RunRow, run_id)
+            assert final_run is not None
+            assert final_run.status == RunStatus.CANCELLED.value
+            assert final_run.failure_reason == "Cancelled during race test"
+
+    def test_worker_finalization_beats_cancellation_race_deterministic(self, shared_db):
+        """Cancellation racing against already-finalized worker completion.
+
+        Deterministic sequence:
+        1. Cancellation thread loads run, pauses right before atomic cancel UPDATE.
+        2. Worker thread executes atomic finalization (status -> COMPLETED, rowcount=1).
+        3. Cancellation thread resumes and executes atomic cancel UPDATE.
+           Because status is now COMPLETED (terminal), cancel UPDATE matches rowcount=0.
+        4. cancel_run_atomic returns cancelled=False and leaves status COMPLETED.
+        """
+        engine, session_factory = shared_db
+        config = RunConfig(
+            project_id="proj_concurrency",
+            dataset_id="ds_concurrency",
+            dataset_version="1.0.0",
+            system_version="v0.1.0-race-2",
+        )
+        provenance = _make_provenance()
+
+        with session_factory() as sess:
+            repo = DatabaseRepo(sess)
+            run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
+            run.worker_id = "worker_2"
+            run.lease_id = "lease_2"
+            sess.commit()
+            run_id = run.id
+
+        cancel_about_to_execute = threading.Event()
+        worker_committed = threading.Event()
+        cancel_result: list[tuple[bool, str | None]] = []
+        cancel_errors: list[Exception] = []
+
+        def cancel_thread():
+            try:
+                with session_factory() as cancel_sess:
+                    orig_execute = cancel_sess.execute
+
+                    def hooked_execute(statement, *args, **kwargs):
+                        if hasattr(statement, "is_update") and statement.is_update:
+                            cancel_about_to_execute.set()
+                            if not worker_committed.wait(timeout=10.0):
+                                raise TimeoutError("Timed out waiting for worker finalization")
+                        return orig_execute(statement, *args, **kwargs)
+
+                    cancel_sess.execute = hooked_execute  # type: ignore[method-assign]
+                    repo = DatabaseRepo(cancel_sess)
+                    cancelled, run = repo.cancel_run_atomic(run_id, reason="Late cancellation")
+                    current_status = run.status if run else None
+                    cancel_sess.commit()
+                    cancel_result.append((cancelled, current_status))
+            except Exception as e:
+                cancel_errors.append(e)
+
+        ct = threading.Thread(target=cancel_thread, daemon=True)
+        ct.start()
+
+        assert cancel_about_to_execute.wait(timeout=10.0), "Cancel thread did not reach update pause"
+
+        with session_factory() as worker_sess:
+            now = datetime.now(timezone.utc)
+            res = worker_sess.execute(
+                update(RunRow)
+                .where(
+                    RunRow.id == run_id,
+                    RunRow.status == RunStatus.RUNNING.value,
+                    RunRow.lease_id == "lease_2",
+                )
+                .values(status=RunStatus.COMPLETED.value, finished_at=now)
+            )
+            worker_sess.commit()
+            assert res.rowcount == 1
+
+        worker_committed.set()
+        ct.join(timeout=10.0)
+        assert not ct.is_alive()
+        assert not cancel_errors, f"Cancel thread encountered error: {cancel_errors}"
+
+        cancelled, status_val = cancel_result[0]
+        assert cancelled is False
+        assert status_val == RunStatus.COMPLETED.value
+
+        with session_factory() as verify_sess:
+            final_run = verify_sess.get(RunRow, run_id)
+            assert final_run is not None
+            assert final_run.status == RunStatus.COMPLETED.value
+
 
 @pytest.fixture
 def postgres_shared_db():
@@ -777,4 +955,88 @@ class TestPostgresConcurrencyHardening:
             assert current is not None
             assert current.status != RunStatus.COMPLETED.value
             assert current.lease_id == "pg_lease_real"
+
+    def test_pg_cancellation_worker_finalization_race_deterministic(self, postgres_shared_db):
+        """Worker finalization vs concurrent cancellation on PostgreSQL.
+
+        Validates that rowcount checking and atomic conditional UPDATE
+        prevent worker finalization from overwriting a concurrent cancellation on PostgreSQL.
+        """
+        engine, session_factory = postgres_shared_db
+        config = RunConfig(
+            project_id="proj_pg_concurrency",
+            dataset_id="ds_pg_concurrency",
+            dataset_version="1.0.0",
+            system_version="v0.2.0-pg-cancel-race",
+        )
+        provenance = _make_provenance()
+
+        with session_factory() as sess:
+            repo = DatabaseRepo(sess)
+            run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
+            run.worker_id = "pg_worker_race"
+            run.lease_id = "pg_lease_race"
+            sess.commit()
+            run_id = run.id
+
+        worker_about_to_finalize = threading.Event()
+        cancellation_committed = threading.Event()
+        worker_res_rowcount: list[int] = []
+        worker_errors: list[Exception] = []
+
+        def worker_thread():
+            try:
+                with session_factory() as worker_sess:
+                    orig_execute = worker_sess.execute
+
+                    def hooked_execute(statement, *args, **kwargs):
+                        if hasattr(statement, "is_update") and statement.is_update:
+                            worker_about_to_finalize.set()
+                            if not cancellation_committed.wait(timeout=10.0):
+                                raise TimeoutError("Timed out waiting for cancellation to commit")
+                        return orig_execute(statement, *args, **kwargs)
+
+                    worker_sess.execute = hooked_execute  # type: ignore[method-assign]
+                    now = datetime.now(timezone.utc)
+                    final_stmt = (
+                        update(RunRow)
+                        .where(
+                            RunRow.id == run_id,
+                            RunRow.status == RunStatus.RUNNING.value,
+                            RunRow.lease_id == "pg_lease_race",
+                        )
+                        .values(
+                            status=RunStatus.COMPLETED.value,
+                            finished_at=now,
+                        )
+                    )
+                    res = worker_sess.execute(final_stmt)
+                    worker_sess.commit()
+                    worker_res_rowcount.append(res.rowcount)
+            except Exception as e:
+                worker_errors.append(e)
+
+        t = threading.Thread(target=worker_thread, daemon=True)
+        t.start()
+
+        assert worker_about_to_finalize.wait(timeout=10.0), "Worker did not reach finalization pause on PG"
+
+        with session_factory() as cancel_sess:
+            repo = DatabaseRepo(cancel_sess)
+            cancelled, run = repo.cancel_run_atomic(run_id, reason="Cancelled during PG race test")
+            cancel_sess.commit()
+            assert cancelled is True
+            assert run.status == RunStatus.CANCELLED.value
+
+        cancellation_committed.set()
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+        assert not worker_errors, f"Worker thread on PG had error: {worker_errors}"
+        assert worker_res_rowcount == [0], f"Expected PG worker rowcount 0, got {worker_res_rowcount}"
+
+        with session_factory() as verify_sess:
+            final_run = verify_sess.get(RunRow, run_id)
+            assert final_run is not None
+            assert final_run.status == RunStatus.CANCELLED.value
+            assert final_run.failure_reason == "Cancelled during PG race test"
 

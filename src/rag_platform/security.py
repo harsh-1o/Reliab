@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 import time
 from enum import Enum
 from typing import Any
@@ -337,11 +338,14 @@ def generate_secure_api_key() -> str:
 class ApiKeyRegistry:
     """Registry mapping API keys to client identities and project role memberships.
 
-    Supports both fast in-memory registration and durable, multi-process database
-    persistence via hashed API keys (SHA-256). Raw keys are never stored in the database.
+    Supports short-lived in-memory caching (TTL 60s) of hashed keys and durable
+    database persistence via SHA-256 key hashes. Raw keys are NEVER cached or stored in the database.
+    Cache entries are invalidated immediately upon revocation or rotation.
     """
 
-    _registry: dict[str, ClientIdentity] = {}
+    _cache: dict[str, tuple[ClientIdentity, float]] = {}  # key_hash -> (identity, cached_at_monotonic)
+    _lock: threading.Lock = threading.Lock()
+    CACHE_TTL_SECONDS: float = 60.0
 
     @classmethod
     def register(
@@ -374,31 +378,37 @@ class ApiKeyRegistry:
         persist_db: bool = False,
         db_session: Any = None,
     ) -> None:
+        from rag_platform.core import sha256_hash
+
         roles: dict[str, Role] = {}
         for p_id, r in (project_roles or {}).items():
-            roles[p_id] = Role(r) if isinstance(r, str) else r
-        cls._registry[api_key] = ClientIdentity(
+            roles[p_id] = r if isinstance(r, Role) else Role(str(r).upper())
+        identity = ClientIdentity(
             client_id=client_id,
             is_admin=is_admin,
             project_roles=roles,
         )
+        key_hash = sha256_hash(api_key)
+        with cls._lock:
+            cls._cache[key_hash] = (identity, time.monotonic())
 
         if persist_db or db_session is not None:
             try:
                 import json
+                from datetime import datetime, timezone
 
                 from sqlalchemy.orm import Session
 
-                from rag_platform.core import sha256_hash
                 from rag_platform.db import ApiKeyRow, create_db_engine
 
-                key_hash = sha256_hash(api_key)
                 roles_str = {p: r.value for p, r in roles.items()}
                 row = ApiKeyRow(
                     key_hash=key_hash,
                     client_id=client_id,
                     is_admin=is_admin,
                     project_roles_json=json.dumps(roles_str),
+                    created_at=datetime.now(timezone.utc),
+                    revoked_at=None,
                 )
                 if db_session is not None:
                     db_session.merge(row)
@@ -413,15 +423,28 @@ class ApiKeyRegistry:
                 logging.getLogger("rag_platform.security").error(
                     "Failed to persist API key for client '%s': %s", client_id, type(exc).__name__
                 )
-                cls._registry.pop(api_key, None)
+                with cls._lock:
+                    cls._cache.pop(key_hash, None)
                 raise RuntimeError(
                     f"Authentication persistence error: failed to store credential for client '{client_id}'"
                 ) from exc
 
     @classmethod
     def get(cls, api_key: str, db_session: Any = None) -> ClientIdentity | None:
-        if api_key in cls._registry:
-            return cls._registry[api_key]
+        from rag_platform.core import sha256_hash
+
+        key_hash = sha256_hash(api_key)
+        now = time.monotonic()
+
+        # Check short-lived cache first
+        with cls._lock:
+            entry = cls._cache.get(key_hash)
+            if entry is not None:
+                identity, cached_at = entry
+                if (now - cached_at) < cls.CACHE_TTL_SECONDS:
+                    return identity
+                else:
+                    cls._cache.pop(key_hash, None)
 
         # Query database for persistent key hash across processes
         try:
@@ -429,10 +452,8 @@ class ApiKeyRegistry:
 
             from sqlalchemy.orm import Session
 
-            from rag_platform.core import sha256_hash
             from rag_platform.db import ApiKeyRow, create_db_engine
 
-            key_hash = sha256_hash(api_key)
             row = None
             if db_session is not None:
                 row = db_session.get(ApiKeyRow, key_hash)
@@ -442,14 +463,21 @@ class ApiKeyRegistry:
                     row = s.get(ApiKeyRow, key_hash)
 
             if row:
+                # If key has been revoked in database, reject authentication immediately
+                if getattr(row, "revoked_at", None) is not None:
+                    with cls._lock:
+                        cls._cache.pop(key_hash, None)
+                    return None
+
                 roles_raw = json.loads(row.project_roles_json) if row.project_roles_json else {}
-                roles = {p: Role(r) for p, r in roles_raw.items()}
+                roles = {p: (r if isinstance(r, Role) else Role(str(r).upper())) for p, r in roles_raw.items()}
                 identity = ClientIdentity(
                     client_id=row.client_id,
                     is_admin=row.is_admin,
                     project_roles=roles,
                 )
-                cls._registry[api_key] = identity
+                with cls._lock:
+                    cls._cache[key_hash] = (identity, time.monotonic())
                 return identity
         except Exception as exc:
             import logging
@@ -460,8 +488,19 @@ class ApiKeyRegistry:
         return None
 
     @classmethod
+    def invalidate(cls, key_or_hash: str) -> None:
+        """Invalidate a key from in-memory cache by raw key or key hash."""
+        from rag_platform.core import sha256_hash
+
+        with cls._lock:
+            cls._cache.pop(key_or_hash, None)
+            cls._cache.pop(sha256_hash(key_or_hash), None)
+
+    @classmethod
     def clear(cls) -> None:
-        cls._registry.clear()
+        """Clear all in-memory cached credentials."""
+        with cls._lock:
+            cls._cache.clear()
 
 
 class SecurityContext(BaseModel):

@@ -7,12 +7,13 @@ import asyncio
 import json
 import platform
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -213,23 +214,89 @@ class AuthSessionReq(BaseModel):
     api_key: str
 
 
-# --- Session Auth Endpoints ---
+class CreateApiKeyReq(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=64)
+    project_roles: dict[str, str] = Field(default_factory=dict)
+    is_admin: bool = False
+
+
+# --- Session Auth & Rate Limiting ---
+class AuthRateLimiter:
+    """Sliding-window rate limiter protecting authentication endpoints against brute-force attacks."""
+
+    def __init__(self, max_failures: int = 5, window_seconds: float = 60.0):
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self._failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def is_blocked(self, ip: str) -> tuple[bool, float]:
+        now = time.monotonic()
+        with self._lock:
+            timestamps = self._failures.get(ip, [])
+            valid = [t for t in timestamps if (now - t) < self.window_seconds]
+            self._failures[ip] = valid
+            if len(valid) >= self.max_failures:
+                retry_after = max(1.0, self.window_seconds - (now - valid[0]))
+                return True, retry_after
+            return False, 0.0
+
+    def record_failure(self, ip: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            timestamps = self._failures.setdefault(ip, [])
+            timestamps.append(now)
+
+    def record_success(self, ip: str) -> None:
+        with self._lock:
+            self._failures.pop(ip, None)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures.clear()
+
+
+auth_rate_limiter = AuthRateLimiter(max_failures=5, window_seconds=60.0)
+
+
+def extract_client_ip(request: Request) -> str:
+    """Safely extract client IP, respecting proxy forwarding headers if present."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "127.0.0.1"
+
+
 @app.post("/v1/auth/session")
 def create_auth_session(
+    request: Request,
     req: AuthSessionReq,
     response: Response,
     db: Session = Depends(get_db),
 ):
-    """Authenticate and issue an HttpOnly, SameSite=Strict session cookie."""
+    """Authenticate and issue an HttpOnly, SameSite=Strict session cookie with IP rate limiting."""
+    client_ip = extract_client_ip(request)
+    blocked, retry_after = auth_rate_limiter.is_blocked(client_ip)
+    if blocked:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed authentication attempts. Please try again later.",
+            headers={"Retry-After": str(int(retry_after))},
+        )
+
     settings = get_settings()
     try:
         ctx = authenticate_request(x_api_key=req.api_key, db_session=db)
     except HTTPException:
+        auth_rate_limiter.record_failure(client_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key or credential.",
         )
 
+    auth_rate_limiter.record_success(client_ip)
     response.set_cookie(
         key="api_key",
         value=req.api_key,
@@ -252,6 +319,109 @@ def clear_auth_session(response: Response):
     """Clear authenticated session cookie."""
     response.delete_cookie(key="api_key", path="/")
     return {"status": "SUCCESS", "message": "Session cleared."}
+
+
+# --- API Key Lifecycle Endpoints (Admin Authorization Required) ---
+@app.post("/v1/auth/keys")
+def create_api_key_endpoint(
+    req: CreateApiKeyReq,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Issue a new API key. Requires administrator privileges."""
+    if not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator role required to issue API credentials.")
+    repo = DatabaseRepo(db)
+    raw_key, row = repo.create_api_key(
+        client_id=req.client_id,
+        project_roles=req.project_roles,
+        is_admin=req.is_admin,
+    )
+    db.commit()
+    roles = json.loads(row.project_roles_json) if row.project_roles_json else {}
+    return {
+        "status": "SUCCESS",
+        "api_key": raw_key,
+        "key_hash": row.key_hash,
+        "client_id": row.client_id,
+        "is_admin": row.is_admin,
+        "project_roles": roles,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.get("/v1/auth/keys")
+def list_api_keys_endpoint(
+    client_id: str | None = None,
+    include_revoked: bool = False,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """List registered API credentials. Requires administrator privileges."""
+    if not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator role required to list API credentials.")
+    repo = DatabaseRepo(db)
+    rows = repo.list_api_keys(client_id=client_id, include_revoked=include_revoked)
+    results = []
+    for r in rows:
+        roles = json.loads(r.project_roles_json) if r.project_roles_json else {}
+        results.append({
+            "key_hash": r.key_hash,
+            "client_id": r.client_id,
+            "is_admin": r.is_admin,
+            "project_roles": roles,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
+            "is_active": r.revoked_at is None,
+        })
+    return {"keys": results}
+
+
+@app.post("/v1/auth/keys/{key_hash}/revoke")
+def revoke_api_key_endpoint(
+    key_hash: str,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Revoke an active API credential. Requires administrator privileges."""
+    if not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator role required to revoke API credentials.")
+    repo = DatabaseRepo(db)
+    success = repo.revoke_api_key(key_hash)
+    db.commit()
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Active API key with hash '{key_hash}' not found or already revoked.")
+    return {"status": "SUCCESS", "message": f"API key '{key_hash}' revoked successfully."}
+
+
+@app.post("/v1/auth/keys/{key_hash}/rotate")
+def rotate_api_key_endpoint(
+    key_hash: str,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Rotate an active API credential. Requires administrator privileges."""
+    if not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator role required to rotate API credentials.")
+    repo = DatabaseRepo(db)
+    try:
+        raw_new_key, new_row = repo.rotate_api_key(key_hash)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    roles = json.loads(new_row.project_roles_json) if new_row.project_roles_json else {}
+    return {
+        "status": "SUCCESS",
+        "api_key": raw_new_key,
+        "key_hash": new_row.key_hash,
+        "old_key_hash": key_hash,
+        "client_id": new_row.client_id,
+        "is_admin": new_row.is_admin,
+        "project_roles": roles,
+        "created_at": new_row.created_at.isoformat() if new_row.created_at else None,
+        "message": "API key rotated successfully. Previous key revoked.",
+    }
 
 
 # --- REST API Endpoints ---
@@ -1011,23 +1181,24 @@ def cancel_run(
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
-    """Cancel an active or queued evaluation run (Point 25)."""
+    """Cancel an active or queued evaluation run atomically."""
     run = db.get(RunRow, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     authorize_project(run.project_id, auth, required_role=Role.EDITOR)
-    if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value):
-        return {
-            "run_id": run.id,
-            "status": run.status,
-            "message": f"Run is already in terminal state '{run.status}'.",
-        }
 
     repo = DatabaseRepo(db)
-    repo.update_run_status(run.id, RunStatus.CANCELLED)
-    run.failure_reason = "Run cancelled by user request."
-    run.finished_at = datetime.now(timezone.utc)
+    cancelled, current_run = repo.cancel_run_atomic(run.id, reason="Run cancelled by user request.")
     db.commit()
+
+    if not cancelled:
+        current_status = current_run.status if current_run else run.status
+        return {
+            "run_id": run.id,
+            "status": current_status,
+            "message": f"Run is already in terminal state '{current_status}'.",
+        }
+
     return {
         "run_id": run.id,
         "status": RunStatus.CANCELLED.value,

@@ -21,6 +21,7 @@ from sqlalchemy import (
     create_engine,
     func,
     select,
+    update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -205,6 +206,9 @@ class ApiKeyRow(Base):
     project_roles_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=lambda: datetime.now(timezone.utc)
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
     )
 
 
@@ -556,7 +560,77 @@ class DatabaseRepo:
         self.session.flush()
         return trace_row
 
+    def cancel_run_atomic(
+        self,
+        run_id: str,
+        reason: str = "Run cancelled by user request.",
+    ) -> tuple[bool, RunRow | None]:
+        """Atomically transition an active/queued run to CANCELLED state.
+
+        Uses a conditional database UPDATE (WHERE status IN ('CREATED', 'QUEUED', 'RUNNING'))
+        to eliminate read-modify-write race conditions against concurrent worker finalization.
+        Returns:
+            tuple[bool, RunRow | None]: (True if updated, current RunRow)
+        """
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(RunRow)
+            .where(
+                RunRow.id == run_id,
+                RunRow.status.in_([
+                    RunStatus.CREATED.value,
+                    RunStatus.QUEUED.value,
+                    RunStatus.RUNNING.value,
+                ]),
+            )
+            .values(
+                status=RunStatus.CANCELLED.value,
+                finished_at=now,
+                failure_reason=reason,
+            )
+        )
+        res = self.session.execute(stmt)
+        self.session.flush()
+        self.session.expire_all()
+        run = self.session.get(RunRow, run_id)
+        return (res.rowcount > 0, run)
+
     def update_run_status(self, run_id: str, status: RunStatus) -> RunRow:
+        if status == RunStatus.CANCELLED:
+            success, run = self.cancel_run_atomic(run_id)
+            if not run:
+                raise ValueError(f"Run {run_id} not found.")
+            if not success:
+                raise ImmutabilityError(f"Run {run_id} is in terminal state ({run.status}) and cannot be modified.")
+            return run
+
+        if status in (RunStatus.COMPLETED, RunStatus.FAILED):
+            now = datetime.now(timezone.utc)
+            stmt = (
+                update(RunRow)
+                .where(
+                    RunRow.id == run_id,
+                    RunRow.status.in_([
+                        RunStatus.CREATED.value,
+                        RunStatus.QUEUED.value,
+                        RunStatus.RUNNING.value,
+                    ]),
+                )
+                .values(
+                    status=status.value,
+                    finished_at=now,
+                )
+            )
+            res = self.session.execute(stmt)
+            self.session.flush()
+            self.session.expire_all()
+            run = self.session.get(RunRow, run_id)
+            if not run:
+                raise ValueError(f"Run {run_id} not found.")
+            if res.rowcount == 0:
+                raise ImmutabilityError(f"Run {run_id} is in terminal state ({run.status}) and cannot be modified.")
+            return run
+
         run = self.session.get(RunRow, run_id)
         if not run:
             raise ValueError(f"Run {run_id} not found.")
@@ -564,8 +638,6 @@ class DatabaseRepo:
             raise ImmutabilityError(f"Run {run_id} is in terminal state ({run.status}) and cannot be modified.")
 
         run.status = status.value
-        if status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
-            run.finished_at = datetime.now(timezone.utc)
         self.session.flush()
         return run
 
@@ -579,12 +651,14 @@ class DatabaseRepo:
         from rag_platform.security import generate_secure_api_key
         raw_key = api_key or generate_secure_api_key()
         key_hash = sha256_hash(raw_key)
-        roles = {p: (r.value if hasattr(r, "value") else str(r)) for p, r in (project_roles or {}).items()}
+        roles = {p: (r.value if hasattr(r, "value") else str(r).upper()) for p, r in (project_roles or {}).items()}
         row = ApiKeyRow(
             key_hash=key_hash,
             client_id=client_id,
             is_admin=is_admin,
             project_roles_json=json.dumps(roles),
+            created_at=datetime.now(timezone.utc),
+            revoked_at=None,
         )
         self.session.add(row)
         self.session.flush()
@@ -593,3 +667,59 @@ class DatabaseRepo:
     def get_api_key(self, api_key: str) -> ApiKeyRow | None:
         key_hash = sha256_hash(api_key)
         return self.session.get(ApiKeyRow, key_hash)
+
+    def list_api_keys(
+        self, client_id: str | None = None, include_revoked: bool = False
+    ) -> list[ApiKeyRow]:
+        """List persisted API keys with optional client filtering and revocation status."""
+        stmt = select(ApiKeyRow)
+        if client_id is not None:
+            stmt = stmt.where(ApiKeyRow.client_id == client_id)
+        if not include_revoked:
+            stmt = stmt.where(ApiKeyRow.revoked_at.is_(None))
+        stmt = stmt.order_by(ApiKeyRow.created_at.desc())
+        return list(self.session.scalars(stmt).all())
+
+    def revoke_api_key(self, key_hash: str) -> bool:
+        """Revoke an active API key by its hash. Atomically marks revoked_at and purges process cache."""
+        from rag_platform.security import ApiKeyRegistry
+
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(ApiKeyRow)
+            .where(ApiKeyRow.key_hash == key_hash, ApiKeyRow.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        res = self.session.execute(stmt)
+        self.session.flush()
+        ApiKeyRegistry.invalidate(key_hash)
+        return res.rowcount > 0
+
+    def rotate_api_key(self, old_key_hash: str) -> tuple[str, ApiKeyRow]:
+        """Atomically revoke an active API key and issue a new credential with the same identity and permissions."""
+        from rag_platform.security import ApiKeyRegistry, generate_secure_api_key
+
+        old_row = self.session.get(ApiKeyRow, old_key_hash)
+        if not old_row:
+            raise ValueError(f"API key with hash '{old_key_hash}' not found.")
+        if old_row.revoked_at is not None:
+            raise ValueError(f"API key with hash '{old_key_hash}' is already revoked.")
+
+        now = datetime.now(timezone.utc)
+        old_row.revoked_at = now
+        self.session.flush()
+        ApiKeyRegistry.invalidate(old_key_hash)
+
+        raw_new_key = generate_secure_api_key()
+        new_key_hash = sha256_hash(raw_new_key)
+        new_row = ApiKeyRow(
+            key_hash=new_key_hash,
+            client_id=old_row.client_id,
+            is_admin=old_row.is_admin,
+            project_roles_json=old_row.project_roles_json,
+            created_at=now,
+            revoked_at=None,
+        )
+        self.session.add(new_row)
+        self.session.flush()
+        return (raw_new_key, new_row)
