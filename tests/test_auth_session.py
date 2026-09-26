@@ -8,7 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from rag_platform.core import Settings
 from rag_platform.db import Base
-from rag_platform.security import ApiKeyRegistry, ClientIdentity, Role
+from rag_platform.security import ApiKeyRegistry, Role
 from rag_platform.server import app, get_db
 
 

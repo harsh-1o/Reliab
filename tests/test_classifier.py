@@ -6,7 +6,6 @@ import pytest
 
 from rag_platform.classifier import FeatureExtractor, MLFailureClassifier
 from rag_platform.models import (
-    Answerability,
     DocumentReference,
     MetricFamily,
     MetricResult,

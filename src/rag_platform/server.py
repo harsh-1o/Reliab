@@ -16,7 +16,7 @@ from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPExcep
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from rag_platform import __version__
@@ -558,6 +558,7 @@ async def _execute_evaluation_run(
     config: RunConfig,
     ds_cases: list[TestCase],
     db_session: Session | None = None,
+    expected_lease_id: str | None = None,
 ) -> None:
     """Execute evaluation run with bounded concurrency, strict timeout, fail-fast, and resource lifecycle."""
     eval_engine = EvaluationEngine(cache=_eval_cache)
@@ -570,12 +571,21 @@ async def _execute_evaluation_run(
     sess = db_session if db_session is not None else create_session()
     repo = DatabaseRepo(sess)
     now = datetime.now(timezone.utc)
+    sess.expire_all()
     run_row = sess.get(RunRow, run_id)
-    if run_row:
-        if not run_row.started_at:
-            run_row.started_at = now
-        run_row.heartbeat_at = now
-        run_row.status = RunStatus.RUNNING.value
+    if not run_row or run_row.status in (
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+        RunStatus.COMPLETED.value,
+    ):
+        return
+    if expected_lease_id and run_row.lease_id != expected_lease_id:
+        return
+
+    if not run_row.started_at:
+        run_row.started_at = now
+    run_row.heartbeat_at = now
+    run_row.status = RunStatus.RUNNING.value
     sess.commit()
 
     timeout_sec = float(getattr(config.options, "timeout_seconds", 60) or 60)
@@ -669,9 +679,14 @@ async def _execute_evaluation_run(
                 trace, metrics, diag = await _process_case_safe(case)
 
                 async with results_lock:
-                    # Check cancellation under lock before committing trace (Point 25)
+                    # Check cancellation and lease validity under lock before committing trace
+                    sess.expire_all()
                     cur_run = sess.get(RunRow, run_id)
-                    if cur_run and cur_run.status == RunStatus.CANCELLED.value:
+                    if (
+                        not cur_run
+                        or cur_run.status != RunStatus.RUNNING.value
+                        or (expected_lease_id and cur_run.lease_id != expected_lease_id)
+                    ):
                         had_cancellation = True
                         case_queue.task_done()
                         break
@@ -704,22 +719,23 @@ async def _execute_evaluation_run(
             await asyncio.gather(*workers)
 
         now = datetime.now(timezone.utc)
+        sess.expire_all()
         run_row = sess.get(RunRow, run_id)
-        if run_row and run_row.status == RunStatus.CANCELLED.value:
-            # Run was cancelled during execution — do not overwrite status (Point 25)
-            pass
-        elif had_fatal_failure and fail_fast:
-            repo.update_run_status(run_id, RunStatus.FAILED)
-            if run_row:
-                run_row.failure_reason = "Run aborted due to fatal case failure (fail_fast=true)"
-                run_row.failure_type = "FAIL_FAST"
-        else:
-            repo.update_run_status(run_id, RunStatus.COMPLETED)
+        if not run_row or run_row.status != RunStatus.RUNNING.value:
+            # Run was cancelled, marked failed by recovery, or already finalized
+            return
+        if expected_lease_id and run_row.lease_id != expected_lease_id:
+            # Worker lease was lost or claimed by another worker
+            return
+
+        final_status = RunStatus.FAILED if (had_fatal_failure and fail_fast) else RunStatus.COMPLETED
+        failure_reason = "Run aborted due to fatal case failure (fail_fast=true)" if (had_fatal_failure and fail_fast) else None
+        failure_type = "FAIL_FAST" if (had_fatal_failure and fail_fast) else None
 
         # Pre-compute and persist run summary and gate result to avoid N+1 recalculation on list/get
         summary_obj = eval_engine.aggregate_run([(t, m) for t, m, _ in results]) if results else None
         gate_obj = None
-        if summary_obj and run_row and run_row.status != RunStatus.CANCELLED.value:
+        if summary_obj and final_status == RunStatus.COMPLETED:
             from rag_platform.regression import RegressionEngine, ReleasePolicy
             reg_engine = RegressionEngine()
             gate_obj = reg_engine.evaluate_gate(
@@ -728,15 +744,40 @@ async def _execute_evaluation_run(
                 candidate_run_id=run_row.id,
             )
 
-        if run_row:
-            run_row.finished_at = now
-            run_row.heartbeat_at = now
-            if summary_obj:
-                run_row.summary_json = summary_obj.model_dump_json()
-            if gate_obj:
-                run_row.gate_result_json = gate_obj.model_dump_json()
-                run_row.gate_status = gate_obj.status.value
+        # Atomic conditional update of final state: only succeeds if run is still RUNNING and lease still matches
+        final_stmt = (
+            update(RunRow)
+            .where(
+                RunRow.id == run_id,
+                RunRow.status == RunStatus.RUNNING.value,
+            )
+        )
+        if expected_lease_id:
+            final_stmt = final_stmt.where(RunRow.lease_id == expected_lease_id)
+
+        update_values: dict[str, Any] = {
+            "status": final_status.value,
+            "finished_at": now,
+            "heartbeat_at": now,
+        }
+        if failure_reason:
+            update_values["failure_reason"] = failure_reason
+        if failure_type:
+            update_values["failure_type"] = failure_type
+        if summary_obj:
+            update_values["summary_json"] = summary_obj.model_dump_json()
+        if gate_obj:
+            update_values["gate_result_json"] = gate_obj.model_dump_json()
+            update_values["gate_status"] = gate_obj.status.value
+
+        res = sess.execute(final_stmt.values(**update_values))
         sess.commit()
+        if res.rowcount == 0:
+            import logging
+            logging.getLogger("rag_platform.server").warning(
+                "run_id=%s final atomic update affected 0 rows; lost lease or recovered.", run_id
+            )
+            return
 
         import logging
         logging.getLogger("rag_platform.server").info(
@@ -750,14 +791,24 @@ async def _execute_evaluation_run(
             "run_id=%s run-level failure: %s", run_id, exc_type
         )
         try:
-            repo.update_run_status(run_id, RunStatus.FAILED)
-            run_row = sess.get(RunRow, run_id)
-            if run_row:
+            with create_session() as fail_sess:
+                fail_stmt = update(RunRow).where(
+                    RunRow.id == run_id,
+                    RunRow.status == RunStatus.RUNNING.value,
+                )
+                if expected_lease_id:
+                    fail_stmt = fail_stmt.where(RunRow.lease_id == expected_lease_id)
                 from rag_platform.security import SecretRedactor
                 safe_reason = SecretRedactor.redact_text(str(exc))[:500]
-                run_row.failure_reason = safe_reason
-                run_row.failure_type = exc_type[:64]
-            sess.commit()
+                fail_sess.execute(
+                    fail_stmt.values(
+                        status=RunStatus.FAILED.value,
+                        finished_at=datetime.now(timezone.utc),
+                        failure_reason=safe_reason,
+                        failure_type=exc_type[:64],
+                    )
+                )
+                fail_sess.commit()
         except Exception:
             pass
     finally:
@@ -877,8 +928,16 @@ async def create_run(
     )
     db.commit()
 
-    # If run already existed under this idempotency key and has already progressed
-    if idempotency_key and run.status in (RunStatus.RUNNING.value, RunStatus.COMPLETED.value, RunStatus.QUEUED.value):
+    # If run already existed under this idempotency key
+    if idempotency_key and (
+        getattr(run, "_is_existing", False)
+        or run.status in (
+            RunStatus.RUNNING.value,
+            RunStatus.COMPLETED.value,
+            RunStatus.QUEUED.value,
+            RunStatus.FAILED.value,
+        )
+    ):
         if req.async_exec:
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
@@ -886,6 +945,18 @@ async def create_run(
                     "run_id": run.id,
                     "manifest_hash": run.manifest_hash,
                     "status": run.status,
+                    "message": "Existing run returned for idempotency key.",
+                },
+            )
+        else:
+            db.refresh(run)
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "run_id": run.id,
+                    "manifest_hash": run.manifest_hash,
+                    "status": run.status,
+                    "gate_status": run.gate_status,
                     "message": "Existing run returned for idempotency key.",
                 },
             )

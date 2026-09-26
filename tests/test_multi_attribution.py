@@ -1,15 +1,15 @@
 import pytest
+
+from rag_platform.attribution import FailureAttributionEngine
+from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
-    TestCase,
+    Citation,
     DocumentReference,
+    FailureCode,
     RagTrace,
     RetrievedChunk,
-    Citation,
-    FailureCode,
-    Severity,
+    TestCase,
 )
-from rag_platform.evaluators import EvaluationEngine
-from rag_platform.attribution import FailureAttributionEngine
 
 
 @pytest.mark.asyncio

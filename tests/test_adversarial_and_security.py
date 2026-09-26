@@ -1,24 +1,18 @@
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
 from rag_platform.db import Base, DatabaseRepo, TraceRow
 from rag_platform.models import (
-    TestCase,
     RagTrace,
     RetrievedChunk,
     RunConfig,
     RunProvenance,
-    FailureAttribution,
-    FailureCode,
-    MetricResult,
-    MetricFamily,
-    DiagnosticFinding,
-    Severity,
+    TestCase,
 )
 from rag_platform.security import (
-    SecretRedactor,
-    EvaluatorPromptDefense,
     BudgetGuard,
+    EvaluatorPromptDefense,
 )
 
 

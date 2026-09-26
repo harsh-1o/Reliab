@@ -14,6 +14,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     func,
     select,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from rag_platform.core import (
@@ -95,6 +97,9 @@ class TestCaseRow(Base):
 
 class RunRow(Base):
     __tablename__ = "runs"
+    __table_args__ = (
+        Index("uq_runs_project_idempotency_key", "project_id", "idempotency_key", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
@@ -406,6 +411,7 @@ class DatabaseRepo:
                 )
             )
             if existing:
+                setattr(existing, "_is_existing", True)
                 return existing
 
         ds = self.session.get(DatasetRow, config.dataset_id)
@@ -432,9 +438,32 @@ class DatabaseRepo:
             options_json=options_override_json or config.options.model_dump_json(),
             idempotency_key=idempotency_key,
         )
-        self.session.add(run)
-        self.session.flush()
-        return run
+        if idempotency_key:
+            try:
+                with self.session.begin_nested():
+                    self.session.add(run)
+                    self.session.flush()
+                setattr(run, "_is_existing", False)
+                return run
+            except IntegrityError:
+                # Concurrent request inserted the same (project_id, idempotency_key)
+                if run in self.session:
+                    self.session.expunge(run)
+                existing = self.session.scalar(
+                    select(RunRow).where(
+                        RunRow.project_id == config.project_id,
+                        RunRow.idempotency_key == idempotency_key,
+                    )
+                )
+                if existing:
+                    setattr(existing, "_is_existing", True)
+                    return existing
+                raise
+        else:
+            self.session.add(run)
+            self.session.flush()
+            setattr(run, "_is_existing", False)
+            return run
 
     def purge_expired_data(self, trace_retention_days: int = 90) -> dict[str, int]:
         """Purge historical evaluation traces older than retention threshold (Point 33)."""

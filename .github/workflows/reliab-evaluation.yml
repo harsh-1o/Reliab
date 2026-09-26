@@ -1,10 +1,10 @@
-name: Reliab Quality Gate & CI/CD Pipeline
+name: "Reliab Quality Gate & CI/CD Pipeline"
 
 on:
   pull_request:
     branches: [ master, main ]
   push:
-    branches: [ master, main ]
+    branches: [ '**' ]
 
 jobs:
   reliab-gate:
@@ -13,6 +13,22 @@ jobs:
     permissions:
       contents: read
       checks: write
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: reliab_test
+          POSTGRES_USER: reliab
+          POSTGRES_PASSWORD: reliab_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      POSTGRES_TEST_URL: postgresql+psycopg://reliab:reliab_password@localhost:5432/reliab_test
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -32,13 +48,20 @@ jobs:
 
       - name: Lint (Ruff)
         run: |
-          ruff check src/ --output-format=github
+          ruff check src/ tests/ --output-format=github
 
       - name: Type Check (mypy)
         run: |
           mypy src/rag_platform/
 
-      - name: Verify Schema Consistency (Alembic)
+      - name: Verify Schema Consistency (Alembic SQLite)
+        run: |
+          python -c "import alembic.config; alembic.config.main(argv=['upgrade', 'head'])"
+          python -c "import alembic.config; alembic.config.main(argv=['check'])"
+
+      - name: "Migrate PostgreSQL Database (Alembic)"
+        env:
+          DATABASE_URL: postgresql+psycopg://reliab:reliab_password@localhost:5432/reliab_test
         run: |
           python -c "import alembic.config; alembic.config.main(argv=['upgrade', 'head'])"
           python -c "import alembic.config; alembic.config.main(argv=['check'])"
@@ -51,7 +74,7 @@ jobs:
         run: |
           pytest tests/ -v --junit-xml=test-results/unit-tests.xml
 
-      - name: Platform Self-Test: Evaluator & Synthetic Quality Gate Verification
+      - name: "Platform Self-Test: Passing Quality Gate"
         run: |
           python -m rag_platform.gate \
             --bootstrap \
@@ -60,7 +83,27 @@ jobs:
             --dataset ds_ci_benchmark \
             --system-version ${{ github.sha }} \
             --policy prod-default \
-            --junit-xml test-results/reliab-gate.xml
+            --mock-mode PERFECT \
+            --junit-xml test-results/reliab-gate-pass.xml
+
+      - name: "Platform Self-Test: Failing Quality Gate"
+        run: |
+          set +e
+          python -m rag_platform.gate \
+            --bootstrap \
+            --adapter-type synthetic \
+            --project proj_ci_fail \
+            --dataset ds_ci_benchmark_fail \
+            --system-version ${{ github.sha }} \
+            --policy prod-default \
+            --mock-mode HALLUCINATING \
+            --junit-xml test-results/reliab-gate-fail.xml
+          exit_code=$?
+          if [ "$exit_code" -ne 1 ]; then
+            echo "Expected the failing quality gate to exit 1, got $exit_code"
+            exit 1
+          fi
+          echo "Failing quality gate correctly exited 1."
 
       - name: Upload Test and Gate Reports
         uses: actions/upload-artifact@v4
@@ -75,4 +118,6 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          files: "test-results/**/*.xml"
+          files: |
+            test-results/unit-tests.xml
+            test-results/reliab-gate-pass.xml

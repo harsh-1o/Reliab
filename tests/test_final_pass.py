@@ -20,10 +20,10 @@ Tests:
 from __future__ import annotations
 
 import asyncio
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import socket
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -41,7 +41,6 @@ from rag_platform.attribution import FailureAttributionEngine
 from rag_platform.core import compute_manifest_hash, generate_id
 from rag_platform.db import Base, DatabaseRepo
 from rag_platform.evaluators import EvaluationEngine, verify_claim_against_chunks
-from rag_platform.regression import RegressionEngine
 from rag_platform.models import (
     ClaimStatus,
     ClaimVerification,
@@ -61,6 +60,7 @@ from rag_platform.models import (
     TestCase,
     compute_dataset_checksum,
 )
+from rag_platform.regression import RegressionEngine
 from rag_platform.security import (
     ApiKeyRegistry,
     Role,

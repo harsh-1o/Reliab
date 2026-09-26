@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from rag_platform.db import DatasetRow, RunRow, create_session
@@ -234,33 +234,95 @@ class DurableRunWorker:
         sess: Session,
         max_age_seconds: float = 600.0,
     ) -> list[str]:
-        """Recover runs whose worker heartbeat is stale or lease has expired."""
+        """Recover runs whose worker heartbeat is stale or lease has expired via atomic conditional updates."""
         now = datetime.now(timezone.utc)
-        stmt = select(RunRow).where(RunRow.status == RunStatus.RUNNING.value)
-        running_runs = sess.scalars(stmt).all()
+        stmt = select(
+            RunRow.id,
+            RunRow.lease_id,
+            RunRow.worker_id,
+            RunRow.heartbeat_at,
+            RunRow.started_at,
+            RunRow.created_at,
+            RunRow.lease_expires_at,
+        ).where(RunRow.status == RunStatus.RUNNING.value)
+        running_runs = sess.execute(stmt).all()
         recovered_ids: list[str] = []
 
-        for run in running_runs:
-            last_activity = run.heartbeat_at or run.started_at or run.created_at
-            if last_activity.tzinfo is None:
+        for (
+            run_id,
+            lease_id,
+            worker_id,
+            heartbeat_at,
+            started_at,
+            created_at,
+            lease_expires_at,
+        ) in running_runs:
+            last_activity = heartbeat_at or started_at or created_at
+            if last_activity and last_activity.tzinfo is None:
                 last_activity = last_activity.replace(tzinfo=timezone.utc)
-            age = (now - last_activity).total_seconds()
+            age = (now - last_activity).total_seconds() if last_activity else 999999.0
 
-            is_lease_expired = run.lease_expires_at is not None and (
-                (run.lease_expires_at.replace(tzinfo=timezone.utc) if run.lease_expires_at.tzinfo is None else run.lease_expires_at) < now
+            lease_exp = lease_expires_at
+            if lease_exp and lease_exp.tzinfo is None:
+                lease_exp = lease_exp.replace(tzinfo=timezone.utc)
+            is_lease_expired = lease_exp is not None and lease_exp < now
+
+            if not (age > max_age_seconds or is_lease_expired):
+                continue
+
+            update_time = datetime.now(timezone.utc)
+            cutoff = update_time - timedelta(seconds=max_age_seconds)
+
+            stale_conds = []
+            if is_lease_expired:
+                stale_conds.append(
+                    and_(RunRow.lease_expires_at.is_not(None), RunRow.lease_expires_at <= update_time)
+                )
+            if age > max_age_seconds:
+                stale_conds.append(
+                    func.coalesce(RunRow.heartbeat_at, RunRow.started_at, RunRow.created_at) < cutoff
+                )
+
+            if not stale_conds:
+                continue
+
+            where_clauses = [
+                RunRow.id == run_id,
+                RunRow.status == RunStatus.RUNNING.value,
+            ]
+            if lease_id is not None:
+                where_clauses.append(RunRow.lease_id == lease_id)
+            else:
+                where_clauses.append(RunRow.lease_id.is_(None))
+
+            if worker_id is not None:
+                where_clauses.append(RunRow.worker_id == worker_id)
+            else:
+                where_clauses.append(RunRow.worker_id.is_(None))
+
+            where_clauses.append(or_(*stale_conds))
+
+            reason = (
+                f"Run abandoned or worker died while running (last heartbeat was {int(age)}s ago > {int(max_age_seconds)}s limit)."
+                if age > max_age_seconds
+                else f"Run worker lease expired at {lease_exp}."
             )
 
-            if age > max_age_seconds or is_lease_expired:
-                run.status = RunStatus.FAILED.value
-                run.finished_at = now
-                run.failure_type = "STALE_RUNNER_RECOVERY"
-                run.failure_reason = (
-                    f"Run abandoned or worker died while running (last heartbeat was {int(age)}s ago > {int(max_age_seconds)}s limit)."
+            res = sess.execute(
+                update(RunRow)
+                .where(and_(*where_clauses))
+                .values(
+                    status=RunStatus.FAILED.value,
+                    finished_at=update_time,
+                    failure_type="STALE_RUNNER_RECOVERY",
+                    failure_reason=reason[:500],
                 )
-                recovered_ids.append(run.id)
+            )
+            if res.rowcount > 0:
+                recovered_ids.append(run_id)
                 logger.warning(
-                    "Recovered stale run_id=%s: heartbeat age=%ds exceeded timeout=%ds (lease_expired=%s)",
-                    run.id, int(age), int(max_age_seconds), is_lease_expired,
+                    "Recovered stale run_id=%s via atomic conditional update: age=%ds, lease_expired=%s",
+                    run_id, int(age), is_lease_expired,
                 )
 
         if recovered_ids:
@@ -407,6 +469,7 @@ class DurableRunWorker:
                     config=config,
                     ds_cases=cases,
                     db_session=sess,
+                    expected_lease_id=active_lease_id,
                 )
             )
             lease_task = asyncio.create_task(lease_lost_event.wait())
@@ -422,6 +485,8 @@ class DurableRunWorker:
                     await evaluation_task
                 except asyncio.CancelledError:
                     pass
+                except Exception as eval_exc:
+                    logger.warning("Cancelled evaluation task raised: %s", eval_exc)
                 await _fail_if_still_owner("Worker heartbeat/lease was lost while evaluation was running.")
                 return False
 
@@ -430,6 +495,11 @@ class DurableRunWorker:
                 await lease_task
             except asyncio.CancelledError:
                 pass
+
+            if evaluation_task in done:
+                eval_exc = evaluation_task.exception()
+                if eval_exc is not None:
+                    raise eval_exc
 
             # A lease can be invalidated immediately after evaluation completes.
             # Guard the final handoff so an obsolete worker never reports success.
@@ -447,12 +517,22 @@ class DurableRunWorker:
         except Exception as exc:
             logger.exception("Failed processing run %s: %s", run_id, exc)
             try:
-                run = sess.get(RunRow, run_id)
-                if run and (not active_lease_id or run.lease_id == active_lease_id):
-                    run.status = RunStatus.FAILED.value
-                    run.failure_reason = str(exc)[:500]
-                    run.failure_type = type(exc).__name__[:64]
-                    sess.commit()
+                with create_session() as fail_sess:
+                    stmt = update(RunRow).where(
+                        RunRow.id == run_id,
+                        RunRow.status == RunStatus.RUNNING.value,
+                    )
+                    if active_lease_id:
+                        stmt = stmt.where(RunRow.lease_id == active_lease_id)
+                    fail_sess.execute(
+                        stmt.values(
+                            status=RunStatus.FAILED.value,
+                            finished_at=datetime.now(timezone.utc),
+                            failure_reason=str(exc)[:500],
+                            failure_type=type(exc).__name__[:64],
+                        )
+                    )
+                    fail_sess.commit()
             except Exception:
                 pass
             return False

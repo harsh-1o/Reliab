@@ -2,8 +2,9 @@
 air-gapped SSRF DNS resolution, and worker notification push loop.
 """
 
-import pytest
 import asyncio
+
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -20,9 +21,9 @@ from rag_platform.models import (
 )
 from rag_platform.ssrf import (
     SSRFProtectionError,
-    validate_url_ssrf,
-    register_static_dns,
     clear_static_dns,
+    register_static_dns,
+    validate_url_ssrf,
 )
 from rag_platform.worker import (
     DurableRunWorker,
@@ -38,7 +39,8 @@ def memory_db_session():
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(bind=engine)
-    session_factory = lambda: Session(engine)
+    def session_factory() -> Session:
+        return Session(engine)
     with session_factory() as sess:
         yield sess, session_factory
 
@@ -154,7 +156,8 @@ class TestAirGappedSSRFDNSResolution:
             clear_static_dns("internal-metadata.test")
 
     def test_custom_dns_resolver_injection(self):
-        custom_resolver = lambda host, port: ["93.184.216.34"]
+        def custom_resolver(host, port):
+            return ["93.184.216.34"]
         resolved = validate_url_ssrf(
             "https://custom-dns-target.internal/endpoint",
             dns_resolver=custom_resolver,
@@ -163,7 +166,8 @@ class TestAirGappedSSRFDNSResolution:
 
     def test_custom_dns_resolver_rebinding_defense(self):
         # Resolver returns both a public IP and an internal private IP
-        malicious_rebinding_resolver = lambda host, port: ["93.184.216.34", "10.240.0.1"]
+        def malicious_rebinding_resolver(host, port):
+            return ["93.184.216.34", "10.240.0.1"]
         with pytest.raises(SSRFProtectionError) as exc_info:
             validate_url_ssrf(
                 "https://rebinding-target.internal/endpoint",

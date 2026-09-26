@@ -251,28 +251,137 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
         db_session.commit()
 
 
+def load_dataset_from_file(
+    file_path: str | Path,
+    project_id: str,
+    dataset_id: str | None = None,
+) -> tuple[str, list[TestCase]]:
+    """Load benchmark test cases from a local .json, .jsonl, or .csv file."""
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Benchmark dataset file not found: {file_path}")
+
+    cases: list[TestCase] = []
+    ext = path.suffix.lower()
+
+    if ext == ".jsonl":
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    cases.append(TestCase.model_validate_json(line))
+    elif ext == ".json":
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            cases = [TestCase.model_validate(c) for c in data]
+        elif isinstance(data, dict):
+            if "cases" in data and isinstance(data["cases"], list):
+                cases = [TestCase.model_validate(c) for c in data["cases"]]
+            else:
+                cases = [TestCase.model_validate(data)]
+        else:
+            raise ValueError(f"Unrecognized JSON structure in dataset file: {file_path}")
+    elif ext == ".csv":
+        from rag_platform.datasets import import_dataset_csv
+        imported_ds = import_dataset_csv(path, project_id=project_id, name=path.stem, version="1.0.0")
+        cases = imported_ds.cases
+    else:
+        raise ValueError(f"Unsupported benchmark dataset format '{ext}'. Expected .json, .jsonl, or .csv")
+
+    if not cases:
+        raise ValueError(f"No test cases loaded from benchmark dataset file: {file_path}")
+
+    actual_dataset_id = dataset_id or f"ds_{path.stem}"
+    return actual_dataset_id, cases
+
+
 def execute_gate_evaluation(
     db_session: Session,
     project_id: str,
-    dataset_id: str,
-    system_version: str,
+    dataset_id: str | None = None,
+    system_version: str = "HEAD",
     policy: ReleasePolicy | None = None,
     mock_mode: SyntheticRagMode = SyntheticRagMode.PERFECT,
     junit_xml_path: str | None = None,
     bootstrap: bool = False,
     adapter_type: str = "synthetic",
     endpoint_url: str | None = None,
+    dataset_path: str | None = None,
+    environment: str = "production",
+    gate_mode: str = "hard",
 ) -> tuple[int, GateResult]:
     """Execute evaluation run and evaluate against policy gate. Returns (exit_code, GateResult)."""
-    if bootstrap:
+    from rag_platform.models import compute_dataset_checksum
+
+    # Ensure project exists
+    project = db_session.get(ProjectRow, project_id)
+    if not project:
+        project = ProjectRow(
+            id=project_id,
+            name=f"CI Project {project_id}",
+            settings_json=json.dumps({"ci_bootstrap": True}),
+        )
+        db_session.add(project)
+        db_session.commit()
+
+    if dataset_path:
+        actual_ds_id, loaded_cases = load_dataset_from_file(dataset_path, project_id, dataset_id)
+        dataset_id = actual_ds_id
+        checksum = compute_dataset_checksum(loaded_cases)
+        ds_row = db_session.get(DatasetRow, dataset_id)
+        if not ds_row:
+            ds_row = DatasetRow(
+                id=dataset_id,
+                project_id=project_id,
+                name=f"File Imported: {Path(dataset_path).stem}",
+                version="1.0.0",
+                description=f"Loaded from {dataset_path}",
+                status=DatasetStatus.PUBLISHED.value,
+                checksum_sha256=checksum,
+            )
+            db_session.add(ds_row)
+        else:
+            ds_row.checksum_sha256 = checksum
+            ds_row.status = DatasetStatus.PUBLISHED.value
+        for c in loaded_cases:
+            tc_row = db_session.get(TestCaseRow, (c.id, dataset_id))
+            if not tc_row:
+                tc_row = TestCaseRow(
+                    id=c.id,
+                    dataset_id=dataset_id,
+                    question=c.question,
+                    expected_answer=c.expected_answer,
+                    expected_facts_json=json.dumps(c.expected_facts),
+                    relevant_docs_json=json.dumps([d.model_dump() for d in c.relevant_documents]),
+                    answerability=c.answerability.value,
+                    tags_json=json.dumps(c.tags),
+                    metadata_json=json.dumps(c.metadata),
+                )
+                db_session.add(tc_row)
+            else:
+                tc_row.question = c.question
+                tc_row.expected_answer = c.expected_answer
+                tc_row.expected_facts_json = json.dumps(c.expected_facts)
+                tc_row.relevant_docs_json = json.dumps([d.model_dump() for d in c.relevant_documents])
+                tc_row.answerability = c.answerability.value
+                tc_row.tags_json = json.dumps(c.tags)
+                tc_row.metadata_json = json.dumps(c.metadata)
+        db_session.commit()
+    elif bootstrap:
+        if not dataset_id:
+            dataset_id = "ci_bench"
         bootstrap_ci_database(db_session, project_id, dataset_id)
+
+    if not dataset_id:
+        raise ValueError("Either dataset_id or dataset_path must be specified.")
 
     repo = DatabaseRepo(db_session)
     active_policy = policy or ReleasePolicy()
 
     ds_row = db_session.get(DatasetRow, dataset_id)
     if not ds_row:
-        raise ValueError(f"Dataset {dataset_id} not found. Use --bootstrap to seed benchmark datasets automatically.")
+        raise ValueError(f"Dataset {dataset_id} not found. Use --bootstrap or --dataset-path to provide benchmark cases.")
 
     actual_adapter_type = "http" if (adapter_type == "http" and endpoint_url) else f"synthetic:{mock_mode.value}"
     provenance = RunProvenance(
@@ -284,7 +393,13 @@ def execute_gate_evaluation(
         model_version="1.0.0",
         evaluator_version="2.0.0",
         adapter_type=actual_adapter_type,
-        environment_info={"ci": "true", "platform": sys.platform, "python": sys.version.split()[0]},
+        environment_info={
+            "ci": "true",
+            "platform": sys.platform,
+            "python": sys.version.split()[0],
+            "environment": environment,
+            "gate_mode": gate_mode,
+        },
     )
 
     config = RunConfig(
@@ -335,20 +450,33 @@ def execute_gate_evaluation(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(xml_content, encoding="utf-8")
 
-    exit_code = 0 if gate.status == GateStatus.PASS else 1
+    if gate.status == GateStatus.FAIL and gate_mode == "soft":
+        import logging
+        logging.getLogger("rag_platform.gate").warning(
+            "Gate violations detected, but gate-mode is 'soft' (non-blocking). Exiting with code 0."
+        )
+        exit_code = 0
+    elif gate.status == GateStatus.FAIL:
+        exit_code = 1
+    else:
+        exit_code = 0
+
     return exit_code, gate
 
 
 def main():
     parser = argparse.ArgumentParser(description="Reliab CI/CD Quality Gate & Platform Self-Test")
-    parser.add_argument("--project", required=True, help="Project ID")
-    parser.add_argument("--dataset", required=True, help="Published Dataset ID")
-    parser.add_argument("--system-version", required=True, help="Candidate RAG Git commit SHA")
+    parser.add_argument("--project", "--project-id", dest="project", default="reliab-ci-project", help="Project ID")
+    parser.add_argument("--dataset", "--dataset-id", dest="dataset", default=None, help="Published Dataset ID in database")
+    parser.add_argument("--dataset-path", default=None, help="Filesystem path to load benchmark dataset from (.json, .jsonl, .csv)")
+    parser.add_argument("--system-version", default="HEAD", help="Candidate RAG Git commit SHA")
     parser.add_argument("--policy", default="prod-default", help="Release policy ID")
     parser.add_argument("--adapter-type", default="synthetic", choices=["synthetic", "http"], help="Adapter type (Points 15)")
     parser.add_argument("--endpoint-url", default=None, help="HTTP SUT endpoint URL when evaluating real RAG system")
     parser.add_argument("--mock-mode", default="PERFECT", choices=[m.value for m in SyntheticRagMode])
     parser.add_argument("--junit-xml", default=None, help="Path to write JUnit XML test results")
+    parser.add_argument("--environment", default="production", help="Deployment environment (e.g. production, staging, development)")
+    parser.add_argument("--gate-mode", default="hard", choices=["hard", "soft"], help="Gate enforcement mode: 'hard' exits with code 1 on violations; 'soft' logs violations as warnings and exits 0")
     parser.add_argument(
         "--bootstrap",
         action="store_true",
@@ -357,6 +485,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if not args.dataset and not args.dataset_path:
+        if args.bootstrap:
+            args.dataset = "ci_bench"
+        else:
+            parser.error("Either --dataset or --dataset-path must be specified.")
 
     engine = create_db_engine()
     if args.bootstrap:
@@ -375,6 +509,9 @@ def main():
             bootstrap=args.bootstrap,
             adapter_type=args.adapter_type,
             endpoint_url=args.endpoint_url,
+            dataset_path=args.dataset_path,
+            environment=args.environment,
+            gate_mode=args.gate_mode,
         )
 
     mode_label = "Platform Self-Test (Synthetic)" if args.adapter_type == "synthetic" else "Production SUT Release Gate"
@@ -382,12 +519,16 @@ def main():
     print(f"RELIAB CI/CD RELEASE QUALITY GATE: [{gate.status.value}] ({mode_label})")
     print(f"Candidate Run ID: {gate.candidate_run_id}")
     print(f"Policy: {gate.policy_id}")
+    print(f"Environment: {args.environment}")
+    print(f"Gate Mode: {args.gate_mode.upper()}")
     print("=" * 60)
 
     if gate.violations:
         print(f"\nVIOLATIONS DETECTED ({len(gate.violations)}):")
         for v in gate.violations:
             print(f"  [FAIL] [{v.metric_name}]: {v.message}")
+        if args.gate_mode == "soft":
+            print("\n[WARN] Gate mode is 'soft'; violations are non-blocking. Exiting 0.")
     else:
         print("\n[PASS] All quality thresholds and regression budgets satisfied.")
 
