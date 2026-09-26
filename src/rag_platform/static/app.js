@@ -29,7 +29,7 @@ function formatMetric(metricObj, isPercentage = true) {
 
 function getApiKey() {
     try {
-        return localStorage.getItem('rag_api_key') || '';
+        return localStorage.getItem('reliab_api_key') || localStorage.getItem('rag_api_key') || '';
     } catch (e) {
         return '';
     }
@@ -37,14 +37,18 @@ function getApiKey() {
 
 function setApiKey(key) {
     try {
-        if (key) localStorage.setItem('rag_api_key', key);
-        else localStorage.removeItem('rag_api_key');
+        if (key) {
+            localStorage.setItem('reliab_api_key', key);
+        } else {
+            localStorage.removeItem('reliab_api_key');
+            localStorage.removeItem('rag_api_key');
+        }
     } catch (e) {}
 }
 
 function promptApiKey() {
     const current = getApiKey();
-    const key = prompt("Enter API Key for RAG Reliability Platform:", current);
+    const key = prompt("Enter API Key for Reliab:", current);
     if (key !== null) {
         setApiKey(key.trim());
         refreshDashboard();
@@ -60,7 +64,7 @@ async function apiFetch(url, options = {}) {
     }
     const res = await fetch(url, opts);
     if (res.status === 401) {
-        const inputKey = prompt("Authentication Required (401). Enter API Key:");
+        const inputKey = prompt("Authentication Required (401). Enter API Key for Reliab:");
         if (inputKey) {
             setApiKey(inputKey.trim());
             opts.headers['X-API-Key'] = inputKey.trim();
@@ -186,16 +190,16 @@ function renderRunDashboard(run, baseline) {
                 </h2>
                 <p>Policy: <code>${policyId}</code> | Evaluated ${escapeHtml(String(run.trace_count || 0))} test cases on benchmark <code>${escapeHtml(run.dataset_id || '')}</code> against commit <code>${escapeHtml(run.system_version || '')}</code>.</p>
                 ${violations.length > 0 ? `
-                    <div style="margin-top:10px; display:flex; flex-direction:column; gap:6px;">
+                    <div class="violation-list">
                         ${violations.map(v => {
                             const opSymbol = v.operator === '<=' ? '&le;' : (v.operator === '<' ? '&lt;' : (v.operator === '>' ? '&gt;' : '&ge;'));
                             return `
-                            <div class="violation-box" style="padding:6px 10px; background:#fff2f0; border-left:3px solid #ff4d4f; border-radius:4px; font-size:12px;">
-                                <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div class="violation-box">
+                                <div class="violation-header">
                                     <span><strong>${escapeHtml(v.metric_name)}</strong> &mdash; Candidate: <strong>${v.candidate_value !== undefined && v.candidate_value !== null ? escapeHtml(String(v.candidate_value)) : 'N/A'}</strong> | Required: <strong>${opSymbol} ${escapeHtml(String(v.threshold))}</strong></span>
-                                    <span class="chip chip-fail" style="font-size:10px; padding:2px 6px;">${escapeHtml(v.violation_type || 'THRESHOLD_BREACH')}</span>
+                                    <span class="chip chip-fail">${escapeHtml(v.violation_type || 'THRESHOLD_BREACH')}</span>
                                 </div>
-                                <div style="color:#555; margin-top:3px;">${escapeHtml(v.message || '')}</div>
+                                <div class="violation-msg">${escapeHtml(v.message || '')}</div>
                             </div>
                         `;}).join('')}
                     </div>
@@ -290,21 +294,23 @@ function renderRunDashboard(run, baseline) {
                     <button id="btn-filter-fail" class="btn" onclick="filterTraces('fail')">Failed Traces Only</button>
                 </div>
             </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Trace ID</th>
-                        <th>Question</th>
-                        <th>Faithfulness</th>
-                        <th>Recall</th>
-                        <th>Primary Diagnosis</th>
-                        <th>Contributing Causes</th>
-                    </tr>
-                </thead>
-                <tbody id="trace-table-body">
-                    <tr><td colspan="6" style="text-align:center; color:var(--text-dim);">Loading execution traces...</td></tr>
-                </tbody>
-            </table>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Trace ID</th>
+                            <th>Question</th>
+                            <th>Faithfulness</th>
+                            <th>Recall</th>
+                            <th>Primary Diagnosis</th>
+                            <th>Contributing Causes</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trace-table-body">
+                        <tr><td colspan="6" style="text-align:center; color:var(--text-dim);">Loading execution traces...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
     `;
 }

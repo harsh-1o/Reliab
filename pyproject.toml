@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rag-reliability-platform"
+name = "reliab"
 version = "0.1.0"
-description = "RAG Reliability, Evaluation, Diagnosis and Regression Platform"
+description = "Reliab: Developer infrastructure for testing, failure diagnosis, and release gating for RAG & LLM systems"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -33,6 +33,8 @@ dev = [
 ]
 
 [project.scripts]
+reliab-worker = "rag_platform.worker:main"
+reliab-gate = "rag_platform.gate:main"
 rag-platform-worker = "rag_platform.worker:main"
 rag-platform-gate = "rag_platform.gate:main"
 

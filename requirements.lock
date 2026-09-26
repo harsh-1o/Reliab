@@ -1,4 +1,4 @@
-# Pinned lockfile for RAG Reliability Platform (Item 35)
+# Pinned lockfile for Reliab (Item 35)
 pydantic==2.12.5
 pydantic_core==2.41.5
 fastapi==0.139.2

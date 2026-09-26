@@ -76,7 +76,7 @@ if ":memory:" in _db_url:
 # else: rely entirely on Alembic
 
 app = FastAPI(
-    title="RAG Reliability Platform",
+    title="Reliab",
     description="Automated failure attribution, regression testing, and quality release gates for RAG systems.",
     version="2.1.0",
 )
@@ -1326,4 +1326,4 @@ def get_dashboard():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
         return FileResponse(str(index_file), media_type="text/html")
-    return HTMLResponse("<h1>RAG Reliability Platform</h1><p>Dashboard static files missing.</p>")
+    return HTMLResponse("<h1>Reliab</h1><p>Dashboard static files missing.</p>")

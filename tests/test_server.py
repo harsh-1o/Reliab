@@ -118,7 +118,7 @@ def test_server_project_and_dataset_endpoints():
     # 8. Dashboard HTML route
     dash_resp = client.get("/dashboard")
     assert dash_resp.status_code == 200
-    assert "RAG Reliability Platform" in dash_resp.text
+    assert "Reliab" in dash_resp.text
 
     # 9. Asynchronous 202 Accepted run execution
     async_resp = client.post(

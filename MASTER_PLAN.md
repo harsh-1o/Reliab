@@ -128,7 +128,7 @@ graph TD
 #### Key Architectural Deliverables
 1. **Repository Layout:**
    ```text
-   rag-reliability-platform/
+   reliab/
    ├── packages/
    │   ├── common/           # Config, logging, UUIDv7, deterministic hashing, errors
    │   ├── domain/           # Pure Pydantic v2 entities, enums, reproducibility schemas

@@ -53,7 +53,7 @@ def _gate_db_row_to_test_case(row: Any) -> TestCase:
 
 def format_junit_xml(gate_result: GateResult) -> str:
     """Generate standard JUnit XML report for CI/CD test dashboards."""
-    suites = ET.Element("testsuites", name="RAG Release Quality Gate")
+    suites = ET.Element("testsuites", name="Reliab Release Quality Gate")
     suite = ET.SubElement(
         suites,
         "testsuite",
@@ -297,7 +297,7 @@ def execute_gate_evaluation(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RAG Reliability CI/CD Quality Gate & Platform Self-Test")
+    parser = argparse.ArgumentParser(description="Reliab CI/CD Quality Gate & Platform Self-Test")
     parser.add_argument("--project", required=True, help="Project ID")
     parser.add_argument("--dataset", required=True, help="Published Dataset ID")
     parser.add_argument("--system-version", required=True, help="Candidate RAG Git commit SHA")
@@ -336,7 +336,7 @@ def main():
 
     mode_label = "Platform Self-Test (Synthetic)" if args.adapter_type == "synthetic" else "Production SUT Release Gate"
     print("\n" + "=" * 60)
-    print(f"RAG CI/CD RELEASE QUALITY GATE: [{gate.status.value}] ({mode_label})")
+    print(f"RELIAB CI/CD RELEASE QUALITY GATE: [{gate.status.value}] ({mode_label})")
     print(f"Candidate Run ID: {gate.candidate_run_id}")
     print(f"Policy: {gate.policy_id}")
     print("=" * 60)

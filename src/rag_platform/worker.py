@@ -412,7 +412,7 @@ def main() -> None:
     python -m rag_platform.worker
     """
     import argparse
-    parser = argparse.ArgumentParser(description="Standalone Durable Evaluation Worker")
+    parser = argparse.ArgumentParser(description="Reliab Standalone Durable Evaluation Worker")
     parser.add_argument("--min-interval", type=float, default=0.1, help="Minimum polling interval in seconds")
     parser.add_argument("--max-interval", type=float, default=5.0, help="Maximum backoff interval in seconds")
     parser.add_argument("--stale-check", type=float, default=60.0, help="Interval for stale run recovery")

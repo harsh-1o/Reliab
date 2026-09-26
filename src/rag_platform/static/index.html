@@ -3,28 +3,40 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RAG Reliability & Release Engineering Console</title>
+    <title>Reliab | RAG Reliability & Release Engineering</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/brand/favicon.png">
+    <link rel="shortcut icon" href="/static/brand/favicon.ico">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=2.2.0">
 </head>
 <body>
 
     <!-- Header -->
     <header>
-        <div class="header-title">
-            <h1>RAG Reliability Platform</h1>
-            <span class="badge-env">CI/CD Gate v0.2.0</span>
+        <div class="header-brand">
+            <a href="/dashboard" class="brand-link" aria-label="Reliab Dashboard">
+                <img src="/static/brand/reliab-wordmark-ui.png" alt="Reliab" class="brand-logo-desktop" width="110" height="88">
+                <img src="/static/brand/reliab-symbol-ui.png" alt="Reliab" class="brand-logo-mobile" width="44" height="44">
+            </a>
+            <div class="header-meta">
+                <h1 class="sr-only">Reliab</h1>
+                <span class="header-subtitle">Release Console</span>
+            </div>
+            <span class="badge-env">CI Gate</span>
             <span id="repro-badge" class="chip chip-neutral" style="display:none;"></span>
         </div>
         <div class="header-controls">
-            <select id="run-select" class="btn" onchange="loadSelectedRun()">
-                <option value="">Loading Evaluation Runs...</option>
-            </select>
-            <button class="btn" onclick="promptApiKey()">API Key</button>
-            <button class="btn" onclick="refreshDashboard()">Refresh</button>
-            <button class="btn btn-primary" onclick="triggerSeedRun()">Run Benchmark</button>
+            <div class="control-group">
+                <label for="run-select" class="sr-only">Select Evaluation Run</label>
+                <select id="run-select" class="btn" onchange="loadSelectedRun()">
+                    <option value="">Loading Evaluation Runs...</option>
+                </select>
+            </div>
+            <button class="btn" onclick="promptApiKey()" aria-label="Configure API Key">API Key</button>
+            <button class="btn" onclick="refreshDashboard()" aria-label="Refresh Dashboard">Refresh</button>
+            <button class="btn btn-primary" onclick="triggerSeedRun()" aria-label="Run Benchmark">Run Benchmark</button>
         </div>
     </header>
 
@@ -32,10 +44,22 @@
     <main id="app-root">
         <div class="empty-state">
             <h4>Loading System State...</h4>
-            <p>Querying SQLite/Postgres datastore for evaluation runs.</p>
+            <p>Connecting to datastore and retrieving evaluation runs.</p>
         </div>
     </main>
 
-    <script src="/static/app.js"></script>
+    <!-- Footer -->
+    <footer class="app-footer">
+        <div class="footer-left">
+            <span>Reliab — Evaluation, diagnosis & quality gates for RAG systems</span>
+        </div>
+        <div class="footer-right">
+            <a href="/docs" target="_blank" rel="noopener">API Docs</a>
+            <span class="sep">•</span>
+            <a href="https://github.com/harsh-1o/reliab" target="_blank" rel="noopener">GitHub</a>
+        </div>
+    </footer>
+
+    <script src="/static/app.js?v=2.2.0"></script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-name: RAG Reliability Quality Gate & CI/CD Pipeline
+name: Reliab Quality Gate & CI/CD Pipeline
 
 on:
   pull_request:
@@ -7,8 +7,8 @@ on:
     branches: [ master, main ]
 
 jobs:
-  rag-gate:
-    name: Build, Test & Release Gate
+  reliab-gate:
+    name: Build, Test & Reliab Gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,13 +52,13 @@ jobs:
             --dataset ds_ci_benchmark \
             --system-version ${{ github.sha }} \
             --policy prod-default \
-            --junit-xml test-results/rag-gate.xml
+            --junit-xml test-results/reliab-gate.xml
 
       - name: Upload Test and Gate Reports
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rag-evaluation-reports
+          name: reliab-evaluation-reports
           path: test-results/
           if-no-files-found: ignore
 
