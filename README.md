@@ -174,3 +174,9 @@ See the [Development Guide](docs/development.md) for the full workflow.
 ## License
 
 Reliab is released under the [MIT License](LICENSE).
+
+---
+
+<p align="center">
+  <img src="https://komarev.com/ghpvc/?username=harsh-1o&repo=Reliab&label=Visitors&color=0e75b6&style=flat" alt="Repository visitors" />
+</p>
