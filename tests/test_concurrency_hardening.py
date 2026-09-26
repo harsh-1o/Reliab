@@ -489,6 +489,9 @@ def postgres_shared_db():
         sess.commit()
 
         proj = ProjectRow(id="proj_pg_concurrency", name="PG Concurrency Project")
+        sess.add(proj)
+        sess.commit()
+
         ds = DatasetRow(
             id="ds_pg_concurrency",
             project_id="proj_pg_concurrency",
@@ -497,7 +500,6 @@ def postgres_shared_db():
             status=DatasetStatus.PUBLISHED.value,
             checksum_sha256="fake_pg_checksum",
         )
-        sess.add(proj)
         sess.add(ds)
         sess.commit()
 
@@ -505,6 +507,9 @@ def postgres_shared_db():
 
     with session_factory() as sess:
         sess.execute(delete(RunRow))
+        sess.execute(delete(TestCaseRow))
+        sess.execute(delete(DatasetRow))
+        sess.execute(delete(ProjectRow))
         sess.commit()
     engine.dispose()
 
