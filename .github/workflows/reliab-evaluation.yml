@@ -95,4 +95,6 @@ jobs:
         if: always()
         continue-on-error: true
         with:
-          files: "test-results/**/*.xml"
+          files: |
+            test-results/unit-tests.xml
+            test-results/reliab-gate-pass.xml
