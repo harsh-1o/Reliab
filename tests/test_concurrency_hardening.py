@@ -16,7 +16,7 @@ import concurrent.futures
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, select, update
+from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import Session
 
 from rag_platform.db import (
@@ -26,7 +26,10 @@ from rag_platform.db import (
     DatasetStatus,
     ProjectRow,
     RunRow,
+    TestCaseRow,
 )
+
+TestCaseRow.__test__ = False
 from rag_platform.models import (
     Answerability,
     DocumentReference,
@@ -224,10 +227,18 @@ class TestStaleRecoveryAtomicRace:
     """B. Stale recovery race condition tests."""
 
     def test_stale_recovery_skips_live_worker_that_renewed_lease(self, shared_db):
-        """Create a RUNNING run with an expired lease.
-        Simulate a worker renewing its lease/heartbeat concurrently between the recovery scan and update.
-        Verify recovery cannot mark the now-live run FAILED.
+        """Deterministically reproduce race between stale recovery and worker renewal.
+
+        Sequence of events:
+        1. Recovery selects stale RUNNING row.
+        2. Recovery pauses right before executing the conditional UPDATE.
+        3. Worker concurrently renews heartbeat and extends lease in the DB, then commits.
+        4. Recovery resumes and attempts conditional UPDATE.
+        5. Database conditional update matches 0 rows (rowcount == 0).
+        6. Run is NOT marked FAILED and remains RUNNING.
         """
+        import threading
+
         engine, session_factory = shared_db
         config = _make_config()
         provenance = _make_provenance()
@@ -241,27 +252,65 @@ class TestStaleRecoveryAtomicRace:
             run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
             run.started_at = past_heartbeat
             run.heartbeat_at = past_heartbeat
-            run.worker_id = "worker_live_1"
-            run.lease_id = "lease_live_1"
+            run.worker_id = "worker_live_race"
+            run.lease_id = "lease_live_race"
             run.lease_expires_at = expired_time
             sess.commit()
             run_id = run.id
 
-        # Worker renews its lease before recovery executes its conditional UPDATE
+        recovery_paused_before_update = threading.Event()
+        worker_renewed_lease = threading.Event()
+        recovered_ids: list[str] = []
+        recovery_errors: list[Exception] = []
+
+        def recovery_worker():
+            try:
+                with session_factory() as recovery_sess:
+                    orig_execute = recovery_sess.execute
+
+                    def hooked_execute(statement, *args, **kwargs):
+                        # Detect the conditional UPDATE statement
+                        if hasattr(statement, "is_update") and statement.is_update:
+                            # Recovery has finished SELECT and is about to execute conditional UPDATE
+                            recovery_paused_before_update.set()
+                            # Pause until worker has renewed its lease
+                            if not worker_renewed_lease.wait(timeout=10.0):
+                                raise TimeoutError("Timed out waiting for worker to renew lease")
+                        return orig_execute(statement, *args, **kwargs)
+
+                    recovery_sess.execute = hooked_execute  # type: ignore[method-assign]
+                    result = DurableRunWorker.recover_stale_runs(recovery_sess, max_age_seconds=600.0)
+                    recovered_ids.extend(result)
+            except Exception as e:
+                recovery_errors.append(e)
+
+        rec_thread = threading.Thread(target=recovery_worker, daemon=True)
+        rec_thread.start()
+
+        # Deterministically wait for recovery to select the stale row and pause
+        assert recovery_paused_before_update.wait(timeout=10.0), "Recovery did not reach update pause"
+
+        # Worker concurrently renews its heartbeat and extends its lease
         with session_factory() as worker_sess:
-            renewed_time = datetime.now(timezone.utc)
-            new_expiry = renewed_time + timedelta(seconds=30.0)
+            renew_time = datetime.now(timezone.utc)
             worker_sess.execute(
                 update(RunRow)
-                .where(RunRow.id == run_id, RunRow.lease_id == "lease_live_1")
-                .values(heartbeat_at=renewed_time, lease_expires_at=new_expiry)
+                .where(RunRow.id == run_id, RunRow.lease_id == "lease_live_race")
+                .values(
+                    heartbeat_at=renew_time,
+                    lease_expires_at=renew_time + timedelta(seconds=120.0),
+                )
             )
             worker_sess.commit()
 
-        # Now recovery runs
-        with session_factory() as recovery_sess:
-            recovered = DurableRunWorker.recover_stale_runs(recovery_sess, max_age_seconds=600.0)
-            assert run_id not in recovered
+        # Signal recovery thread to proceed with its conditional update
+        worker_renewed_lease.set()
+        rec_thread.join(timeout=10.0)
+
+        assert not recovery_errors, f"Recovery thread error: {recovery_errors}"
+        # Because the conditional update checked lease_expires_at and heartbeat_at, rowcount was 0
+        assert run_id not in recovered_ids
+        assert len(recovered_ids) == 0
 
         # Verify the run is STILL RUNNING in the database
         with session_factory() as check_sess:
@@ -269,6 +318,11 @@ class TestStaleRecoveryAtomicRace:
             assert current is not None
             assert current.status == RunStatus.RUNNING.value
             assert current.failure_type is None
+            hb = current.heartbeat_at
+            if hb is not None and hb.tzinfo is None:
+                hb = hb.replace(tzinfo=timezone.utc)
+            assert hb is not None
+            assert hb >= renew_time - timedelta(seconds=1)
 
     def test_stale_recovery_marks_actually_dead_worker_failed(self, shared_db):
         """Create a RUNNING run with an expired lease that is never renewed.
@@ -405,3 +459,317 @@ class TestLeaseLossObsoleteWorkerIsolation:
             assert current is not None
             assert current.status == RunStatus.FAILED.value
             assert current.failure_type == "DATASET_NOT_FOUND"
+
+
+@pytest.fixture
+def postgres_shared_db():
+    """Live PostgreSQL database connection fixture for real multi-connection concurrency testing.
+
+    Activated when POSTGRES_TEST_URL is configured in the environment (e.g. in CI or local Docker).
+    Skipped gracefully when no PostgreSQL database is available.
+    """
+    import os
+
+    pg_url = os.getenv("POSTGRES_TEST_URL")
+    if not pg_url:
+        pytest.skip("POSTGRES_TEST_URL not set; skipping live PostgreSQL concurrency suite")
+
+    engine = create_engine(pg_url, pool_pre_ping=True)
+    Base.metadata.create_all(bind=engine)
+
+    def session_factory() -> Session:
+        return Session(bind=engine)
+
+    # Seed baseline project and dataset for concurrency tests
+    with session_factory() as sess:
+        sess.execute(delete(RunRow))
+        sess.execute(delete(TestCaseRow))
+        sess.execute(delete(DatasetRow))
+        sess.execute(delete(ProjectRow))
+        sess.commit()
+
+        proj = ProjectRow(id="proj_pg_concurrency", name="PG Concurrency Project")
+        ds = DatasetRow(
+            id="ds_pg_concurrency",
+            project_id="proj_pg_concurrency",
+            name="PG Concurrency Benchmark",
+            version="1.0.0",
+            status=DatasetStatus.PUBLISHED.value,
+            checksum_sha256="fake_pg_checksum",
+        )
+        sess.add(proj)
+        sess.add(ds)
+        sess.commit()
+
+    yield engine, session_factory
+
+    with session_factory() as sess:
+        sess.execute(delete(RunRow))
+        sess.commit()
+    engine.dispose()
+
+
+class TestPostgresConcurrencyHardening:
+    """D. Real multi-threaded concurrency and race-condition tests against PostgreSQL."""
+
+    def test_pg_concurrent_idempotency_same_key_multi_threaded(self, postgres_shared_db):
+        """Concurrently create runs with the same (project_id, idempotency_key) on PostgreSQL.
+
+        Verifies that:
+        1. Exactly 1 row is committed to PostgreSQL.
+        2. All concurrent threads receive the identical run ID.
+        3. No raw IntegrityError escapes to callers.
+        """
+        engine, session_factory = postgres_shared_db
+        idempotency_key = "pg_race_key_unique_888"
+
+        results: list[str] = []
+        errors: list[Exception] = []
+
+        def worker_attempt(thread_idx: int):
+            try:
+                with session_factory() as sess:
+                    repo = DatabaseRepo(sess)
+                    config = RunConfig(
+                        project_id="proj_pg_concurrency",
+                        dataset_id="ds_pg_concurrency",
+                        dataset_version="1.0.0",
+                        system_version="v0.2.0-pg",
+                    )
+                    provenance = _make_provenance()
+                    run = repo.create_run(config, provenance, idempotency_key=idempotency_key)
+                    sess.commit()
+                    return run.id
+            except Exception as e:
+                errors.append(e)
+                raise
+
+        num_threads = 5
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(worker_attempt, i) for i in range(num_threads)]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        assert len(errors) == 0, f"Encountered unexpected errors during concurrent creation: {errors}"
+        assert len(results) == num_threads
+        first_id = results[0]
+        assert all(r_id == first_id for r_id in results), "All threads must receive the identical run ID"
+
+        with session_factory() as verify_sess:
+            stmt = select(RunRow).where(
+                RunRow.project_id == "proj_pg_concurrency",
+                RunRow.idempotency_key == idempotency_key,
+            )
+            matching_runs = verify_sess.scalars(stmt).all()
+            assert len(matching_runs) == 1
+            assert matching_runs[0].id == first_id
+
+    def test_pg_stale_recovery_race_with_heartbeat(self, postgres_shared_db):
+        """Deterministically reproduce stale recovery race on PostgreSQL using threading.Event.
+
+        Verifies recovery's conditional UPDATE affects 0 rows when worker renews heartbeat.
+        """
+        import threading
+
+        engine, session_factory = postgres_shared_db
+        config = RunConfig(
+            project_id="proj_pg_concurrency",
+            dataset_id="ds_pg_concurrency",
+            dataset_version="1.0.0",
+            system_version="v0.2.0-pg",
+        )
+        provenance = _make_provenance()
+
+        now = datetime.now(timezone.utc)
+        expired_time = now - timedelta(seconds=60.0)
+        past_heartbeat = now - timedelta(seconds=700.0)
+
+        with session_factory() as sess:
+            repo = DatabaseRepo(sess)
+            run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
+            run.started_at = past_heartbeat
+            run.heartbeat_at = past_heartbeat
+            run.worker_id = "pg_worker_live"
+            run.lease_id = "pg_lease_live"
+            run.lease_expires_at = expired_time
+            sess.commit()
+            run_id = run.id
+
+        recovery_paused = threading.Event()
+        worker_renewed = threading.Event()
+        recovered_ids: list[str] = []
+        recovery_errors: list[Exception] = []
+
+        def recovery_worker():
+            try:
+                with session_factory() as recovery_sess:
+                    orig_execute = recovery_sess.execute
+
+                    def hooked_execute(statement, *args, **kwargs):
+                        if hasattr(statement, "is_update") and statement.is_update:
+                            recovery_paused.set()
+                            if not worker_renewed.wait(timeout=10.0):
+                                raise TimeoutError("Timed out waiting for worker renewal")
+                        return orig_execute(statement, *args, **kwargs)
+
+                    recovery_sess.execute = hooked_execute  # type: ignore[method-assign]
+                    result = DurableRunWorker.recover_stale_runs(recovery_sess, max_age_seconds=600.0)
+                    recovered_ids.extend(result)
+            except Exception as e:
+                recovery_errors.append(e)
+
+        rec_thread = threading.Thread(target=recovery_worker, daemon=True)
+        rec_thread.start()
+
+        assert recovery_paused.wait(timeout=10.0), "Recovery did not reach update pause on PostgreSQL"
+
+        with session_factory() as worker_sess:
+            renew_time = datetime.now(timezone.utc)
+            worker_sess.execute(
+                update(RunRow)
+                .where(RunRow.id == run_id, RunRow.lease_id == "pg_lease_live")
+                .values(
+                    heartbeat_at=renew_time,
+                    lease_expires_at=renew_time + timedelta(seconds=120.0),
+                )
+            )
+            worker_sess.commit()
+
+        worker_renewed.set()
+        rec_thread.join(timeout=10.0)
+
+        assert not recovery_errors, f"PostgreSQL recovery error: {recovery_errors}"
+        assert run_id not in recovered_ids
+        assert len(recovered_ids) == 0
+
+        with session_factory() as check_sess:
+            current = check_sess.get(RunRow, run_id)
+            assert current is not None
+            assert current.status == RunStatus.RUNNING.value
+            assert current.failure_type is None
+
+    @pytest.mark.asyncio
+    async def test_pg_obsolete_worker_cannot_overwrite_recovered_state(self, postgres_shared_db):
+        """Verify on PostgreSQL that an obsolete worker cannot resurrect a recovered run to COMPLETED."""
+        engine, session_factory = postgres_shared_db
+        from rag_platform.server import CreateRunReq, _execute_evaluation_run
+
+        config = RunConfig(
+            project_id="proj_pg_concurrency",
+            dataset_id="ds_pg_concurrency",
+            dataset_version="1.0.0",
+            system_version="v0.2.0-pg",
+        )
+        provenance = _make_provenance()
+
+        with session_factory() as sess:
+            repo = DatabaseRepo(sess)
+            run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
+            run.worker_id = "pg_worker_obsolete"
+            run.lease_id = "pg_lease_obsolete"
+            sess.commit()
+            run_id = run.id
+
+        test_case = TestCase(
+            id="pg_tc_1",
+            question="What is PostgreSQL?",
+            expected_answer="An open-source relational database.",
+            relevant_documents=[DocumentReference(document_id="pg_doc", chunk_id="c1")],
+            answerability=Answerability.ANSWERABLE,
+        )
+
+        with session_factory() as recovery_sess:
+            recovery_sess.execute(
+                update(RunRow)
+                .where(RunRow.id == run_id)
+                .values(
+                    status=RunStatus.FAILED.value,
+                    finished_at=datetime.now(timezone.utc),
+                    failure_type="STALE_RUNNER_RECOVERY",
+                    failure_reason="Recovered by watchdog",
+                )
+            )
+            recovery_sess.commit()
+
+        req = CreateRunReq(
+            project_id="proj_pg_concurrency",
+            dataset_id="ds_pg_concurrency",
+            system_version="v0.2.0-pg",
+            adapter_type="synthetic",
+        )
+
+        with session_factory() as worker_sess:
+            await _execute_evaluation_run(
+                run_id=run_id,
+                req=req,
+                config=config,
+                ds_cases=[test_case],
+                db_session=worker_sess,
+                expected_lease_id="pg_lease_obsolete",
+            )
+
+        with session_factory() as check_sess:
+            current = check_sess.get(RunRow, run_id)
+            assert current is not None
+            assert current.status == RunStatus.FAILED.value
+            assert current.failure_type == "STALE_RUNNER_RECOVERY"
+
+    @pytest.mark.asyncio
+    async def test_pg_server_execute_evaluation_run_lease_invalidation(self, postgres_shared_db):
+        """Simulate lease invalidation during evaluation on PostgreSQL.
+
+        When expected_lease_id does not match the active DB lease, _execute_evaluation_run must
+        immediately abort without modifying status or committing traces.
+        """
+        engine, session_factory = postgres_shared_db
+        from rag_platform.server import CreateRunReq, _execute_evaluation_run
+
+        config = RunConfig(
+            project_id="proj_pg_concurrency",
+            dataset_id="ds_pg_concurrency",
+            dataset_version="1.0.0",
+            system_version="v0.2.0-pg",
+        )
+        provenance = _make_provenance()
+
+        with session_factory() as sess:
+            repo = DatabaseRepo(sess)
+            run = repo.create_run(config, provenance, initial_status=RunStatus.RUNNING)
+            run.worker_id = "pg_worker_real"
+            run.lease_id = "pg_lease_real"
+            sess.commit()
+            run_id = run.id
+
+        test_case = TestCase(
+            id="pg_tc_inv",
+            question="What is lease invalidation?",
+            expected_answer="Safety barrier.",
+            relevant_documents=[DocumentReference(document_id="pg_doc", chunk_id="c1")],
+            answerability=Answerability.ANSWERABLE,
+        )
+
+        req = CreateRunReq(
+            project_id="proj_pg_concurrency",
+            dataset_id="ds_pg_concurrency",
+            system_version="v0.2.0-pg",
+            adapter_type="synthetic",
+        )
+
+        # Worker calls _execute_evaluation_run with a stale/wrong lease id
+        with session_factory() as worker_sess:
+            await _execute_evaluation_run(
+                run_id=run_id,
+                req=req,
+                config=config,
+                ds_cases=[test_case],
+                db_session=worker_sess,
+                expected_lease_id="pg_stale_lease_999",
+            )
+
+        # Run in DB should not be COMPLETED
+        with session_factory() as check_sess:
+            current = check_sess.get(RunRow, run_id)
+            assert current is not None
+            assert current.status != RunStatus.COMPLETED.value
+            assert current.lease_id == "pg_lease_real"
+

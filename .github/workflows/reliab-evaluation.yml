@@ -13,6 +13,22 @@ jobs:
     permissions:
       contents: read
       checks: write
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: reliab_test
+          POSTGRES_USER: reliab
+          POSTGRES_PASSWORD: reliab_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      POSTGRES_TEST_URL: postgresql+psycopg://reliab:reliab_password@localhost:5432/reliab_test
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -38,7 +54,14 @@ jobs:
         run: |
           mypy src/rag_platform/
 
-      - name: Verify Schema Consistency (Alembic)
+      - name: Verify Schema Consistency (Alembic SQLite)
+        run: |
+          python -c "import alembic.config; alembic.config.main(argv=['upgrade', 'head'])"
+          python -c "import alembic.config; alembic.config.main(argv=['check'])"
+
+      - name: "Migrate PostgreSQL Database (Alembic)"
+        env:
+          DATABASE_URL: postgresql+psycopg://reliab:reliab_password@localhost:5432/reliab_test
         run: |
           python -c "import alembic.config; alembic.config.main(argv=['upgrade', 'head'])"
           python -c "import alembic.config; alembic.config.main(argv=['check'])"
