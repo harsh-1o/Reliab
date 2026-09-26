@@ -25,6 +25,7 @@ def baseline_summary() -> RunMetricsSummary:
         metrics={
             "faithfulness": MetricSummary(metric_name="faithfulness", metric_family=MetricFamily.GENERATION, mean=0.94, p50=0.95, p95=0.98, min=0.8, max=1.0, count=100),
             "recall_at_5": MetricSummary(metric_name="recall_at_5", metric_family=MetricFamily.RETRIEVAL, mean=0.95, p50=1.0, p95=1.0, min=0.8, max=1.0, count=100),
+            "citation_accuracy": MetricSummary(metric_name="citation_accuracy", metric_family=MetricFamily.CITATION, mean=0.97, p50=1.0, p95=1.0, min=0.8, max=1.0, count=100),
         },
         total_cases=100,
         scored_cases=100,
@@ -41,6 +42,7 @@ def compliant_candidate() -> RunMetricsSummary:
         metrics={
             "faithfulness": MetricSummary(metric_name="faithfulness", metric_family=MetricFamily.GENERATION, mean=0.93, p50=0.94, p95=0.98, min=0.8, max=1.0, count=100),
             "recall_at_5": MetricSummary(metric_name="recall_at_5", metric_family=MetricFamily.RETRIEVAL, mean=0.94, p50=1.0, p95=1.0, min=0.8, max=1.0, count=100),
+            "citation_accuracy": MetricSummary(metric_name="citation_accuracy", metric_family=MetricFamily.CITATION, mean=0.96, p50=1.0, p95=1.0, min=0.8, max=1.0, count=100),
         },
         total_cases=100,
         scored_cases=100,

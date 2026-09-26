@@ -489,9 +489,14 @@ class SecurityContext(BaseModel):
 def authenticate_request(
     x_api_key: str | None = None,
     authorization: str | None = None,
+    cookie_token: str | None = None,
     db_session: Any = None,
 ) -> SecurityContext:
-    """Verify API credential and resolve client identity with project memberships."""
+    """Verify API credential and resolve client identity with project memberships.
+
+    Production is fail-closed: If AUTH_ENABLED=true, credentials are strictly required.
+    DEV_MODE can only bypass authentication when AUTH_ENABLED is explicitly false.
+    """
     from rag_platform.core import get_settings
 
     app_settings = get_settings()
@@ -499,16 +504,18 @@ def authenticate_request(
     token = x_api_key
     if not token and authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+    if not token and cookie_token:
+        token = cookie_token.strip()
 
-    # Pass-through as dev admin ONLY when auth is disabled and no credential was supplied
-    if (not app_settings.auth_enabled or app_settings.dev_mode) and not token:
+    # Pass-through as dev admin ONLY when auth is explicitly disabled AND dev_mode is true
+    if not app_settings.auth_enabled and app_settings.dev_mode and not token:
         return SecurityContext(authenticated=True, client_id="dev", is_admin=True)
 
     if not token:
         from fastapi import HTTPException, status
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required: missing API key or Bearer token.",
+            detail="Authentication required: missing API key, Bearer token, or session credential.",
         )
 
     # 1. Check registered client keys (in-memory cache or persistent DB)
@@ -557,8 +564,8 @@ def authorize_project(
     from rag_platform.core import get_settings
 
     app_settings = get_settings()
-    # Dev pass-through only applies when no explicit project memberships exist on dev context
-    if (not app_settings.auth_enabled or app_settings.dev_mode) and context.client_id == "dev" and not context.project_roles:
+    # Dev pass-through only applies when auth is disabled AND dev_mode is true
+    if not app_settings.auth_enabled and app_settings.dev_mode and context.client_id == "dev" and not context.project_roles:
         return
     if context.is_admin:
         return

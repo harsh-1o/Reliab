@@ -27,13 +27,56 @@ function formatMetric(metricObj, isPercentage = true) {
     return { display, sub: `N=${metricObj.count}`, isEvaluated: true };
 }
 
+function getApiKey() {
+    try {
+        return localStorage.getItem('rag_api_key') || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+function setApiKey(key) {
+    try {
+        if (key) localStorage.setItem('rag_api_key', key);
+        else localStorage.removeItem('rag_api_key');
+    } catch (e) {}
+}
+
+function promptApiKey() {
+    const current = getApiKey();
+    const key = prompt("Enter API Key for RAG Reliability Platform:", current);
+    if (key !== null) {
+        setApiKey(key.trim());
+        refreshDashboard();
+    }
+}
+
+async function apiFetch(url, options = {}) {
+    const opts = { ...options };
+    opts.headers = { ...opts.headers };
+    const key = getApiKey();
+    if (key && !opts.headers['X-API-Key'] && !opts.headers['Authorization']) {
+        opts.headers['X-API-Key'] = key;
+    }
+    const res = await fetch(url, opts);
+    if (res.status === 401) {
+        const inputKey = prompt("Authentication Required (401). Enter API Key:");
+        if (inputKey) {
+            setApiKey(inputKey.trim());
+            opts.headers['X-API-Key'] = inputKey.trim();
+            return fetch(url, opts);
+        }
+    }
+    return res;
+}
+
 async function init() {
     await fetchRuns();
 }
 
 async function fetchRuns() {
     try {
-        const res = await fetch('/v1/runs');
+        const res = await apiFetch('/v1/runs');
         const data = await res.json();
         const runs = data.runs || [];
         const selector = document.getElementById('run-select');
@@ -66,7 +109,7 @@ async function loadSelectedRun() {
     if (!selector) return;
     const runId = selector.value;
     if (!runId) return;
-    const res = await fetch(`/v1/runs/${encodeURIComponent(runId)}`);
+    const res = await apiFetch(`/v1/runs/${encodeURIComponent(runId)}`);
     currentRun = await res.json();
     renderRunDashboard(currentRun, baselineRun);
     await loadTraces(runId);
@@ -74,7 +117,7 @@ async function loadSelectedRun() {
 
 async function loadTraces(runId, failureOnly = false) {
     try {
-        const res = await fetch(`/v1/runs/${encodeURIComponent(runId)}/traces?failure_only=${failureOnly}`);
+        const res = await apiFetch(`/v1/runs/${encodeURIComponent(runId)}/traces?failure_only=${failureOnly}`);
         const data = await res.json();
         runTraces = data.traces || [];
         renderTraceTable(runTraces);
@@ -144,15 +187,17 @@ function renderRunDashboard(run, baseline) {
                 <p>Policy: <code>${policyId}</code> | Evaluated ${escapeHtml(String(run.trace_count || 0))} test cases on benchmark <code>${escapeHtml(run.dataset_id || '')}</code> against commit <code>${escapeHtml(run.system_version || '')}</code>.</p>
                 ${violations.length > 0 ? `
                     <div style="margin-top:10px; display:flex; flex-direction:column; gap:6px;">
-                        ${violations.map(v => `
+                        ${violations.map(v => {
+                            const opSymbol = v.operator === '<=' ? '&le;' : (v.operator === '<' ? '&lt;' : (v.operator === '>' ? '&gt;' : '&ge;'));
+                            return `
                             <div class="violation-box" style="padding:6px 10px; background:#fff2f0; border-left:3px solid #ff4d4f; border-radius:4px; font-size:12px;">
                                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                                    <span><strong>${escapeHtml(v.metric_name)}</strong> &mdash; Candidate: <strong>${v.candidate_value !== undefined && v.candidate_value !== null ? escapeHtml(String(v.candidate_value)) : 'N/A'}</strong> | Required: <strong>&ge; ${escapeHtml(String(v.threshold))}</strong></span>
+                                    <span><strong>${escapeHtml(v.metric_name)}</strong> &mdash; Candidate: <strong>${v.candidate_value !== undefined && v.candidate_value !== null ? escapeHtml(String(v.candidate_value)) : 'N/A'}</strong> | Required: <strong>${opSymbol} ${escapeHtml(String(v.threshold))}</strong></span>
                                     <span class="chip chip-fail" style="font-size:10px; padding:2px 6px;">${escapeHtml(v.violation_type || 'THRESHOLD_BREACH')}</span>
                                 </div>
                                 <div style="color:#555; margin-top:3px;">${escapeHtml(v.message || '')}</div>
                             </div>
-                        `).join('')}
+                        `;}).join('')}
                     </div>
                 ` : ''}
             </div>
@@ -402,7 +447,7 @@ function renderEmptyState(msg) {
 
 async function triggerSeedRun() {
     try {
-        const res = await fetch('/v1/demo-run', { method: 'POST' });
+        const res = await apiFetch('/v1/demo-run', { method: 'POST' });
         const data = await res.json();
         if (data.status === 'SUCCESS') {
             await fetchRuns();

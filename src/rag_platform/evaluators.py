@@ -919,8 +919,12 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
             with self._get_session() as sess:
                 row = sess.get(EvaluationCacheRow, key)
                 if row:
-                    row.last_accessed_at = datetime.now(timezone.utc)
-                    sess.commit()
+                    now = datetime.now(timezone.utc)
+                    last_acc = row.last_accessed_at.replace(tzinfo=timezone.utc) if row.last_accessed_at.tzinfo is None else row.last_accessed_at
+                    # Throttle last_accessed_at DB writes to at most once per 5 minutes per cached entry
+                    if (now - last_acc).total_seconds() > 300:
+                        row.last_accessed_at = now
+                        sess.commit()
                     self.hits += 1
                     data = json.loads(row.result_json)
                     return MetricResult.model_validate(data)
@@ -951,20 +955,24 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
                         last_accessed_at=now,
                     )
                     sess.add(new_row)
+                    sess.flush()
 
-                    # Enforce capacity bound by pruning oldest accessed entries if limit exceeded
-                    total_count = sess.scalar(select(func.count(EvaluationCacheRow.cache_key))) or 0
-                    if total_count > self.capacity:
-                        oldest_subq = (
-                            select(EvaluationCacheRow.cache_key)
-                            .order_by(EvaluationCacheRow.last_accessed_at.asc())
-                            .limit(total_count - self.capacity)
-                        )
-                        sess.execute(
-                            delete(EvaluationCacheRow).where(
-                                EvaluationCacheRow.cache_key.in_(oldest_subq)
+                    # Prune when count exceeds capacity (bounded by oldest accessed)
+                    self._set_counter = getattr(self, "_set_counter", 0) + 1
+                    prune_interval = max(1, min(50, self.capacity))
+                    if self._set_counter >= self.capacity and (self._set_counter % prune_interval == 0 or self._set_counter > self.capacity):
+                        total_count = sess.scalar(select(func.count(EvaluationCacheRow.cache_key))) or 0
+                        if total_count > self.capacity:
+                            oldest_subq = (
+                                select(EvaluationCacheRow.cache_key)
+                                .order_by(EvaluationCacheRow.last_accessed_at.asc(), EvaluationCacheRow.created_at.asc())
+                                .limit(total_count - self.capacity)
+                            ).scalar_subquery()
+                            sess.execute(
+                                delete(EvaluationCacheRow).where(
+                                    EvaluationCacheRow.cache_key.in_(oldest_subq)
+                                )
                             )
-                        )
                 sess.commit()
         except Exception as exc:
             logger.debug("DatabaseEvaluationCache set error: %s", exc)
@@ -1220,8 +1228,8 @@ class EvaluationEngine:
             )
 
         total_cases = len(traces_with_metrics)
-        hallucination_rate = round(hallucinations / total_cases, 4) if total_cases > 0 else 0.0
-        abstention_acc = round(sum(abstention_scores) / len(abstention_scores), 4) if abstention_scores else 1.0
+        hallucination_rate = round(hallucinations / total_cases, 4) if total_cases > 0 else None
+        abstention_acc = round(sum(abstention_scores) / len(abstention_scores), 4) if abstention_scores else None
 
         sorted_latencies = sorted(latencies) if latencies else [0]
         p95_lat = sorted_latencies[min(int(len(sorted_latencies) * 0.95), len(sorted_latencies) - 1)]
@@ -1237,6 +1245,7 @@ class EvaluationEngine:
             total_cases=total_cases,
             scored_cases=total_cases,
             hallucination_rate=hallucination_rate,
+            low_faithfulness_rate=hallucination_rate,
             abstention_accuracy=abstention_acc,
             p95_latency_ms=float(p95_lat),
             total_cost_usd=round(total_cost, 4),

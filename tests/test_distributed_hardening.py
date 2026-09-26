@@ -208,6 +208,7 @@ class TestWorkerNotificationBusAndAdaptiveLoop:
                 min_interval=0.05,
                 max_interval=0.2,
                 stale_check_interval=100.0,
+                session_factory=session_factory,
             )
         )
 

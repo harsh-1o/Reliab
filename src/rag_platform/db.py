@@ -20,7 +20,8 @@ from sqlalchemy import (
     func,
     select,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+import threading
 
 from rag_platform.core import (
     ImmutabilityError,
@@ -28,7 +29,7 @@ from rag_platform.core import (
     settings,
     sha256_hash,
 )
-from rag_platform.security import RecursiveTraceSanitizer
+from rag_platform.security import RecursiveTraceSanitizer, SecretRedactor
 from rag_platform.models import (
     DatasetStatus,
     DocumentReference,
@@ -80,7 +81,7 @@ class TestCaseRow(Base):
     __tablename__ = "test_cases"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), nullable=False)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), primary_key=True)
     question: Mapped[str] = mapped_column(Text, nullable=False)
     expected_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     expected_facts_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -125,6 +126,11 @@ class RunRow(Base):
     summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     gate_result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     gate_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # Distributed Worker Lease & Ownership Fields (Points 8 & 31)
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
     traces: Mapped[list[TraceRow]] = relationship("TraceRow", back_populates="run", cascade="all, delete-orphan")
 
@@ -211,14 +217,53 @@ class EvaluationCacheRow(Base):
 
 
 # --- Database Operations & Repository ---
-def create_db_engine(db_url: str | None = None):
+_engines: dict[str, Any] = {}
+_sessionmakers: dict[str, sessionmaker[Session]] = {}
+_db_lock = threading.RLock()
+
+
+def get_db_engine(db_url: str | None = None):
+    """Retrieve or create application-wide singleton database engine with connection pooling."""
     url = db_url or settings.database_url
-    return create_engine(url, echo=False)
+    with _db_lock:
+        if url not in _engines:
+            connect_args = {}
+            if url.startswith("sqlite"):
+                connect_args["check_same_thread"] = False
+            _engines[url] = create_engine(url, echo=False, pool_pre_ping=True, connect_args=connect_args)
+        return _engines[url]
+
+
+def get_sessionmaker(db_url: str | None = None) -> sessionmaker[Session]:
+    """Retrieve or create application-wide singleton sessionmaker."""
+    url = db_url or settings.database_url
+    with _db_lock:
+        if url not in _sessionmakers:
+            eng = get_db_engine(url)
+            _sessionmakers[url] = sessionmaker(bind=eng, autoflush=False, expire_on_commit=False)
+        return _sessionmakers[url]
+
+
+def create_db_engine(db_url: str | None = None):
+    return get_db_engine(db_url)
 
 
 def create_session(db_url: str | None = None) -> Session:
-    """Create a new SQLAlchemy session connected to the configured database."""
-    return Session(create_db_engine(db_url))
+    """Create a new SQLAlchemy session using application-wide sessionmaker and shared engine pool."""
+    sm = get_sessionmaker(db_url)
+    return sm()
+
+
+def reset_engine_cache() -> None:
+    """Dispose and clear cached engines (used in test isolation)."""
+    with _db_lock:
+        for eng in _engines.values():
+            try:
+                eng.dispose()
+            except Exception:
+                pass
+        _engines.clear()
+        _sessionmakers.clear()
 
 
 def init_db(engine=None, allow_non_memory: bool = False) -> None:
@@ -351,7 +396,18 @@ class DatabaseRepo:
         provenance: RunProvenance,
         initial_status: RunStatus = RunStatus.CREATED,
         options_override_json: str | None = None,
+        idempotency_key: str | None = None,
     ) -> RunRow:
+        if idempotency_key:
+            existing = self.session.scalar(
+                select(RunRow).where(
+                    RunRow.project_id == config.project_id,
+                    RunRow.idempotency_key == idempotency_key,
+                )
+            )
+            if existing:
+                return existing
+
         ds = self.session.get(DatasetRow, config.dataset_id)
         if not ds:
             raise ValueError(f"Dataset {config.dataset_id} not found.")
@@ -374,10 +430,30 @@ class DatabaseRepo:
             policy_id=config.policy_id,
             suite=config.suite,
             options_json=options_override_json or config.options.model_dump_json(),
+            idempotency_key=idempotency_key,
         )
         self.session.add(run)
         self.session.flush()
         return run
+
+    def purge_expired_data(self, trace_retention_days: int = 90) -> dict[str, int]:
+        """Purge historical evaluation traces older than retention threshold (Point 33)."""
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=trace_retention_days)
+        # Find runs finished before cutoff
+        expired_runs = self.session.scalars(
+            select(RunRow).where(
+                RunRow.finished_at != None,
+                RunRow.finished_at < cutoff,
+            )
+        ).all()
+        purged_traces = 0
+        for r in expired_runs:
+            count = len(r.traces)
+            r.traces.clear()
+            purged_traces += count
+        self.session.flush()
+        return {"expired_runs_evaluated": len(expired_runs), "purged_traces": purged_traces}
 
     def record_trace(
         self,
@@ -431,8 +507,9 @@ class DatabaseRepo:
             self.session.flush()
 
         if attribution:
+            clean_evidence = RecursiveTraceSanitizer.sanitize_value(attribution.evidence)
             evidence_payload = {
-                **attribution.evidence,
+                **(clean_evidence if isinstance(clean_evidence, dict) else {}),
                 "recommended_actions": attribution.recommended_actions,
             }
             f_row = FailureRow(
@@ -442,7 +519,7 @@ class DatabaseRepo:
                 failure_type=attribution.failure_type.value,
                 severity=attribution.severity.value,
                 confidence=attribution.confidence,
-                explanation=attribution.explanation,
+                explanation=SecretRedactor.redact_text(attribution.explanation),
                 evidence_json=json.dumps(evidence_payload),
             )
             self.session.add(f_row)

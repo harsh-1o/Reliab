@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from enum import Enum
 from typing import Any, Callable, Protocol
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -114,10 +114,17 @@ class HttpRagAdapter:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._shared_client is not None and not self._shared_client.is_closed:
             return self._shared_client
+        from rag_platform.ssrf import SSRFProtectedTransport
+        transport = SSRFProtectedTransport(
+            allowed_hosts=self.allowed_hosts,
+            allow_private_ips=self.allow_private_ip,
+            dns_resolver=self.dns_resolver,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
         self._shared_client = httpx.AsyncClient(
+            transport=transport,
             timeout=self.timeout_seconds,
             follow_redirects=False,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
         self._owns_client = True
         return self._shared_client
@@ -145,7 +152,7 @@ class HttpRagAdapter:
         try:
             current_url = self.endpoint_url
             # Pre-flight SSRF validation immediately before connecting
-            validate_url_ssrf(
+            validated_ips = validate_url_ssrf(
                 current_url,
                 allowed_hosts=self.allowed_hosts,
                 allow_private_ips=self.allow_private_ip,
@@ -154,12 +161,43 @@ class HttpRagAdapter:
 
             client = await self._get_client()
 
+            # Pin validated host IP on transport if supported
+            if hasattr(client, "_transport") and hasattr(client._transport, "pin_host"):
+                parsed_host = urlsplit(current_url).hostname
+                if parsed_host and validated_ips:
+                    client._transport.pin_host(parsed_host, validated_ips[0])
+
             # Follow redirects manually with strict SSRF validation at every hop
             max_redirects = 5
             redirect_count = 0
+            max_retries = 3
+            retry_count = 0
+            retry_status_codes = {429, 502, 503, 504}
 
             while True:
-                resp = await client.post(current_url, json=payload, headers=self.headers)
+                try:
+                    resp = await client.post(current_url, json=payload, headers=self.headers)
+                except (httpx.ConnectError, httpx.RemoteProtocolError) as net_err:
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        backoff = min(2.0, 0.25 * (2 ** retry_count)) + 0.05
+                        await asyncio.sleep(backoff)
+                        continue
+                    raise net_err
+
+                # Transient server / rate limit retries (429, 502, 503, 504)
+                if resp.status_code in retry_status_codes and retry_count < max_retries:
+                    retry_count += 1
+                    retry_after = resp.headers.get("retry-after")
+                    backoff = min(2.0, 0.25 * (2 ** retry_count)) + 0.05
+                    if retry_after:
+                        try:
+                            backoff = min(5.0, float(retry_after))
+                        except ValueError:
+                            pass
+                    await asyncio.sleep(backoff)
+                    continue
+
                 if resp.is_redirect and "location" in resp.headers:
                     redirect_count += 1
                     if redirect_count > max_redirects:
@@ -167,12 +205,16 @@ class HttpRagAdapter:
                     location = resp.headers["location"]
                     current_url = urljoin(current_url, location)
                     # Revalidate every redirect destination before following
-                    validate_url_ssrf(
+                    redirect_ips = validate_url_ssrf(
                         current_url,
                         allowed_hosts=self.allowed_hosts,
                         allow_private_ips=self.allow_private_ip,
                         dns_resolver=self.dns_resolver,
                     )
+                    if hasattr(client, "_transport") and hasattr(client._transport, "pin_host"):
+                        redir_host = urlsplit(current_url).hostname
+                        if redir_host and redirect_ips:
+                            client._transport.pin_host(redir_host, redirect_ips[0])
                     continue
                 break
 
@@ -188,7 +230,11 @@ class HttpRagAdapter:
                     question=case.question,
                     error_code="OPS-01",
                     latency_ms=latency_ms,
-                    telemetry={"http_status": resp.status_code, "body": safe_body},
+                    telemetry={
+                        "http_status": resp.status_code,
+                        "body": safe_body,
+                        "retries": retry_count,
+                    },
                 )
 
             data = resp.json()

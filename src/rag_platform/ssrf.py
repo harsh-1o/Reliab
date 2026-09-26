@@ -283,3 +283,105 @@ def validate_url_ssrf(
         resolved_ips.append(ip_str)
 
     return resolved_ips
+
+
+# --- DNS Rebinding Protection via Transport-Level IP Pinning ---
+from httpcore._backends.auto import AutoBackend
+import httpx
+
+
+class SSRFPinningNetworkBackend(AutoBackend):
+    """Network backend that connects directly to pre-validated IP addresses, preventing DNS rebinding.
+
+    Guarantees that the socket connects to an already-validated IP address and never
+    performs a second unbound DNS lookup that could resolve to a private/loopback/metadata IP.
+    Preserves TLS SNI and HTTP Host headers for correct virtual hosting and SSL certificate validation.
+    """
+
+    def __init__(
+        self,
+        ip_pins: dict[str, str] | None = None,
+        allowed_hosts: set[str] | list[str] | None = None,
+        allow_private_ips: bool = False,
+        dns_resolver: Callable[[str, int], list[str]] | None = None,
+    ) -> None:
+        super().__init__()
+        self.ip_pins: dict[str, str] = {k.lower(): v for k, v in (ip_pins or {}).items()}
+        self.allowed_hosts = allowed_hosts
+        self.allow_private_ips = allow_private_ips
+        self.dns_resolver = dns_resolver
+
+    def pin_host(self, host: str, ip: str) -> None:
+        self.ip_pins[host.strip().lower()] = ip
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        clean_host = host.strip().lower()
+        target_ip = self.ip_pins.get(clean_host)
+
+        if target_ip is None:
+            # Validate URL/host and resolve IP immediately at socket creation time
+            url_to_validate = f"http://{clean_host}:{port}"
+            valid_ips = validate_url_ssrf(
+                url_to_validate,
+                allowed_hosts=self.allowed_hosts,
+                allow_private_ips=self.allow_private_ips,
+                dns_resolver=self.dns_resolver,
+            )
+            target_ip = valid_ips[0]
+            self.ip_pins[clean_host] = target_ip
+        else:
+            # Enforce that the pinned IP itself is still strictly safe
+            if not self.allow_private_ips:
+                try:
+                    ip_obj = ipaddress.ip_address(target_ip)
+                    if not is_ip_allowed(ip_obj):
+                        raise SSRFProtectionError(
+                            f"Pinned IP '{target_ip}' for host '{host}' is disallowed private/reserved IP"
+                        )
+                except ValueError as exc:
+                    raise SSRFProtectionError(f"Invalid pinned IP '{target_ip}': {exc}") from exc
+
+        await self._init_backend()
+        # Connect TCP socket directly to target_ip, while httpcore/httpx retains server_hostname for TLS SNI
+        return await self._backend.connect_tcp(
+            target_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+
+class SSRFProtectedTransport(httpx.AsyncHTTPTransport):
+    """Custom httpx AsyncHTTPTransport configured with SSRFPinningNetworkBackend.
+
+    Guarantees that socket-level connections use pinned, pre-validated IP addresses.
+    """
+
+    def __init__(
+        self,
+        ip_pins: dict[str, str] | None = None,
+        allowed_hosts: set[str] | list[str] | None = None,
+        allow_private_ips: bool = False,
+        dns_resolver: Callable[[str, int], list[str]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.pinning_backend = SSRFPinningNetworkBackend(
+            ip_pins=ip_pins,
+            allowed_hosts=allowed_hosts,
+            allow_private_ips=allow_private_ips,
+            dns_resolver=dns_resolver,
+        )
+        self._pool._network_backend = self.pinning_backend
+
+    def pin_host(self, host: str, ip: str) -> None:
+        self.pinning_backend.pin_host(host, ip)
+

@@ -43,10 +43,11 @@ jobs:
         run: |
           pytest tests/ -v --junit-xml=test-results/unit-tests.xml
 
-      - name: Seed Benchmark & Execute RAG Quality Gate (Fail-Closed)
+      - name: Platform Self-Test: Evaluator & Synthetic Quality Gate Verification
         run: |
           python -m rag_platform.gate \
             --bootstrap \
+            --adapter-type synthetic \
             --project proj_ci \
             --dataset ds_ci_benchmark \
             --system-version ${{ github.sha }} \

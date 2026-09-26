@@ -90,23 +90,38 @@ def compute_manifest_hash(
     return prov.compute_hash()
 
 # --- Config ---
+# --- Config ---
+def _is_production_environment() -> bool:
+    env = os.getenv("ENVIRONMENT", os.getenv("APP_ENV", os.getenv("DEPLOYMENT_ENV", ""))).lower()
+    return env in ("production", "prod", "staging")
+
+
 def _resolve_api_key() -> str:
     """Resolve API key from environment.
 
     Fails startup with a clear error if running in production mode (DEV_MODE=false / AUTH_ENABLED=true)
     and no key is configured, preventing a silent insecure default.
     """
-    key = os.getenv("RAG_PLATFORM_API_KEY", "")
-    auth_enabled = os.getenv("AUTH_ENABLED", "false").lower() in ("true", "1")
-    dev_mode = os.getenv("DEV_MODE", "true").lower() in ("true", "1")
+    is_prod = _is_production_environment()
+    default_auth = "true" if is_prod else "false"
+    default_dev = "false" if is_prod else "true"
 
+    auth_enabled = os.getenv("AUTH_ENABLED", default_auth).lower() in ("true", "1")
+    dev_mode = os.getenv("DEV_MODE", default_dev).lower() in ("true", "1")
+
+    if is_prod and dev_mode:
+        raise RuntimeError(
+            "STARTUP FAILURE: Application refusing to start with DEV_MODE=true in a deployment environment. "
+            "Set DEV_MODE=false and configure AUTH_ENABLED=true."
+        )
+
+    key = os.getenv("RAG_PLATFORM_API_KEY", "")
     if auth_enabled and not dev_mode:
         if not key or len(key) < 32:
             raise RuntimeError(
                 "STARTUP FAILURE: AUTH_ENABLED=true but RAG_PLATFORM_API_KEY is not set or is too short (<32 chars). "
                 "Set a strong secret via RAG_PLATFORM_API_KEY env variable, or set DEV_MODE=true for local development."
             )
-    # Development-mode fallback (never used when auth is enforced)
     return key or "dev-secret-key-REPLACE-IN-PRODUCTION-32+"
 
 
@@ -116,11 +131,17 @@ class Settings:
         default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///./rag_platform.db")
     )
     auth_enabled: bool = field(
-        default_factory=lambda: os.getenv("AUTH_ENABLED", "false").lower() in ("true", "1")
+        default_factory=lambda: os.getenv(
+            "AUTH_ENABLED",
+            "true" if _is_production_environment() else "false",
+        ).lower() in ("true", "1")
     )
     api_key: str = field(default_factory=_resolve_api_key)
     dev_mode: bool = field(
-        default_factory=lambda: os.getenv("DEV_MODE", "true").lower() in ("true", "1")
+        default_factory=lambda: os.getenv(
+            "DEV_MODE",
+            "false" if _is_production_environment() else "true",
+        ).lower() in ("true", "1")
     )
     default_max_cases: int = 500
     default_timeout_seconds: int = 60
@@ -130,4 +151,5 @@ settings = Settings()
 
 def get_settings() -> Settings:
     return settings
+
 

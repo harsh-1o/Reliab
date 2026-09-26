@@ -32,6 +32,10 @@ dev = [
     "pytest-cov>=4.0.0",
 ]
 
+[project.scripts]
+rag-platform-worker = "rag_platform.worker:main"
+rag-platform-gate = "rag_platform.gate:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

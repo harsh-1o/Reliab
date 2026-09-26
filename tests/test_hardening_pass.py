@@ -205,6 +205,11 @@ def test_backend_release_gate_included_in_run_api(in_memory_db, client):
             metric_family=MetricFamily.RETRIEVAL,
             score=0.95,
         ),
+        MetricResult(
+            metric_name="citation_accuracy",
+            metric_family=MetricFamily.GENERATION,
+            score=0.99,
+        ),
     ]
     repo.record_trace(trace, metrics)
     in_memory_db.commit()

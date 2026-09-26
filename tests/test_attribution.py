@@ -99,8 +99,17 @@ async def test_diagnose_broken_citation(eval_engine, attr_engine, answerable_cas
 
     diag = attr_engine.diagnose(trace, answerable_case, metrics)
     assert diag is not None
-    assert diag.failure_type == FailureCode.CIT_01
+    # Misattributed chunk text produces CIT_02 (Point 20)
+    assert diag.failure_type == FailureCode.CIT_02
     assert "wrong_doc_404" in str(diag.evidence)
+
+    # Completely unretrieved chunk produces CIT_01 (Point 20)
+    from rag_platform.models import Citation
+    trace_unretrieved = trace.model_copy(update={
+        "citations": [Citation(claim_id="cl_1", claim_text="Fact", document_id="never_retrieved_doc", chunk_id="never_retrieved_chunk")]
+    })
+    diag_unretrieved = attr_engine.diagnose(trace_unretrieved, answerable_case, metrics)
+    assert diag_unretrieved.failure_type == FailureCode.CIT_01
 
 
 @pytest.mark.asyncio

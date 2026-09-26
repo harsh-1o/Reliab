@@ -215,6 +215,7 @@ class MetricResult(BaseModel):
     status: MetricStatus = MetricStatus.PASS
     reason: str | None = None
     evaluator_version: str = "2.0.0"
+    evaluator_type: str = "deterministic_heuristic"
     cached: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -239,8 +240,9 @@ class RunMetricsSummary(BaseModel):
     metrics: dict[str, MetricSummary] = Field(default_factory=dict)
     total_cases: int = 0
     scored_cases: int = 0
-    hallucination_rate: float = 0.0
-    abstention_accuracy: float = 1.0
+    hallucination_rate: float | None = None
+    low_faithfulness_rate: float | None = None
+    abstention_accuracy: float | None = None
     infra_error_count: int = 0
     p95_latency_ms: float = 0.0
     total_cost_usd: float = 0.0
@@ -349,6 +351,9 @@ class RunProvenance(BaseModel):
         return sha256_hash(canonical_json(self.canonical_manifest()))
 
     def model_post_init(self, __context: Any) -> None:
+        from rag_platform.security import SecretRedactor
+        if self.adapter_config:
+            self.adapter_config = SecretRedactor.redact_dict(self.adapter_config)
         if self.model_parameters and not self.model_config_hash:
             self.model_config_hash = sha256_hash(canonical_json(self.model_parameters))
         elif self.model_config_hash == "default_model_config_hash":
@@ -361,13 +366,21 @@ class RunProvenance(BaseModel):
             self.prompt_hash = sha256_hash(self.prompt_template)
         if self.system_prompt and not self.system_prompt_hash:
             self.system_prompt_hash = sha256_hash(self.system_prompt)
+        if not self.dependency_lock_hash:
+            try:
+                from pathlib import Path
+                lock_file = Path("requirements.lock")
+                if lock_file.exists():
+                    self.dependency_lock_hash = sha256_hash(lock_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
         if not self.manifest_hash:
             self.manifest_hash = self.compute_hash()
 
 
 class RunOptions(BaseModel):
-    max_cases: int | None = None
-    concurrency: int = 5
+    max_cases: int | None = Field(default=500, ge=1, le=10000)
+    concurrency: int = Field(default=5, ge=1, le=100)
     timeout_seconds: float = 60.0
     fail_fast: bool = False
     use_cache: bool = True
@@ -391,6 +404,8 @@ class MetricRegressionPolicy(BaseModel):
     # Regression limits relative to baseline
     max_absolute_drop: float | None = None
     max_relative_drop_pct: float | None = None
+    # Missing data handling (default is fail-closed)
+    allow_missing: bool = False
     # Legacy aliases kept for backward compatibility
     min_absolute_score: float | None = None       # alias → min_candidate_value
     max_absolute_score: float | None = None       # alias → max_candidate_value
@@ -428,6 +443,7 @@ class GateViolation(BaseModel):
     baseline_value: float | None = None
     candidate_value: float | None = None
     threshold: float
+    operator: str | None = None
     violation_type: str
     message: str
 

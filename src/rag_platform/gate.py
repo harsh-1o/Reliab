@@ -217,6 +217,8 @@ def execute_gate_evaluation(
     mock_mode: SyntheticRagMode = SyntheticRagMode.PERFECT,
     junit_xml_path: str | None = None,
     bootstrap: bool = False,
+    adapter_type: str = "synthetic",
+    endpoint_url: str | None = None,
 ) -> tuple[int, GateResult]:
     """Execute evaluation run and evaluate against policy gate. Returns (exit_code, GateResult)."""
     if bootstrap:
@@ -229,15 +231,16 @@ def execute_gate_evaluation(
     if not ds_row:
         raise ValueError(f"Dataset {dataset_id} not found. Use --bootstrap to seed benchmark datasets automatically.")
 
+    actual_adapter_type = "http" if (adapter_type == "http" and endpoint_url) else f"synthetic:{mock_mode.value}"
     provenance = RunProvenance(
         dataset_checksum=ds_row.checksum_sha256,
         dataset_id=dataset_id,
         dataset_version=ds_row.version,
         rag_version=system_version,
-        model_name="synthetic-benchmark-engine",
+        model_name="rag-benchmark-engine",
         model_version="1.0.0",
         evaluator_version="2.0.0",
-        adapter_type=f"synthetic:{mock_mode.value}",
+        adapter_type=actual_adapter_type,
         environment_info={"ci": "true", "platform": sys.platform, "python": sys.version.split()[0]},
     )
 
@@ -253,7 +256,12 @@ def execute_gate_evaluation(
     repo.update_run_status(run.id, RunStatus.RUNNING)
     db_session.commit()
 
-    adapter = SyntheticRagAdapter(mock_mode)
+    if adapter_type == "http" and endpoint_url:
+        from rag_platform.adapters import HttpRagAdapter
+        adapter = HttpRagAdapter(endpoint_url=endpoint_url)
+    else:
+        adapter = SyntheticRagAdapter(mock_mode)
+
     eval_engine = EvaluationEngine()
     attr_engine = FailureAttributionEngine()
 
@@ -289,11 +297,13 @@ def execute_gate_evaluation(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RAG Reliability CI/CD Quality Gate")
+    parser = argparse.ArgumentParser(description="RAG Reliability CI/CD Quality Gate & Platform Self-Test")
     parser.add_argument("--project", required=True, help="Project ID")
     parser.add_argument("--dataset", required=True, help="Published Dataset ID")
     parser.add_argument("--system-version", required=True, help="Candidate RAG Git commit SHA")
     parser.add_argument("--policy", default="prod-default", help="Release policy ID")
+    parser.add_argument("--adapter-type", default="synthetic", choices=["synthetic", "http"], help="Adapter type (Points 15)")
+    parser.add_argument("--endpoint-url", default=None, help="HTTP SUT endpoint URL when evaluating real RAG system")
     parser.add_argument("--mock-mode", default="PERFECT", choices=[m.value for m in SyntheticRagMode])
     parser.add_argument("--junit-xml", default=None, help="Path to write JUnit XML test results")
     parser.add_argument(
@@ -306,7 +316,9 @@ def main():
     args = parser.parse_args()
 
     engine = create_db_engine()
-    Base.metadata.create_all(bind=engine)
+    if args.bootstrap:
+        from rag_platform.db import init_db
+        init_db(engine, allow_non_memory=True)
 
     with Session(engine) as session:
         mode = SyntheticRagMode(args.mock_mode)
@@ -318,10 +330,13 @@ def main():
             mock_mode=mode,
             junit_xml_path=args.junit_xml,
             bootstrap=args.bootstrap,
+            adapter_type=args.adapter_type,
+            endpoint_url=args.endpoint_url,
         )
 
+    mode_label = "Platform Self-Test (Synthetic)" if args.adapter_type == "synthetic" else "Production SUT Release Gate"
     print("\n" + "=" * 60)
-    print(f"RAG CI/CD RELEASE QUALITY GATE: [{gate.status.value}]")
+    print(f"RAG CI/CD RELEASE QUALITY GATE: [{gate.status.value}] ({mode_label})")
     print(f"Candidate Run ID: {gate.candidate_run_id}")
     print(f"Policy: {gate.policy_id}")
     print("=" * 60)

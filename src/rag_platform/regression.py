@@ -229,6 +229,7 @@ class RegressionEngine:
                     metric_name="faithfulness",
                     candidate_value=None,
                     threshold=policy.min_faithfulness,
+                    operator=">=",
                     violation_type="MISSING_DATA",
                     message=f"Faithfulness metric is missing or unmeasured; cannot satisfy required minimum {policy.min_faithfulness:.3f}.",
                 )
@@ -239,6 +240,7 @@ class RegressionEngine:
                     metric_name="faithfulness",
                     candidate_value=cand_faith.mean,
                     threshold=policy.min_faithfulness,
+                    operator=">=",
                     violation_type="THRESHOLD_BREACH",
                     message=f"Faithfulness {cand_faith.mean:.3f} fell below required minimum {policy.min_faithfulness:.3f}.",
                 )
@@ -252,6 +254,7 @@ class RegressionEngine:
                     metric_name="recall_at_5",
                     candidate_value=None,
                     threshold=policy.min_retrieval_recall,
+                    operator=">=",
                     violation_type="MISSING_DATA",
                     message=f"Recall@5 metric is missing or unmeasured; cannot satisfy required minimum {policy.min_retrieval_recall:.3f}.",
                 )
@@ -262,6 +265,7 @@ class RegressionEngine:
                     metric_name="recall_at_5",
                     candidate_value=cand_recall.mean,
                     threshold=policy.min_retrieval_recall,
+                    operator=">=",
                     violation_type="THRESHOLD_BREACH",
                     message=f"Recall@5 {cand_recall.mean:.3f} fell below required minimum {policy.min_retrieval_recall:.3f}.",
                 )
@@ -269,36 +273,51 @@ class RegressionEngine:
 
         # 3. Citation Accuracy Threshold
         cand_cit = candidate.metrics.get("citation_accuracy")
-        if cand_cit and cand_cit.count > 0 and cand_cit.mean < policy.min_citation_accuracy:
+        if cand_cit is None or cand_cit.count == 0:
+            if getattr(policy, "min_citation_accuracy", None) is not None:
+                violations.append(
+                    GateViolation(
+                        metric_name="citation_accuracy",
+                        candidate_value=None,
+                        threshold=policy.min_citation_accuracy,
+                        operator=">=",
+                        violation_type="MISSING_DATA",
+                        message=f"Citation accuracy metric is missing or unmeasured; cannot satisfy required minimum {policy.min_citation_accuracy:.3f}.",
+                    )
+                )
+        elif cand_cit.mean < policy.min_citation_accuracy:
             violations.append(
                 GateViolation(
                     metric_name="citation_accuracy",
                     candidate_value=cand_cit.mean,
                     threshold=policy.min_citation_accuracy,
+                    operator=">=",
                     violation_type="THRESHOLD_BREACH",
                     message=f"Citation accuracy {cand_cit.mean:.3f} fell below required {policy.min_citation_accuracy:.3f}.",
                 )
             )
 
         # 4. Hallucination Rate Cap
-        if candidate.hallucination_rate > policy.max_hallucination_rate:
+        if candidate.hallucination_rate is not None and candidate.hallucination_rate > policy.max_hallucination_rate:
             violations.append(
                 GateViolation(
                     metric_name="hallucination_rate",
                     candidate_value=candidate.hallucination_rate,
                     threshold=policy.max_hallucination_rate,
+                    operator="<=",
                     violation_type="THRESHOLD_BREACH",
                     message=f"Hallucination rate {candidate.hallucination_rate:.3f} exceeded maximum ceiling {policy.max_hallucination_rate:.3f}.",
                 )
             )
 
         # 5. Abstention Accuracy Threshold
-        if candidate.abstention_accuracy < policy.min_abstention_accuracy:
+        if candidate.abstention_accuracy is not None and candidate.abstention_accuracy < policy.min_abstention_accuracy:
             violations.append(
                 GateViolation(
                     metric_name="abstention_accuracy",
                     candidate_value=candidate.abstention_accuracy,
                     threshold=policy.min_abstention_accuracy,
+                    operator=">=",
                     violation_type="THRESHOLD_BREACH",
                     message=f"Abstention accuracy {candidate.abstention_accuracy:.3f} fell below required {policy.min_abstention_accuracy:.3f}.",
                 )
@@ -315,6 +334,7 @@ class RegressionEngine:
                         baseline_value=baseline.p95_latency_ms,
                         candidate_value=candidate.p95_latency_ms,
                         threshold=round(max_lat, 2),
+                        operator="<=",
                         violation_type="REGRESSION_BUDGET",
                         message=f"P95 latency {candidate.p95_latency_ms:.1f}ms regressed more than {policy.max_latency_regression_pct}% over baseline ({baseline.p95_latency_ms:.1f}ms).",
                     )
@@ -332,6 +352,7 @@ class RegressionEngine:
                         baseline_value=baseline.total_cost_usd,
                         candidate_value=candidate.total_cost_usd,
                         threshold=round(cost_ceiling, 4),
+                        operator="<=",
                         violation_type="REGRESSION_BUDGET",
                         message=f"Cost ${candidate.total_cost_usd:.4f} exceeded allowed budget ceiling of ${cost_ceiling:.4f}.",
                     )
@@ -340,7 +361,21 @@ class RegressionEngine:
         # 7. Configurable Metric-Specific Regression Policies
         for mp in policy.metric_policies:
             c_entry = candidate.metrics.get(mp.metric_name)
-            c_val = c_entry.mean if c_entry else 0.0
+            if c_entry is None or c_entry.count == 0:
+                if not getattr(mp, "allow_missing", False):
+                    violations.append(
+                        GateViolation(
+                            metric_name=mp.metric_name,
+                            candidate_value=None,
+                            threshold=mp.min_candidate_value if mp.min_candidate_value is not None else (mp.max_candidate_value or 0.0),
+                            operator=">=" if mp.min_candidate_value is not None else "<=",
+                            violation_type="MISSING_DATA",
+                            message=f"Metric '{mp.metric_name}' is missing or unmeasured; cannot satisfy release policy.",
+                        )
+                    )
+                continue
+
+            c_val = c_entry.mean
 
             if mp.min_candidate_value is not None and c_val < mp.min_candidate_value:
                 violations.append(
@@ -348,6 +383,7 @@ class RegressionEngine:
                         metric_name=mp.metric_name,
                         candidate_value=c_val,
                         threshold=mp.min_candidate_value,
+                        operator=">=",
                         violation_type="METRIC_POLICY_BREACH",
                         message=f"{mp.metric_name} value {c_val:.4f} fell below required minimum {mp.min_candidate_value:.4f}.",
                     )
@@ -359,6 +395,7 @@ class RegressionEngine:
                         metric_name=mp.metric_name,
                         candidate_value=c_val,
                         threshold=mp.max_candidate_value,
+                        operator="<=",
                         violation_type="METRIC_POLICY_BREACH",
                         message=f"{mp.metric_name} value {c_val:.4f} exceeded allowed maximum {mp.max_candidate_value:.4f}.",
                     )

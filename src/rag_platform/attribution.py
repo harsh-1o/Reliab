@@ -242,7 +242,7 @@ class FailureAttributionEngine:
                 if overlap < 0.30:
                     findings.append(
                         DiagnosticFinding(
-                            code=FailureCode.CIT_01,
+                            code=FailureCode.CIT_02,
                             severity=Severity.HIGH,
                             confidence=0.92,
                             explanation=f"Citation attached to chunk '{matched_chunk.chunk_id}' in doc '{cit.document_id}', but chunk text does not substantiate the claim.",

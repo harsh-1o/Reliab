@@ -12,7 +12,7 @@ import sys
 import time
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -33,6 +33,7 @@ from rag_platform.db import (
     Base,
     DatabaseRepo,
     DatasetRow,
+    DatasetStatus,
     FailureRow,
     ProjectRow,
     RunRow,
@@ -56,8 +57,11 @@ from rag_platform.models import (
 )
 from rag_platform.regression import RegressionEngine
 from rag_platform.security import (
+    BudgetGuard,
     Role,
+    SecretRedactor,
     SecurityContext,
+    TokenBucketRateLimiter,
     authenticate_request,
     authorize_project,
 )
@@ -96,14 +100,15 @@ def create_session() -> Session:
     return Session(engine)
 
 
-
 def get_auth(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
+    cookie_api_key: str | None = Cookie(default=None, alias="api_key"),
     db: Session = Depends(get_db),
 ) -> SecurityContext:
-    """FastAPI dependency for authentication."""
-    return authenticate_request(x_api_key=x_api_key, authorization=authorization, db_session=db)
+    """FastAPI dependency for authentication (supports Header, Bearer, and Cookie)."""
+    key = x_api_key or cookie_api_key
+    return authenticate_request(x_api_key=key, authorization=authorization, db_session=db)
 
 
 @app.get("/health")
@@ -154,7 +159,12 @@ class CreateDatasetReq(BaseModel):
     name: str
     version: str
     description: str | None = None
-    cases: list[TestCase] = Field(default_factory=list)
+    cases: list[TestCase] = Field(default_factory=list, max_length=10000)
+
+
+class BulkCasesReq(BaseModel):
+    cases: list[TestCase] = Field(..., min_length=1, max_length=10000)
+    publish: bool = True
 
 
 class CreateRunReq(BaseModel):
@@ -179,10 +189,10 @@ class CreateRunReq(BaseModel):
     chunking_config: dict[str, Any] = Field(default_factory=dict)
     random_seed: int | None = None
     async_exec: bool = False
-    # RunOptions fields — all honoured in _execute_evaluation_run (FIX #7)
-    concurrency: int = 5
-    max_cases: int | None = None
-    timeout_seconds: float = 60.0
+    # RunOptions fields — bounded & enforced (Points 9, 10, 29)
+    concurrency: int = Field(default=5, ge=1, le=100)
+    max_cases: int | None = Field(default=500, ge=1, le=10000)
+    timeout_seconds: float = Field(default=60.0, ge=0.01, le=3600.0)
     fail_fast: bool = False
     use_cache: bool = True
 
@@ -191,6 +201,7 @@ class CompareReq(BaseModel):
     baseline_run_id: str
     candidate_run_id: str
     policy: ReleasePolicy = Field(default_factory=ReleasePolicy)
+    allow_cross_dataset: bool = False
 
 
 # --- REST API Endpoints ---
@@ -267,6 +278,33 @@ def create_dataset(
         repo.publish_dataset(row.id)
     db.commit()
     return {"id": row.id, "checksum": row.checksum_sha256, "status": row.status}
+
+
+@app.post("/v1/datasets/{dataset_id}/cases/bulk")
+def add_cases_bulk(
+    dataset_id: str,
+    req: BulkCasesReq,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Add test cases to a dataset in bulk chunks (Point 30)."""
+    repo = DatabaseRepo(db)
+    ds = repo.get_dataset(dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    authorize_project(ds.project_id, auth, required_role=Role.EDITOR)
+    if ds.status == DatasetStatus.PUBLISHED.value:
+        raise HTTPException(status_code=400, detail="Cannot add cases to an already published dataset")
+    repo.add_test_cases(dataset_id, req.cases)
+    if req.publish:
+        repo.publish_dataset(dataset_id)
+    db.commit()
+    return {
+        "dataset_id": dataset_id,
+        "cases_added": len(req.cases),
+        "status": ds.status,
+        "checksum": ds.checksum_sha256,
+    }
 
 
 @app.get("/v1/datasets")
@@ -550,24 +588,43 @@ async def _execute_evaluation_run(
         results: list[tuple[RagTrace, list[MetricResult], Any]] = []
         results_lock = asyncio.Lock()
         had_fatal_failure = False
+        had_cancellation = False
+
+        rate_limit_rps = req.adapter_config.get("rate_limit_rps")
+        rate_limiter = (
+            TokenBucketRateLimiter(rate=float(rate_limit_rps), capacity=float(req.concurrency * 2))
+            if rate_limit_rps
+            else None
+        )
 
         async def worker():
-            nonlocal had_fatal_failure
+            nonlocal had_fatal_failure, had_cancellation
             while not case_queue.empty():
-                if had_fatal_failure and fail_fast:
+                if (had_fatal_failure and fail_fast) or had_cancellation:
                     break
                 try:
                     case = case_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
-                if had_fatal_failure and fail_fast:
+                if (had_fatal_failure and fail_fast) or had_cancellation:
                     case_queue.task_done()
                     break
+
+                # Rate limiting guardrail if configured (Point 27)
+                if rate_limiter:
+                    await rate_limiter.acquire(1.0)
 
                 trace, metrics, diag = await _process_case_safe(case)
 
                 async with results_lock:
+                    # Check cancellation under lock before committing trace (Point 25)
+                    cur_run = sess.get(RunRow, run_id)
+                    if cur_run and cur_run.status == RunStatus.CANCELLED.value:
+                        had_cancellation = True
+                        case_queue.task_done()
+                        break
+
                     results.append((trace, metrics, diag))
                     repo.record_trace(trace, metrics, diag)
                     sess.commit()
@@ -597,7 +654,10 @@ async def _execute_evaluation_run(
 
         now = datetime.now(timezone.utc)
         run_row = sess.get(RunRow, run_id)
-        if had_fatal_failure and fail_fast:
+        if run_row and run_row.status == RunStatus.CANCELLED.value:
+            # Run was cancelled during execution — do not overwrite status (Point 25)
+            pass
+        elif had_fatal_failure and fail_fast:
             repo.update_run_status(run_id, RunStatus.FAILED)
             if run_row:
                 run_row.failure_reason = "Run aborted due to fatal case failure (fail_fast=true)"
@@ -608,7 +668,7 @@ async def _execute_evaluation_run(
         # Pre-compute and persist run summary and gate result to avoid N+1 recalculation on list/get
         summary_obj = eval_engine.aggregate_run([(t, m) for t, m, _ in results]) if results else None
         gate_obj = None
-        if summary_obj and run_row:
+        if summary_obj and run_row and run_row.status != RunStatus.CANCELLED.value:
             from rag_platform.regression import RegressionEngine, ReleasePolicy
             reg_engine = RegressionEngine()
             gate_obj = reg_engine.evaluate_gate(
@@ -666,6 +726,7 @@ async def _execute_evaluation_run(
 async def create_run(
     req: CreateRunReq,
     background_tasks: BackgroundTasks,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
     auth: SecurityContext = Depends(get_auth),
 ):
@@ -684,6 +745,33 @@ async def create_run(
                 f"not to the requested project '{req.project_id}'."
             ),
         )
+
+    # Validate dataset version (Point 13)
+    if req.dataset_version and req.dataset_version != ds.version:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Supplied dataset_version '{req.dataset_version}' does not match "
+                f"published dataset version '{ds.version}'."
+            ),
+        )
+
+    cases = [db_row_to_test_case(r) for r in ds.cases]
+
+    # Validate safety limits via BudgetGuard (Points 10, 27)
+    effective_max_cases = req.max_cases if req.max_cases is not None else 500
+    config_options = RunOptions(
+        concurrency=req.concurrency,
+        max_cases=effective_max_cases,
+        timeout_seconds=getattr(req, "timeout_seconds", 60.0),
+        fail_fast=getattr(req, "fail_fast", False),
+        use_cache=getattr(req, "use_cache", True),
+    )
+    try:
+        cases_to_evaluate = min(len(cases), effective_max_cases)
+        BudgetGuard.validate_run_bounds(cases_to_evaluate, config_options)
+    except Exception as err:
+        raise HTTPException(status_code=400, detail=str(err))
 
     env_info = {
         "os": platform.system(),
@@ -718,28 +806,38 @@ async def create_run(
     config = RunConfig(
         project_id=req.project_id,
         dataset_id=req.dataset_id,
-        dataset_version=req.dataset_version or ds.version,
+        dataset_version=ds.version,
         system_version=req.system_version,
         policy_id=req.policy_id,
-        options=RunOptions(
-            concurrency=req.concurrency,
-            max_cases=getattr(req, "max_cases", None),
-            timeout_seconds=getattr(req, "timeout_seconds", 60),
-            fail_fast=getattr(req, "fail_fast", False),
-            use_cache=getattr(req, "use_cache", True),
-        ),
+        options=config_options,
     )
 
     initial_status = RunStatus.QUEUED if req.async_exec else RunStatus.CREATED
+    # Sanitize options before persistence (Point 4)
+    safe_options = SecretRedactor.redact_dict(req.model_dump())
+    safe_options_json = json.dumps(safe_options)
+
     run = repo.create_run(
         config,
         provenance,
         initial_status=initial_status,
-        options_override_json=req.model_dump_json(),
+        options_override_json=safe_options_json,
+        idempotency_key=idempotency_key,
     )
     db.commit()
 
-    cases = [db_row_to_test_case(r) for r in ds.cases]
+    # If run already existed under this idempotency key and has already progressed
+    if idempotency_key and run.status in (RunStatus.RUNNING.value, RunStatus.COMPLETED.value, RunStatus.QUEUED.value):
+        if req.async_exec:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "run_id": run.id,
+                    "manifest_hash": run.manifest_hash,
+                    "status": run.status,
+                    "message": "Existing run returned for idempotency key.",
+                },
+            )
 
     if req.async_exec:
         # Asynchronous execution via durable database-backed worker
@@ -782,6 +880,36 @@ async def create_run(
         "manifest_hash": run.manifest_hash,
         "status": run.status,
         "summary": summary.model_dump() if summary else None,
+    }
+
+
+@app.post("/v1/runs/{run_id}/cancel")
+def cancel_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Cancel an active or queued evaluation run (Point 25)."""
+    run = db.get(RunRow, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    authorize_project(run.project_id, auth, required_role=Role.EDITOR)
+    if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value):
+        return {
+            "run_id": run.id,
+            "status": run.status,
+            "message": f"Run is already in terminal state '{run.status}'.",
+        }
+
+    repo = DatabaseRepo(db)
+    repo.update_run_status(run.id, RunStatus.CANCELLED)
+    run.failure_reason = "Run cancelled by user request."
+    run.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    return {
+        "run_id": run.id,
+        "status": RunStatus.CANCELLED.value,
+        "message": "Run evaluation cancelled successfully.",
     }
 
 
@@ -981,6 +1109,17 @@ def compare_runs(
     authorize_project(b_run.project_id, auth, required_role=Role.VIEWER)
     authorize_project(c_run.project_id, auth, required_role=Role.VIEWER)
 
+    # Validate baseline/candidate dataset compatibility (Point 14)
+    if not req.allow_cross_dataset and b_run.dataset_checksum != c_run.dataset_checksum:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Incompatible datasets for comparison: baseline dataset checksum ({b_run.dataset_checksum}) "
+                f"!= candidate dataset checksum ({c_run.dataset_checksum}). "
+                f"Set allow_cross_dataset=True in request to explicitly permit cross-dataset comparison."
+            ),
+        )
+
     eval_engine = EvaluationEngine()
     b_traces = [
         (
@@ -1045,6 +1184,24 @@ def compare_runs(
         "comparison": comparison.model_dump(),
         "gate_result": gate.model_dump(),
     }
+
+
+@app.post("/v1/maintenance/cleanup")
+def cleanup_retention(
+    trace_retention_days: int = Query(default=90, ge=1, le=3650),
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Retention cleanup for evaluation traces (Point 33)."""
+    if not auth.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: maintenance operations require ADMIN role.",
+        )
+    repo = DatabaseRepo(db)
+    result = repo.purge_expired_data(trace_retention_days=trace_retention_days)
+    db.commit()
+    return result
 
 
 @app.post("/v1/demo-run")
