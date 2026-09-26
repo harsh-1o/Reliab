@@ -110,10 +110,33 @@ def compute_manifest_hash(
     return prov.compute_hash()
 
 # --- Config ---
-# --- Config ---
 def _is_production_environment() -> bool:
     env = os.getenv("ENVIRONMENT", os.getenv("APP_ENV", os.getenv("DEPLOYMENT_ENV", ""))).lower()
     return env in ("production", "prod", "staging")
+
+
+def _resolve_database_url() -> str:
+    """Resolve the database URL and fail closed for deployment environments.
+
+    SQLite remains a convenient local-development/test default, but a deployment
+    environment must explicitly configure a database and cannot silently fall back
+    to a local SQLite file that is unsuitable for distributed workers.
+    """
+    configured = os.getenv("DATABASE_URL", "").strip()
+    if not configured:
+        if _is_production_environment():
+            raise RuntimeError(
+                "STARTUP FAILURE: DATABASE_URL must be explicitly configured in a deployment environment. "
+                "Refusing to fall back to SQLite."
+            )
+        return "sqlite:///./rag_platform.db"
+
+    if _is_production_environment() and configured.lower().startswith("sqlite:"):
+        raise RuntimeError(
+            "STARTUP FAILURE: SQLite is not supported as the deployment database. "
+            "Configure DATABASE_URL with PostgreSQL (or another supported server database)."
+        )
+    return configured
 
 
 def _resolve_api_key() -> str:
@@ -147,9 +170,7 @@ def _resolve_api_key() -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = field(
-        default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///./rag_platform.db")
-    )
+    database_url: str = field(default_factory=_resolve_database_url)
     auth_enabled: bool = field(
         default_factory=lambda: os.getenv(
             "AUTH_ENABLED",
@@ -171,5 +192,3 @@ settings = Settings()
 
 def get_settings() -> Settings:
     return settings
-
-
