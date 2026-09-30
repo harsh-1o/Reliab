@@ -226,6 +226,22 @@ class EvaluationCacheRow(Base):
     )
 
 
+class SessionRow(Base):
+    __tablename__ = "sessions"
+
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    project_roles_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+
+
 # --- Database Operations & Repository ---
 _engines: dict[str, Any] = {}
 _sessionmakers: dict[str, sessionmaker[Session]] = {}

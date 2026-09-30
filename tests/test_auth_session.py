@@ -212,3 +212,106 @@ def test_trusted_proxy_forwarded_for_and_spoof_defense(monkeypatch):
     }
     req_no_client = Request(scope_no_client)
     assert extract_client_ip(req_no_client, trusted_proxies=trusted) == "127.0.0.1"
+
+
+def test_database_backed_cross_process_sessions():
+    """P1: Verify that sessions are persisted in database and shared across independent worker/API processes."""
+    from rag_platform.security import ClientIdentity, Role, SessionStore
+
+    # Shared database engine simulating shared storage between Process A and Process B
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+
+    identity = ClientIdentity(
+        client_id="user_distributed",
+        is_admin=False,
+        project_roles={"proj_shared": Role.EDITOR},
+    )
+
+    # 1. Process A creates session in shared database
+    with Session(engine) as sess_a:
+        session_id = SessionStore.create_session(identity, ttl_seconds=3600.0, db_session=sess_a)
+        assert session_id.startswith("sess_")
+
+    # 2. Process B (separate database connection/process) retrieves session
+    with Session(engine) as sess_b:
+        retrieved_ident = SessionStore.get_session(session_id, db_session=sess_b)
+        assert retrieved_ident is not None
+        assert retrieved_ident.client_id == "user_distributed"
+        assert retrieved_ident.project_roles["proj_shared"] == Role.EDITOR
+        assert not retrieved_ident.is_admin
+
+    # 3. Test expired session behavior across processes
+    with Session(engine) as sess_a:
+        expired_id = SessionStore.create_session(identity, ttl_seconds=-10.0, db_session=sess_a)
+
+    with Session(engine) as sess_b:
+        assert SessionStore.get_session(expired_id, db_session=sess_b) is None
+
+    # 4. Process A invalidates session -> Process B immediately sees rejection
+    with Session(engine) as sess_a:
+        assert SessionStore.invalidate(session_id, db_session=sess_a) is True
+
+    with Session(engine) as sess_b:
+        assert SessionStore.get_session(session_id, db_session=sess_b) is None
+
+
+def test_api_key_short_ttl_multi_process_revocation():
+    """P2: Verify that short API key cache TTL ensures revoked keys are rejected across processes."""
+    import time
+
+    from rag_platform.db import DatabaseRepo
+    from rag_platform.security import ApiKeyRegistry, Role, generate_secure_api_key
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+
+    raw_key = generate_secure_api_key()
+    with Session(engine) as sess:
+        repo = DatabaseRepo(sess)
+        created_key, row = repo.create_api_key(
+            client_id="client_multi_proc",
+            api_key=raw_key,
+            project_roles={"proj_1": Role.VIEWER},
+        )
+        sess.commit()
+        key_hash = row.key_hash
+
+    # Save original TTL and set short TTL for test
+    orig_ttl = ApiKeyRegistry.CACHE_TTL_SECONDS
+    try:
+        ApiKeyRegistry.CACHE_TTL_SECONDS = 0.05
+        ApiKeyRegistry.clear()
+
+        # Process B authenticates and caches key
+        with Session(engine) as sess_b:
+            ident = ApiKeyRegistry.get(raw_key, db_session=sess_b)
+            assert ident is not None
+            assert ident.client_id == "client_multi_proc"
+
+        # Process A revokes key in DB (without touching Process B's local memory)
+        with Session(engine) as sess_a:
+            repo_a = DatabaseRepo(sess_a)
+            revoked = repo_a.revoke_api_key(key_hash)
+            sess_a.commit()
+            assert revoked is True
+
+        # Wait for short TTL to expire
+        time.sleep(0.06)
+
+        # Process B attempts authentication again -> must be rejected from DB
+        with Session(engine) as sess_b:
+            ident_after = ApiKeyRegistry.get(raw_key, db_session=sess_b)
+            assert ident_after is None
+    finally:
+        ApiKeyRegistry.CACHE_TTL_SECONDS = orig_ttl
+        ApiKeyRegistry.clear()
+

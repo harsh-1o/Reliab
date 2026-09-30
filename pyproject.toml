@@ -87,4 +87,4 @@ module = [
 ]
 ignore_errors = true
 
-# Strict typing configured for all application modules
+# Baseline static typing configured for application modules

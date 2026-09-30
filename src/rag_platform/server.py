@@ -351,7 +351,7 @@ def create_auth_session(
         is_admin=ctx.is_admin,
         project_roles=ctx.project_roles,
     )
-    session_token = SessionStore.create_session(identity, ttl_seconds=86400.0)
+    session_token = SessionStore.create_session(identity, ttl_seconds=86400.0, db_session=db)
 
     # Issue opaque session token as HttpOnly cookie (never the raw API key)
     response.set_cookie(
@@ -386,11 +386,12 @@ def clear_auth_session(
     response: Response,
     cookie_session_id: str | None = Cookie(default=None, alias="session_id"),
     cookie_api_key: str | None = Cookie(default=None, alias="api_key"),
+    db: Session = Depends(get_db),
 ):
     """Clear authenticated session cookie and invalidate server-side session."""
     token = cookie_session_id or cookie_api_key
     if token:
-        SessionStore.invalidate(token)
+        SessionStore.invalidate(token, db_session=db)
     response.delete_cookie(key="session_id", path="/")
     response.delete_cookie(key="api_key", path="/")
     return {"status": "SUCCESS", "message": "Session cleared."}
