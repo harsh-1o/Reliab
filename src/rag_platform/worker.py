@@ -425,9 +425,20 @@ class DurableRunWorker:
 
             ds = sess.get(DatasetRow, run.dataset_id)
             if not ds:
-                run.status = RunStatus.FAILED.value
-                run.failure_reason = f"Dataset {run.dataset_id} not found"
-                run.failure_type = "DATASET_NOT_FOUND"
+                ds_fail_stmt = update(RunRow).where(
+                    RunRow.id == run_id,
+                    RunRow.status == RunStatus.RUNNING.value,
+                )
+                if active_lease_id:
+                    ds_fail_stmt = ds_fail_stmt.where(RunRow.lease_id == active_lease_id)
+                sess.execute(
+                    ds_fail_stmt.values(
+                        status=RunStatus.FAILED.value,
+                        finished_at=datetime.now(timezone.utc),
+                        failure_reason=f"Dataset {run.dataset_id} not found",
+                        failure_type="DATASET_NOT_FOUND",
+                    )
+                )
                 sess.commit()
                 return False
 

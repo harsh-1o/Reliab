@@ -503,6 +503,49 @@ class ApiKeyRegistry:
             cls._cache.clear()
 
 
+class SessionStore:
+    """Server-side store for opaque browser session tokens.
+
+    Prevents exposure of raw API credentials in browser cookies by issuing
+    random, short-lived session identifiers tied to client identities.
+    """
+
+    _sessions: dict[str, tuple[ClientIdentity, float]] = {}  # session_id -> (identity, expires_at_monotonic)
+    _lock: threading.Lock = threading.Lock()
+    DEFAULT_TTL_SECONDS: float = 86400.0  # 24 hours
+
+    @classmethod
+    def create_session(cls, identity: ClientIdentity, ttl_seconds: float = DEFAULT_TTL_SECONDS) -> str:
+        session_id = f"sess_{secrets.token_urlsafe(32)}"
+        expires_at = time.monotonic() + ttl_seconds
+        with cls._lock:
+            cls._sessions[session_id] = (identity, expires_at)
+        return session_id
+
+    @classmethod
+    def get_session(cls, session_id: str) -> ClientIdentity | None:
+        now = time.monotonic()
+        with cls._lock:
+            entry = cls._sessions.get(session_id)
+            if entry is None:
+                return None
+            identity, expires_at = entry
+            if now > expires_at:
+                cls._sessions.pop(session_id, None)
+                return None
+            return identity
+
+    @classmethod
+    def invalidate(cls, session_id: str) -> bool:
+        with cls._lock:
+            return cls._sessions.pop(session_id, None) is not None
+
+    @classmethod
+    def clear(cls) -> None:
+        with cls._lock:
+            cls._sessions.clear()
+
+
 class SecurityContext(BaseModel):
     authenticated: bool
     client_id: str | None = None
@@ -536,35 +579,50 @@ def authenticate_request(
     cookie_token: str | None = None,
     db_session: Any = None,
 ) -> SecurityContext:
-    """Verify API credential and resolve client identity with project memberships.
+    """Verify API credential or session token and resolve client identity.
 
     Production is fail-closed: If AUTH_ENABLED=true, credentials are strictly required.
     DEV_MODE can only bypass authentication when AUTH_ENABLED is explicitly false.
+    Browser sessions use opaque server-side tokens; API clients use API keys.
     """
     from rag_platform.core import get_settings
 
     app_settings = get_settings()
 
-    token = x_api_key
-    if not token and authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-    if not token and cookie_token:
-        token = cookie_token.strip()
+    api_token = x_api_key
+    if not api_token and authorization and authorization.lower().startswith("bearer "):
+        api_token = authorization[7:].strip()
 
-    # Pass-through as dev admin ONLY when auth is explicitly disabled AND dev_mode is true
-    if not app_settings.auth_enabled and app_settings.dev_mode and not token:
+    # 1. Handle browser session token if provided and no explicit API key passed
+    if not api_token and cookie_token:
+        sess_identity = SessionStore.get_session(cookie_token.strip())
+        if sess_identity:
+            return SecurityContext(
+                authenticated=True,
+                client_id=sess_identity.client_id,
+                is_admin=sess_identity.is_admin,
+                project_roles=sess_identity.project_roles,
+            )
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session credential.",
+        )
+
+    # 2. Pass-through as dev admin ONLY when auth is explicitly disabled AND dev_mode is true
+    if not app_settings.auth_enabled and app_settings.dev_mode and not api_token:
         return SecurityContext(authenticated=True, client_id="dev", is_admin=True)
 
-    if not token:
+    if not api_token:
         from fastapi import HTTPException, status
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required: missing API key, Bearer token, or session credential.",
         )
 
-    # 1. Check registered client keys (in-memory cache or persistent DB)
+    # 3. Check registered client keys (in-memory cache or persistent DB)
     try:
-        client = ApiKeyRegistry.get(token, db_session=db_session)
+        client = ApiKeyRegistry.get(api_token, db_session=db_session)
     except Exception as exc:
         import logging
         logging.getLogger("rag_platform.security").error(
@@ -584,8 +642,8 @@ def authenticate_request(
             project_roles=client.project_roles,
         )
 
-    # 2. Check global admin key configured in application settings
-    if token == app_settings.api_key:
+    # 4. Check global admin key configured in application settings
+    if api_token == app_settings.api_key:
         return SecurityContext(
             authenticated=True,
             client_id="global_admin",

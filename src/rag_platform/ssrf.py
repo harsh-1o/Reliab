@@ -11,10 +11,12 @@ import ipaddress
 import logging
 import os
 import socket
+import threading
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
 
 # Disallowed IPv4 networks
 DISALLOWED_IPV4_NETWORKS = [
@@ -82,13 +84,16 @@ def get_allowed_hosts() -> set[str] | None:
 
 
 # Static DNS mapping for air-gapped deployments, offline test suites, and mock resolution
-STATIC_DNS_MAP: dict[str, list[str]] = {
+DEFAULT_STATIC_DNS_MAP: dict[str, list[str]] = {
     # Default public test fixtures (IANA / RFC reserved public documentation IPs)
     "example.com": ["93.184.216.34"],
     "rag.example.com": ["93.184.216.34"],
     "staging-rag.example.com": ["93.184.216.35"],
     "httpbin.org": ["54.237.133.81"],
 }
+
+_STATIC_DNS_LOCK = threading.Lock()
+STATIC_DNS_MAP: dict[str, list[str]] = dict(DEFAULT_STATIC_DNS_MAP)
 
 
 def register_static_dns(hostname: str, ips: list[str] | str) -> None:
@@ -100,15 +105,19 @@ def register_static_dns(hostname: str, ips: list[str] | str) -> None:
     """
     clean_host = hostname.strip().lower()
     ip_list = [ips] if isinstance(ips, str) else list(ips)
-    STATIC_DNS_MAP[clean_host] = ip_list
+    with _STATIC_DNS_LOCK:
+        STATIC_DNS_MAP[clean_host] = ip_list
 
 
-def clear_static_dns(hostname: str | None = None) -> None:
-    """Clear static DNS entries."""
-    if hostname:
-        STATIC_DNS_MAP.pop(hostname.strip().lower(), None)
-    else:
-        STATIC_DNS_MAP.clear()
+def clear_static_dns(hostname: str | None = None, reset_to_defaults: bool = True) -> None:
+    """Clear static DNS entries with thread safety and optional restoration of default test fixtures."""
+    with _STATIC_DNS_LOCK:
+        if hostname:
+            STATIC_DNS_MAP.pop(hostname.strip().lower(), None)
+        else:
+            STATIC_DNS_MAP.clear()
+            if reset_to_defaults:
+                STATIC_DNS_MAP.update(DEFAULT_STATIC_DNS_MAP)
 
 
 def get_static_dns_map_from_env() -> dict[str, list[str]]:
@@ -252,13 +261,15 @@ def validate_url_ssrf(
             raw_ips = dns_resolver(hostname, port)
         except Exception as exc:
             raise SSRFProtectionError(f"Custom DNS resolver failed for '{hostname}': {exc}") from exc
-    elif hostname in STATIC_DNS_MAP:
-        raw_ips = STATIC_DNS_MAP[hostname]
     else:
-        env_map = get_static_dns_map_from_env()
-        if hostname in env_map:
-            raw_ips = env_map[hostname]
-        else:
+        with _STATIC_DNS_LOCK:
+            if hostname in STATIC_DNS_MAP:
+                raw_ips = list(STATIC_DNS_MAP[hostname])
+        if not raw_ips:
+            env_map = get_static_dns_map_from_env()
+            if hostname in env_map:
+                raw_ips = env_map[hostname]
+        if not raw_ips:
             try:
                 # Resolve all addresses (protects against multi-A DNS rebinding / mixed public-private records)
                 addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)

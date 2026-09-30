@@ -70,14 +70,21 @@ def test_failed_session_creation(auth_client):
 def test_browser_cookie_login_authenticated_request_and_logout(auth_client):
     """Verify browser flow: login -> HttpOnly cookie -> authenticated requests -> logout -> rejected."""
     # 1. Login with master API key
+    raw_api_key = "master-admin-key-999-secure-secret-32-chars-long"
     login_resp = auth_client.post(
         "/v1/auth/session",
-        json={"api_key": "master-admin-key-999-secure-secret-32-chars-long"},
+        json={"api_key": raw_api_key},
     )
     assert login_resp.status_code == 200
     assert login_resp.json()["status"] == "SUCCESS"
     assert login_resp.json()["is_admin"] is True
-    assert "api_key" in login_resp.cookies
+
+    # Priority 1 requirement: Cookie must NOT contain the raw API key!
+    cookie_val = login_resp.cookies.get("session_id") or login_resp.cookies.get("api_key")
+    assert cookie_val is not None
+    assert cookie_val != raw_api_key
+    assert raw_api_key not in cookie_val
+    assert cookie_val.startswith("sess_")
 
     # 2. Make authenticated API request relying strictly on session cookie (no X-API-Key header)
     resp = auth_client.get("/v1/projects")
@@ -89,15 +96,36 @@ def test_browser_cookie_login_authenticated_request_and_logout(auth_client):
     assert create_resp.status_code == 200
     assert create_resp.json()["name"] == "Cookie Auth Test Project"
 
-    # 4. Logout: invalidate server-side cookie
+    # 4. Logout: invalidate server-side session
     logout_resp = auth_client.post("/v1/auth/logout")
     assert logout_resp.status_code == 200
     assert logout_resp.json()["status"] == "SUCCESS"
 
-    # 5. Subsequent request must now be rejected with 401
-    auth_client.cookies.clear()
-    unauth_resp = auth_client.get("/v1/projects")
+    # 5. Subsequent request with the same session token must be rejected by server-side invalidation
+    # Even if client keeps sending the cookie, server-side session is revoked
+    unauth_resp = auth_client.get("/v1/projects", cookies={"session_id": cookie_val})
     assert unauth_resp.status_code == 401
+    assert "Invalid or expired session" in unauth_resp.json()["detail"]
+
+
+def test_session_cookie_does_not_contain_api_key(auth_client):
+    """Explicitly verify that session cookie contains an opaque random token, never the API key."""
+    secret_key = "client-user-key-123"
+    login_resp = auth_client.post("/v1/auth/session", json={"api_key": secret_key})
+    assert login_resp.status_code == 200
+
+    session_cookie = login_resp.cookies.get("session_id")
+    assert session_cookie is not None
+    assert secret_key not in session_cookie
+    assert session_cookie.startswith("sess_")
+    assert len(session_cookie) >= 32
+
+
+def test_expired_or_invalid_session_token_rejected(auth_client):
+    """Submitting non-existent or fabricated session cookies must return 401."""
+    resp = auth_client.get("/v1/projects", cookies={"session_id": "sess_fabricated_bogus_token_12345"})
+    assert resp.status_code == 401
+    assert "Invalid or expired session" in resp.json()["detail"]
 
 
 def test_browser_cookie_login_with_registered_client_key(auth_client):
@@ -137,3 +165,50 @@ def test_programmatic_client_bearer_token(auth_client):
 
     resp_bad = auth_client.get("/v1/projects", headers={"Authorization": "Bearer bogus"})
     assert resp_bad.status_code == 401
+
+
+def test_trusted_proxy_forwarded_for_and_spoof_defense(monkeypatch):
+    """Priority 2: Verify trusted proxy resolution and spoofing defense."""
+    from starlette.requests import Request
+
+    from rag_platform.server import extract_client_ip
+
+    trusted = ("127.0.0.1", "10.0.0.0/8")
+
+    # 1. Direct untrusted client trying to spoof X-Forwarded-For
+    scope_untrusted = {
+        "type": "http",
+        "client": ("203.0.113.195", 12345),
+        "headers": [(b"x-forwarded-for", b"198.51.100.5")],
+    }
+    req_untrusted = Request(scope_untrusted)
+    # Direct peer 203.0.113.195 is NOT trusted; X-Forwarded-For must be ignored!
+    assert extract_client_ip(req_untrusted, trusted_proxies=trusted) == "203.0.113.195"
+
+    # 2. Trusted proxy with single forwarded IP
+    scope_trusted_proxy = {
+        "type": "http",
+        "client": ("127.0.0.1", 54321),
+        "headers": [(b"x-forwarded-for", b"198.51.100.5")],
+    }
+    req_trusted = Request(scope_trusted_proxy)
+    assert extract_client_ip(req_trusted, trusted_proxies=trusted) == "198.51.100.5"
+
+    # 3. Trusted proxy with multiple forwarded IPs in chain: client, internal_lb
+    scope_chain = {
+        "type": "http",
+        "client": ("127.0.0.1", 54321),
+        "headers": [(b"x-forwarded-for", b"198.51.100.5, 10.0.0.2")],
+    }
+    req_chain = Request(scope_chain)
+    # 10.0.0.2 is in trusted 10.0.0.0/8, so rightmost untrusted client is 198.51.100.5
+    assert extract_client_ip(req_chain, trusted_proxies=trusted) == "198.51.100.5"
+
+    # 4. Fallback when no client socket host is present
+    scope_no_client = {
+        "type": "http",
+        "client": None,
+        "headers": [],
+    }
+    req_no_client = Request(scope_no_client)
+    assert extract_client_ip(req_no_client, trusted_proxies=trusted) == "127.0.0.1"

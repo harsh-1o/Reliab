@@ -65,10 +65,12 @@ def export_dataset_csv(dataset: BenchmarkDataset, target_path: str | Path) -> No
             "question",
             "expected_answer",
             "expected_facts",
+            "expected_facts_json",
             "doc_ids",
             "relevant_documents_json",
             "answerability",
             "tags",
+            "tags_json",
             "metadata_json",
         ])
         for c in dataset.cases:
@@ -77,10 +79,12 @@ def export_dataset_csv(dataset: BenchmarkDataset, target_path: str | Path) -> No
                 c.question,
                 c.expected_answer or "",
                 ";".join(c.expected_facts),
+                json.dumps(c.expected_facts, ensure_ascii=False),
                 ";".join(d.document_id for d in c.relevant_documents),
                 json.dumps([d.model_dump() for d in c.relevant_documents]),
                 c.answerability.value,
                 ";".join(c.tags),
+                json.dumps(c.tags, ensure_ascii=False),
                 json.dumps(c.metadata, ensure_ascii=False, sort_keys=True),
             ])
 
@@ -98,8 +102,25 @@ def import_dataset_csv(
     with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            facts = [ft.strip() for ft in row.get("expected_facts", "").split(";") if ft.strip()]
-            tags = [t.strip() for t in row.get("tags", "").split(";") if t.strip()]
+            raw_facts_json = row.get("expected_facts_json")
+            if raw_facts_json and raw_facts_json.strip():
+                try:
+                    parsed_facts = json.loads(raw_facts_json)
+                    facts = [str(f) for f in parsed_facts] if isinstance(parsed_facts, list) else [str(parsed_facts)]
+                except Exception:
+                    facts = [ft.strip() for ft in row.get("expected_facts", "").split(";") if ft.strip()]
+            else:
+                facts = [ft.strip() for ft in row.get("expected_facts", "").split(";") if ft.strip()]
+
+            raw_tags_json = row.get("tags_json")
+            if raw_tags_json and raw_tags_json.strip():
+                try:
+                    parsed_tags = json.loads(raw_tags_json)
+                    tags = [str(t) for t in parsed_tags] if isinstance(parsed_tags, list) else [str(parsed_tags)]
+                except Exception:
+                    tags = [t.strip() for t in row.get("tags", "").split(";") if t.strip()]
+            else:
+                tags = [t.strip() for t in row.get("tags", "").split(";") if t.strip()]
 
             raw_docs_json = row.get("relevant_documents_json")
             if raw_docs_json and raw_docs_json.strip():
