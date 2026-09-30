@@ -14,8 +14,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
-import json
 import math
 import statistics
 
@@ -23,13 +21,9 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from rag_platform.core import sha256_hash
 from rag_platform.db import (
     Base,
     DatabaseRepo,
-    DatasetRow,
-    DatasetStatus,
-    TestCaseRow,
 )
 from rag_platform.evaluators import (
     BoundedLRUCache,
@@ -39,17 +33,13 @@ from rag_platform.evaluators import (
     wilson_score_interval,
 )
 from rag_platform.models import (
-    Answerability,
     Citation,
-    ClaimStatus,
     DocumentReference,
     MetricFamily,
     MetricResult,
-    MetricStatus,
     RagTrace,
     RetrievedChunk,
     RunConfig,
-    RunOptions,
     RunProvenance,
     RunStatus,
     TestCase,
@@ -474,8 +464,8 @@ class TestPostgresDependency:
 
     def test_psycopg_in_pyproject(self):
         """psycopg must be in optional dependencies."""
-        from pathlib import Path
         import tomllib
+        from pathlib import Path
 
         pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
         with open(pyproject_path, "rb") as f:

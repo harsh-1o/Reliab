@@ -368,8 +368,8 @@ def execute_gate_evaluation(
             ds_row.checksum_sha256 = checksum
             ds_row.status = DatasetStatus.PUBLISHED.value
             for c in loaded_cases:
-                tc_row = db_session.get(TestCaseRow, (c.id, dataset_id))
-                if not tc_row:
+                existing_tc = db_session.get(TestCaseRow, (c.id, dataset_id))
+                if not existing_tc:
                     tc_row = TestCaseRow(
                         id=c.id,
                         dataset_id=dataset_id,
@@ -383,13 +383,13 @@ def execute_gate_evaluation(
                     )
                     db_session.add(tc_row)
                 else:
-                    tc_row.question = c.question
-                    tc_row.expected_answer = c.expected_answer
-                    tc_row.expected_facts_json = json.dumps(c.expected_facts)
-                    tc_row.relevant_docs_json = json.dumps([d.model_dump() for d in c.relevant_documents])
-                    tc_row.answerability = c.answerability.value
-                    tc_row.tags_json = json.dumps(c.tags)
-                    tc_row.metadata_json = json.dumps(c.metadata)
+                    existing_tc.question = c.question
+                    existing_tc.expected_answer = c.expected_answer
+                    existing_tc.expected_facts_json = json.dumps(c.expected_facts)
+                    existing_tc.relevant_docs_json = json.dumps([d.model_dump() for d in c.relevant_documents])
+                    existing_tc.answerability = c.answerability.value
+                    existing_tc.tags_json = json.dumps(c.tags)
+                    existing_tc.metadata_json = json.dumps(c.metadata)
             db_session.commit()
     elif bootstrap:
         if not dataset_id:
