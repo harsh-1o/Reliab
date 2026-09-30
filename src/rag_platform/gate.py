@@ -221,6 +221,10 @@ def bootstrap_ci_database(db_session: Session, project_id: str, dataset_id: str)
                 checksum_sha256=checksum,
             )
             db_session.add(ds_row)
+        elif ds_row.status == DatasetStatus.PUBLISHED.value:
+            # Published datasets are immutable — skip mutation, use existing data
+            db_session.commit()
+            return
         else:
             ds_row.checksum_sha256 = checksum
             ds_row.status = DatasetStatus.PUBLISHED.value
@@ -341,12 +345,8 @@ def execute_gate_evaluation(
                 checksum_sha256=checksum,
             )
             db_session.add(ds_row)
-        else:
-            ds_row.checksum_sha256 = checksum
-            ds_row.status = DatasetStatus.PUBLISHED.value
-        for c in loaded_cases:
-            tc_row = db_session.get(TestCaseRow, (c.id, dataset_id))
-            if not tc_row:
+            # Add test case rows for brand new dataset
+            for c in loaded_cases:
                 tc_row = TestCaseRow(
                     id=c.id,
                     dataset_id=dataset_id,
@@ -359,15 +359,38 @@ def execute_gate_evaluation(
                     metadata_json=json.dumps(c.metadata),
                 )
                 db_session.add(tc_row)
-            else:
-                tc_row.question = c.question
-                tc_row.expected_answer = c.expected_answer
-                tc_row.expected_facts_json = json.dumps(c.expected_facts)
-                tc_row.relevant_docs_json = json.dumps([d.model_dump() for d in c.relevant_documents])
-                tc_row.answerability = c.answerability.value
-                tc_row.tags_json = json.dumps(c.tags)
-                tc_row.metadata_json = json.dumps(c.metadata)
-        db_session.commit()
+            db_session.commit()
+        elif ds_row.status == DatasetStatus.PUBLISHED.value:
+            # Published datasets are immutable — do not mutate.
+            # Use the existing dataset as-is; skip test case updates.
+            db_session.commit()
+        else:
+            ds_row.checksum_sha256 = checksum
+            ds_row.status = DatasetStatus.PUBLISHED.value
+            for c in loaded_cases:
+                tc_row = db_session.get(TestCaseRow, (c.id, dataset_id))
+                if not tc_row:
+                    tc_row = TestCaseRow(
+                        id=c.id,
+                        dataset_id=dataset_id,
+                        question=c.question,
+                        expected_answer=c.expected_answer,
+                        expected_facts_json=json.dumps(c.expected_facts),
+                        relevant_docs_json=json.dumps([d.model_dump() for d in c.relevant_documents]),
+                        answerability=c.answerability.value,
+                        tags_json=json.dumps(c.tags),
+                        metadata_json=json.dumps(c.metadata),
+                    )
+                    db_session.add(tc_row)
+                else:
+                    tc_row.question = c.question
+                    tc_row.expected_answer = c.expected_answer
+                    tc_row.expected_facts_json = json.dumps(c.expected_facts)
+                    tc_row.relevant_docs_json = json.dumps([d.model_dump() for d in c.relevant_documents])
+                    tc_row.answerability = c.answerability.value
+                    tc_row.tags_json = json.dumps(c.tags)
+                    tc_row.metadata_json = json.dumps(c.metadata)
+            db_session.commit()
     elif bootstrap:
         if not dataset_id:
             dataset_id = "ci_bench"

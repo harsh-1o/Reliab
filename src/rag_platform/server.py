@@ -1202,16 +1202,12 @@ async def create_run(
     )
     db.commit()
 
-    # If run already existed under this idempotency key
-    if idempotency_key and (
-        getattr(run, "_is_existing", False)
-        or run.status in (
-            RunStatus.RUNNING.value,
-            RunStatus.COMPLETED.value,
-            RunStatus.QUEUED.value,
-            RunStatus.FAILED.value,
-        )
-    ):
+    # If run already existed under this idempotency key.
+    # IMPORTANT: Only use `_is_existing` flag set by DatabaseRepo.create_run() to
+    # detect truly pre-existing runs. Do NOT check `run.status` here — a brand-new
+    # async run starts with status=QUEUED, which would false-positive match and
+    # return before the worker notification code is reached.
+    if idempotency_key and getattr(run, "_is_existing", False):
         if req.async_exec:
             return JSONResponse(
                 status_code=status.HTTP_200_OK,

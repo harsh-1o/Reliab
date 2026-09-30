@@ -391,6 +391,7 @@ class DatabaseRepo:
                     relevant_documents=[DocumentReference(**d) for d in json.loads(r.relevant_docs_json)],
                     answerability=Answerability(r.answerability),
                     tags=json.loads(r.tags_json),
+                    metadata=json.loads(r.metadata_json) if r.metadata_json else {},
                 )
             )
         if not cases:
