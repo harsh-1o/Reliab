@@ -512,23 +512,25 @@ def _resolve_session_db(db_session: Any = None) -> tuple[Any, bool]:
         return db_session, False
     try:
         from rag_platform.server import app, get_db
+
         if get_db in app.dependency_overrides:
             gen = app.dependency_overrides[get_db]()
             return next(gen), True
-    except Exception:
+    except (ImportError, AttributeError, KeyError, StopIteration):
         pass
     from sqlalchemy.orm import Session
 
     from rag_platform.db import create_db_engine
+
     return Session(create_db_engine()), True
 
 
 class SessionStore:
     """Database-backed server-side store for opaque browser session tokens.
 
-    Persists sessions in the database (SessionRow) so authenticated browser sessions
-    are recognized and invalidated consistently across distributed API workers and
-    processes behind load balancers.
+    Persists cryptographic SHA-256 hashes of session tokens in the database (SessionRow),
+    ensuring bearer tokens are never stored in plaintext. Authenticated browser sessions
+    are linked to their issuing credentials for immediate revocation and live authorization.
     """
 
     DEFAULT_TTL_SECONDS: float = 86400.0  # 24 hours
@@ -538,9 +540,14 @@ class SessionStore:
         cls,
         identity: ClientIdentity,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        api_key_hash: str | None = None,
         db_session: Any = None,
     ) -> str:
-        session_id = f"sess_{secrets.token_urlsafe(32)}"
+        from rag_platform.core import sha256_hash
+        from rag_platform.db import SessionRow
+
+        raw_token = f"sess_{secrets.token_urlsafe(32)}"
+        token_hash = sha256_hash(raw_token)
         now_utc = datetime.now(timezone.utc)
         expires_at = now_utc + timedelta(seconds=ttl_seconds)
         roles_dict = {
@@ -548,10 +555,9 @@ class SessionStore:
             for p, r in identity.project_roles.items()
         }
 
-        from rag_platform.db import SessionRow
-
         row = SessionRow(
-            session_id=session_id,
+            token_hash=token_hash,
+            api_key_hash=api_key_hash,
             client_id=identity.client_id,
             is_admin=identity.is_admin,
             project_roles_json=json.dumps(roles_dict),
@@ -567,18 +573,25 @@ class SessionStore:
             if should_close:
                 sess.close()
 
-        return session_id
+        return raw_token
 
     @classmethod
     def get_session(cls, session_id: str, db_session: Any = None) -> ClientIdentity | None:
         if not session_id or not isinstance(session_id, str):
             return None
 
-        from rag_platform.db import SessionRow
+        from rag_platform.core import sha256_hash
+        from rag_platform.db import ApiKeyRow, SessionRow
+
+        token_hash = sha256_hash(session_id)
 
         sess, should_close = _resolve_session_db(db_session)
         try:
-            row = sess.get(SessionRow, session_id)
+            row = sess.get(SessionRow, token_hash)
+            # In case the caller provided an already-hashed 64-character token
+            if row is None and len(session_id) == 64:
+                row = sess.get(SessionRow, session_id)
+
             if row is None:
                 return None
 
@@ -595,6 +608,48 @@ class SessionStore:
                     pass
                 return None
 
+            # If session is linked to an originating API key, verify it is still active
+            # and reflect live database permissions rather than a stale snapshot
+            if row.api_key_hash:
+                key_row = sess.get(ApiKeyRow, row.api_key_hash)
+                if key_row is not None:
+                    if key_row.revoked_at is not None:
+                        try:
+                            sess.delete(row)
+                            sess.commit()
+                        except Exception:
+                            pass
+                        return None
+
+                    roles_raw = json.loads(key_row.project_roles_json) if key_row.project_roles_json else {}
+                    roles = {p: (Role(r) if isinstance(r, str) else r) for p, r in roles_raw.items()}
+                    return ClientIdentity(
+                        client_id=key_row.client_id,
+                        is_admin=key_row.is_admin,
+                        project_roles=roles,
+                    )
+                else:
+                    # Key is not in database ApiKeyRow. Check in-memory cache or admin settings key.
+                    with ApiKeyRegistry._lock:
+                        cache_entry = ApiKeyRegistry._cache.get(row.api_key_hash)
+                    if cache_entry is not None:
+                        cached_ident, _ = cache_entry
+                        return cached_ident
+
+                    from rag_platform.core import get_settings
+
+                    settings = get_settings()
+                    admin_key = getattr(settings, "api_key", None)
+                    if admin_key and sha256_hash(admin_key) == row.api_key_hash:
+                        return ClientIdentity(
+                            client_id=row.client_id or "global_admin",
+                            is_admin=True,
+                            project_roles={},
+                        )
+                    # Key was deleted or is unknown
+                    return None
+
+            # Standalone session without linked API key: use session snapshot
             roles_raw = json.loads(row.project_roles_json) if row.project_roles_json else {}
             roles = {p: (Role(r) if isinstance(r, str) else r) for p, r in roles_raw.items()}
             return ClientIdentity(
@@ -611,11 +666,16 @@ class SessionStore:
         if not session_id or not isinstance(session_id, str):
             return False
 
+        from rag_platform.core import sha256_hash
         from rag_platform.db import SessionRow
+
+        token_hash = sha256_hash(session_id)
 
         sess, should_close = _resolve_session_db(db_session)
         try:
-            row = sess.get(SessionRow, session_id)
+            row = sess.get(SessionRow, token_hash)
+            if row is None and len(session_id) == 64:
+                row = sess.get(SessionRow, session_id)
             if row is not None:
                 sess.delete(row)
                 sess.commit()
@@ -626,13 +686,44 @@ class SessionStore:
                 sess.close()
 
     @classmethod
+    def cleanup_expired(cls, db_session: Any = None) -> int:
+        """Batch-deletes expired sessions utilizing the ix_sessions_expires_at index.
+
+        Safe error handling: logs unexpected database failures without exposing tokens.
+        """
+        import logging
+
+        from sqlalchemy import delete
+
+        from rag_platform.db import SessionRow
+
+        now_utc = datetime.now(timezone.utc)
+        sess, should_close = _resolve_session_db(db_session)
+        try:
+            stmt = delete(SessionRow).where(SessionRow.expires_at < now_utc)
+            res = sess.execute(stmt)
+            sess.commit()
+            return int(res.rowcount or 0)
+        except Exception as exc:
+            sess.rollback()
+            logging.getLogger("rag_platform.security").error(
+                "Failed to clean up expired sessions from database: %s", type(exc).__name__
+            )
+            raise RuntimeError("Database error during expired session cleanup") from exc
+        finally:
+            if should_close:
+                sess.close()
+
+    @classmethod
     def clear(cls, db_session: Any = None) -> None:
         """Clear all stored sessions (used primarily in test fixtures)."""
+        from sqlalchemy import delete
+
         from rag_platform.db import SessionRow
 
         sess, should_close = _resolve_session_db(db_session)
         try:
-            sess.query(SessionRow).delete()
+            sess.execute(delete(SessionRow))
             sess.commit()
         except Exception:
             pass

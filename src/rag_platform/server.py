@@ -351,21 +351,20 @@ def create_auth_session(
         is_admin=ctx.is_admin,
         project_roles=ctx.project_roles,
     )
-    session_token = SessionStore.create_session(identity, ttl_seconds=86400.0, db_session=db)
+    from rag_platform.core import sha256_hash
+
+    api_key_hash = sha256_hash(req.api_key)
+    session_token = SessionStore.create_session(
+        identity,
+        ttl_seconds=86400.0,
+        api_key_hash=api_key_hash,
+        db_session=db,
+    )
 
     # Issue opaque session token as HttpOnly cookie (never the raw API key)
+    # The legacy 'api_key' cookie is no longer set; new sessions strictly use 'session_id'.
     response.set_cookie(
         key="session_id",
-        value=session_token,
-        httponly=True,
-        samesite="strict",
-        secure=not settings.dev_mode,
-        max_age=86400,
-        path="/",
-    )
-    # Also set api_key cookie alias containing opaque session_token for backward compatibility
-    response.set_cookie(
-        key="api_key",
         value=session_token,
         httponly=True,
         samesite="strict",
@@ -497,6 +496,23 @@ def rotate_api_key_endpoint(
         "project_roles": roles,
         "created_at": new_row.created_at.isoformat() if new_row.created_at else None,
         "message": "API key rotated successfully. Previous key revoked.",
+    }
+
+
+# --- Maintenance & Operational Endpoints ---
+@app.post("/v1/maintenance/cleanup")
+def maintenance_cleanup_endpoint(
+    db: Session = Depends(get_db),
+    auth: SecurityContext = Depends(get_auth),
+):
+    """Purge expired browser sessions and stale artifacts. Requires administrator privileges."""
+    if not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator role required for maintenance operations.")
+    deleted_sessions = SessionStore.cleanup_expired(db_session=db)
+    return {
+        "status": "SUCCESS",
+        "deleted_expired_sessions": deleted_sessions,
+        "message": f"Successfully purged {deleted_sessions} expired session(s).",
     }
 
 

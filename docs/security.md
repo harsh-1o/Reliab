@@ -9,8 +9,24 @@ Reliab is built with enterprise defense-in-depth principles to safely evaluate i
 ### Fail-Closed Authentication & Opaque Sessions
 - **Default Enabled**: `AUTH_ENABLED=true` is the default configuration.
 - **Environment Gating**: The application rejects startup if `DEV_MODE=true` is detected in staging or production environments.
-- **Hashed API Keys**: API keys are securely hashed using cryptographic primitives before comparison to mitigate timing attacks.
-- **Opaque Browser Session Tokens**: Authenticating via `POST /v1/auth/session` exchanges the API key for an opaque random session token (`sess_<token_urlsafe(32)>`). The raw API key is **never** stored in browser cookies. Sessions are stored in a server-side `SessionStore` with a 24-hour TTL, and `/v1/auth/logout` explicitly invalidates the server-side session.
+- **Hashed API Keys**: API keys are securely hashed using cryptographic primitives (SHA-256) before comparison and database storage, mitigating timing attacks and credential leakage.
+- **Cryptographically Hashed Session Tokens**: Authenticating via `POST /v1/auth/session` exchanges an API key for a cryptographically secure, random bearer token (`sess_<token_urlsafe(32)>`).
+  - The raw bearer token is returned to the client and stored exclusively in an HttpOnly, SameSite=Strict `session_id` cookie.
+  - The database stores **only** the SHA-256 hash of the token (`token_hash`), ensuring that a database compromise or SQL dump never leaks valid session bearer credentials.
+  - Incoming session requests hash the presented token and perform lookup by hash.
+- **Credential Linkage & Instant Revocation**:
+  - Each browser session is linked to the issuing API key (`api_key_hash`).
+  - Revoking or rotating an API key immediately invalidates and deletes all active sessions associated with that key.
+  - Active sessions dynamically reflect live database permissions (`project_roles_json` and `is_admin`) of the originating credential.
+- **Session Cleanup & Expiration**:
+  - Sessions default to a 24-hour TTL (`expires_at`).
+  - Expired sessions are rejected automatically during authentication and can be purged safely in batches via `POST /v1/maintenance/cleanup` utilizing the database index on `expires_at`.
+- **API-Key Cache & Revocation Consistency**:
+  - API key identities are cached in-memory with a short TTL (configurable via `API_KEY_CACHE_TTL_SECONDS`, default 2.0 seconds).
+  - Key revocation and rotation immediately purge the local process cache. Cross-process propagation is guaranteed within the 2.0-second window (or 0.0 seconds if `API_KEY_CACHE_TTL_SECONDS=0` is configured for strict instantaneous cross-process consistency).
+- **Brute-Force Rate Limiting Scope**:
+  - `AuthRateLimiter` enforces a process-local sliding window (default 5 failed attempts per 60s per IP) for defense-in-depth against brute-force attacks on `/v1/auth/session`.
+  - In distributed multi-process or containerized deployments behind load balancers, edge gateways (such as NGINX, Cloudflare, Envoy, or AWS WAF) handle centralized rate limiting without requiring external Redis dependencies for offline/air-gapped environments.
 - **Trusted Reverse Proxy Defense**: Client IP extraction respects `TRUSTED_PROXIES` (default `127.0.0.1,::1,testclient`). If a request does not originate from a configured trusted proxy, `X-Forwarded-For` headers are ignored and the direct socket IP is enforced, preventing spoofing and rate-limiting bypasses.
 
 ### Socket-Level SSRF Defense

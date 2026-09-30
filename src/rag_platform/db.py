@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete,
     func,
     select,
     update,
@@ -229,7 +230,8 @@ class EvaluationCacheRow(Base):
 class SessionRow(Base):
     __tablename__ = "sessions"
 
-    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    api_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     project_roles_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -706,6 +708,8 @@ class DatabaseRepo:
             .values(revoked_at=now)
         )
         res = self.session.execute(stmt)
+        # Invalidate any browser sessions created from this revoked API key
+        self.session.execute(delete(SessionRow).where(SessionRow.api_key_hash == key_hash))
         self.session.flush()
         ApiKeyRegistry.invalidate(key_hash)
         return res.rowcount > 0
@@ -722,6 +726,8 @@ class DatabaseRepo:
 
         now = datetime.now(timezone.utc)
         old_row.revoked_at = now
+        # Invalidate any browser sessions created from rotated old API key
+        self.session.execute(delete(SessionRow).where(SessionRow.api_key_hash == old_key_hash))
         self.session.flush()
         ApiKeyRegistry.invalidate(old_key_hash)
 
