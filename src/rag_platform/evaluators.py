@@ -429,15 +429,18 @@ class MeanReciprocalRankMetric(BaseMetric):
             )
 
         gold_refs = case.relevant_documents
-        for chunk in trace.retrieved_chunks:
+        # Use enumerate position (1-indexed) as the rank, not chunk.rank,
+        # because the list order is the ground truth for MRR and chunk.rank
+        # may be stale or inconsistent if the list wasn't sorted.
+        for position, chunk in enumerate(trace.retrieved_chunks, start=1):
             if any(is_evidence_match(gold, chunk) for gold in gold_refs):
-                rr = 1.0 / max(1, chunk.rank)
+                rr = 1.0 / position
                 return MetricResult(
                     metric_name=self.name,
                     metric_family=self.family,
                     score=round(rr, 4),
                     status=MetricStatus.PASS if rr >= 0.50 else MetricStatus.FAIL,
-                    reason=f"First relevant evidence '{chunk.document_id}:{chunk.chunk_id}' found at rank {chunk.rank}.",
+                    reason=f"First relevant evidence '{chunk.document_id}:{chunk.chunk_id}' found at position {position}.",
                     evaluator_version=self.version,
                 )
 
@@ -724,34 +727,50 @@ class CitationSupportMetric(BaseMetric):
             )
 
         chunk_map = {c.chunk_id: c for c in trace.retrieved_chunks}
-        doc_map = {c.document_id: c for c in trace.retrieved_chunks}
+        # Preserve ALL chunks per document (not just the last one).
+        # A single document_id can appear across multiple chunks.
+        doc_chunks_map: dict[str, list[RetrievedChunk]] = {}
+        for c in trace.retrieved_chunks:
+            doc_chunks_map.setdefault(c.document_id, []).append(c)
 
         valid_count = 0
         heuristic_validated: list[dict] = []
         total = len(trace.citations)
 
         for cit in trace.citations:
-            matched = chunk_map.get(cit.chunk_id) or doc_map.get(cit.document_id)
-            if not matched:
+            # Strict match: if the citation specifies a chunk_id, require exact match.
+            # Do NOT fall back to document-level when an explicit chunk_id is wrong.
+            if cit.chunk_id and cit.chunk_id in chunk_map:
+                matched_chunks = [chunk_map[cit.chunk_id]]
+            elif cit.chunk_id:
+                # Citation references a specific chunk_id that was NOT retrieved — genuine miss.
+                continue
+            else:
+                # No chunk_id specified — match at document level across all chunks.
+                matched_chunks = doc_chunks_map.get(cit.document_id, [])
+            if not matched_chunks:
                 continue
 
-            # Primary: verify claim against matched chunk using the grounding evaluator
-            citation_status, _, _ = verify_claim_against_chunks(cit.claim_text, [matched])
+            # Primary: verify claim against ALL matched chunks using the grounding evaluator
+            citation_status, _, _ = verify_claim_against_chunks(cit.claim_text, matched_chunks)
             if citation_status == ClaimStatus.SUPPORTED:
                 valid_count += 1
             else:
                 # Heuristic lexical fallback — explicitly disclosed in metadata.
                 # A weak lexical match must NOT silently override the primary evaluator.
                 claim_words = [w for w in re.findall(r"\w+", cit.claim_text.lower()) if len(w) > 2]
-                chunk_words = set(re.findall(r"\w+", matched.text.lower()))
-                lexical_overlap = sum(1 for w in claim_words if w in chunk_words) / len(claim_words) if claim_words else 0.0
-                if lexical_overlap >= 0.40:
+                best_overlap = 0.0
+                for mc in matched_chunks:
+                    chunk_words = set(re.findall(r"\w+", mc.text.lower()))
+                    overlap = sum(1 for w in claim_words if w in chunk_words) / len(claim_words) if claim_words else 0.0
+                    best_overlap = max(best_overlap, overlap)
+                if best_overlap >= 0.40:
                     valid_count += 1
                     # Tag this citation as heuristically validated (not semantically)
                     heuristic_validated.append({
                         "claim_id": cit.claim_id,
                         "evaluation_method": "HEURISTIC_FALLBACK",
-                        "lexical_overlap": round(lexical_overlap, 3),
+                        "lexical_overlap": round(best_overlap, 3),
                     })
 
         score = round(valid_count / total, 4)
@@ -1117,9 +1136,9 @@ class EvaluationEngine:
             ],
             "trace_answer": trace.answer,
             "trace_abstained": trace.abstained,
-            # Include chunk content hash, not just IDs (fixes stale cache on content change)
+            # Include chunk content hash AND rank (rank affects MRR/precision metrics)
             "chunks": [
-                {"document_id": c.document_id, "chunk_id": c.chunk_id, "content_hash": sha256_hash(c.text)}
+                {"document_id": c.document_id, "chunk_id": c.chunk_id, "rank": c.rank, "content_hash": sha256_hash(c.text)}
                 for c in trace.retrieved_chunks
             ],
             "citations": [
@@ -1208,11 +1227,33 @@ class EvaluationEngine:
             variance = sum((x - mean_val) ** 2 for x in vals) / (n - 1) if n > 1 else 0.0
             std_dev = math.sqrt(variance)
 
-            # Wilson score interval for bounded proportion metrics
-            ci_lower, ci_upper = wilson_score_interval(mean_val, n)
+            # Confidence interval: Wilson score is valid only for binary/binomial metrics
+            # (where each score is 0 or 1). For continuous metrics use normal CI.
+            is_binary = all(v in (0.0, 1.0) for v in vals)
+            if is_binary:
+                ci_lower, ci_upper = wilson_score_interval(mean_val, n)
+            elif n > 1:
+                # Normal approximation CI for continuous metrics
+                se = std_dev / math.sqrt(n)
+                z = statistics.NormalDist().inv_cdf(0.975)  # 95% CI
+                ci_lower = round(max(0.0, mean_val - z * se), 4)
+                ci_upper = round(min(1.0, mean_val + z * se), 4)
+            else:
+                ci_lower, ci_upper = round(mean_val, 4), round(mean_val, 4)
 
-            p50_idx = int(n * 0.50)
-            p95_idx = min(int(n * 0.95), n - 1)
+            # Standard percentile calculation using linear interpolation
+            def _percentile(sorted_data: list[float], pct: float) -> float:
+                """Compute percentile using standard linear interpolation (matches numpy default)."""
+                if len(sorted_data) == 1:
+                    return sorted_data[0]
+                rank = pct * (len(sorted_data) - 1)
+                lo = int(rank)
+                hi = min(lo + 1, len(sorted_data) - 1)
+                frac = rank - lo
+                return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
+
+            p50_val = _percentile(sorted_vals, 0.50)
+            p95_val = _percentile(sorted_vals, 0.95)
 
             sample_warning = (
                 f"Small sample size (N={n} < 30); statistical variance is elevated."
@@ -1224,8 +1265,8 @@ class EvaluationEngine:
                 metric_name=name,
                 metric_family=metric_families[name],
                 mean=round(mean_val, 4),
-                p50=round(sorted_vals[p50_idx], 4),
-                p95=round(sorted_vals[p95_idx], 4),
+                p50=round(p50_val, 4),
+                p95=round(p95_val, 4),
                 min=round(sorted_vals[0], 4),
                 max=round(sorted_vals[-1], 4),
                 count=n,
