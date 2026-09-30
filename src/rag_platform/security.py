@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
+import secrets
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -327,7 +331,6 @@ class ClientIdentity(BaseModel):
     project_roles: dict[str, Role] = Field(default_factory=dict)
 
 
-import secrets
 
 
 def generate_secure_api_key() -> str:
@@ -345,7 +348,7 @@ class ApiKeyRegistry:
 
     _cache: dict[str, tuple[ClientIdentity, float]] = {}  # key_hash -> (identity, cached_at_monotonic)
     _lock: threading.Lock = threading.Lock()
-    CACHE_TTL_SECONDS: float = 60.0
+    CACHE_TTL_SECONDS: float = float(os.getenv("API_KEY_CACHE_TTL_SECONDS", "2.0"))
 
     @classmethod
     def register(
@@ -503,47 +506,139 @@ class ApiKeyRegistry:
             cls._cache.clear()
 
 
-class SessionStore:
-    """Server-side store for opaque browser session tokens.
+def _resolve_session_db(db_session: Any = None) -> tuple[Any, bool]:
+    """Resolves an active database session for SessionStore operations."""
+    if db_session is not None:
+        return db_session, False
+    try:
+        from rag_platform.server import app, get_db
+        if get_db in app.dependency_overrides:
+            gen = app.dependency_overrides[get_db]()
+            return next(gen), True
+    except Exception:
+        pass
+    from sqlalchemy.orm import Session
 
-    Prevents exposure of raw API credentials in browser cookies by issuing
-    random, short-lived session identifiers tied to client identities.
+    from rag_platform.db import create_db_engine
+    return Session(create_db_engine()), True
+
+
+class SessionStore:
+    """Database-backed server-side store for opaque browser session tokens.
+
+    Persists sessions in the database (SessionRow) so authenticated browser sessions
+    are recognized and invalidated consistently across distributed API workers and
+    processes behind load balancers.
     """
 
-    _sessions: dict[str, tuple[ClientIdentity, float]] = {}  # session_id -> (identity, expires_at_monotonic)
-    _lock: threading.Lock = threading.Lock()
     DEFAULT_TTL_SECONDS: float = 86400.0  # 24 hours
 
     @classmethod
-    def create_session(cls, identity: ClientIdentity, ttl_seconds: float = DEFAULT_TTL_SECONDS) -> str:
+    def create_session(
+        cls,
+        identity: ClientIdentity,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        db_session: Any = None,
+    ) -> str:
         session_id = f"sess_{secrets.token_urlsafe(32)}"
-        expires_at = time.monotonic() + ttl_seconds
-        with cls._lock:
-            cls._sessions[session_id] = (identity, expires_at)
+        now_utc = datetime.now(timezone.utc)
+        expires_at = now_utc + timedelta(seconds=ttl_seconds)
+        roles_dict = {
+            p: (r.value if isinstance(r, Role) else str(r))
+            for p, r in identity.project_roles.items()
+        }
+
+        from rag_platform.db import SessionRow
+
+        row = SessionRow(
+            session_id=session_id,
+            client_id=identity.client_id,
+            is_admin=identity.is_admin,
+            project_roles_json=json.dumps(roles_dict),
+            created_at=now_utc,
+            expires_at=expires_at,
+        )
+
+        sess, should_close = _resolve_session_db(db_session)
+        try:
+            sess.add(row)
+            sess.commit()
+        finally:
+            if should_close:
+                sess.close()
+
         return session_id
 
     @classmethod
-    def get_session(cls, session_id: str) -> ClientIdentity | None:
-        now = time.monotonic()
-        with cls._lock:
-            entry = cls._sessions.get(session_id)
-            if entry is None:
+    def get_session(cls, session_id: str, db_session: Any = None) -> ClientIdentity | None:
+        if not session_id or not isinstance(session_id, str):
+            return None
+
+        from rag_platform.db import SessionRow
+
+        sess, should_close = _resolve_session_db(db_session)
+        try:
+            row = sess.get(SessionRow, session_id)
+            if row is None:
                 return None
-            identity, expires_at = entry
-            if now > expires_at:
-                cls._sessions.pop(session_id, None)
+
+            now_utc = datetime.now(timezone.utc)
+            row_expires = row.expires_at
+            if row_expires.tzinfo is None:
+                row_expires = row_expires.replace(tzinfo=timezone.utc)
+
+            if now_utc > row_expires:
+                try:
+                    sess.delete(row)
+                    sess.commit()
+                except Exception:
+                    pass
                 return None
-            return identity
+
+            roles_raw = json.loads(row.project_roles_json) if row.project_roles_json else {}
+            roles = {p: (Role(r) if isinstance(r, str) else r) for p, r in roles_raw.items()}
+            return ClientIdentity(
+                client_id=row.client_id,
+                is_admin=row.is_admin,
+                project_roles=roles,
+            )
+        finally:
+            if should_close:
+                sess.close()
 
     @classmethod
-    def invalidate(cls, session_id: str) -> bool:
-        with cls._lock:
-            return cls._sessions.pop(session_id, None) is not None
+    def invalidate(cls, session_id: str, db_session: Any = None) -> bool:
+        if not session_id or not isinstance(session_id, str):
+            return False
+
+        from rag_platform.db import SessionRow
+
+        sess, should_close = _resolve_session_db(db_session)
+        try:
+            row = sess.get(SessionRow, session_id)
+            if row is not None:
+                sess.delete(row)
+                sess.commit()
+                return True
+            return False
+        finally:
+            if should_close:
+                sess.close()
 
     @classmethod
-    def clear(cls) -> None:
-        with cls._lock:
-            cls._sessions.clear()
+    def clear(cls, db_session: Any = None) -> None:
+        """Clear all stored sessions (used primarily in test fixtures)."""
+        from rag_platform.db import SessionRow
+
+        sess, should_close = _resolve_session_db(db_session)
+        try:
+            sess.query(SessionRow).delete()
+            sess.commit()
+        except Exception:
+            pass
+        finally:
+            if should_close:
+                sess.close()
 
 
 class SecurityContext(BaseModel):
@@ -595,7 +690,7 @@ def authenticate_request(
 
     # 1. Handle browser session token if provided and no explicit API key passed
     if not api_token and cookie_token:
-        sess_identity = SessionStore.get_session(cookie_token.strip())
+        sess_identity = SessionStore.get_session(cookie_token.strip(), db_session=db_session)
         if sess_identity:
             return SecurityContext(
                 authenticated=True,
