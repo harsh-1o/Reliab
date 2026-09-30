@@ -28,8 +28,9 @@ Reliab exposes a RESTful API built on FastAPI for managing projects, benchmark d
 ## 2. Authentication & Security
 
 When `RAG_AUTH_ENABLED=true` is set (default in production):
-- **API Key**: Pass the configured secret key in the `X-API-Key` HTTP header.
-- **Web UI Session**: Browser requests use an HTTP-only secure cookie session (`reliab_session`).
+- **API Key**: Pass the configured secret key in the `X-API-Key` or `Authorization: Bearer <key>` HTTP header.
+- **Web UI Session**: Browser clients authenticate via `POST /v1/auth/session` with `{"api_key": "..."}` to obtain an opaque random session token (`sess_<random>`) stored in an `HttpOnly`, `SameSite=Lax`, `Secure` cookie (`reliab_session` / `session_id`). The raw API key is never stored in browser cookies. Call `POST /v1/auth/logout` to destroy the server-side session.
+- **Trusted Proxies**: Set `TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1` when operating behind reverse proxies. Untrusted client IP spoofing in `X-Forwarded-For` is automatically rejected.
 
 ```bash
 curl -H "X-API-Key: your-api-key" \

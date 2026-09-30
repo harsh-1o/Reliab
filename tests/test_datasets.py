@@ -96,3 +96,73 @@ def test_deterministic_benchmark_split(sample_dataset: BenchmarkDataset):
     # Verify seed reproducibility
     assert dev1.checksum_sha256 == dev2.checksum_sha256
     assert test1.checksum_sha256 == test2.checksum_sha256
+
+
+def test_csv_roundtrip_preserves_semicolons_in_facts():
+    case = TestCase(
+        id="case_semi",
+        question="What is the breakdown?",
+        expected_answer="Part A; Part B",
+        expected_facts=["Entity A; sub-entity 1", "Entity B; sub-entity 2", "Simple fact"],
+        relevant_documents=[DocumentReference(document_id="doc_finance", chunk_id="chunk_1")],
+        tags=["tag1", "tag2"],
+    )
+    ds = BenchmarkDataset(
+        id="ds_semi",
+        project_id="proj_1",
+        name="semicolon_test",
+        version="v1.0",
+        cases=[case],
+    ).publish()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "semicolon_test.csv"
+        export_dataset_csv(ds, path)
+        assert path.exists()
+
+        imported = import_dataset_csv(path, "proj_1", "semicolon_test", "v1.0")
+        assert len(imported.cases) == 1
+        assert imported.cases[0].expected_facts == [
+            "Entity A; sub-entity 1",
+            "Entity B; sub-entity 2",
+            "Simple fact",
+        ]
+        assert imported.cases[0].tags == ["tag1", "tag2"]
+        assert imported.checksum_sha256 == ds.checksum_sha256
+
+
+def test_case_canonical_dict_document_order_invariance():
+    doc_a = DocumentReference(document_id="doc_a", chunk_id="c_1", page=1)
+    doc_b = DocumentReference(document_id="doc_b", chunk_id="c_2", page=2)
+
+    case_forward = TestCase(
+        id="c1",
+        question="Q?",
+        relevant_documents=[doc_a, doc_b],
+    )
+    case_reverse = TestCase(
+        id="c1",
+        question="Q?",
+        relevant_documents=[doc_b, doc_a],
+    )
+
+    assert case_forward.to_canonical_dict() == case_reverse.to_canonical_dict()
+
+    ds1 = BenchmarkDataset(
+        id="ds_1",
+        project_id="p1",
+        name="ds1",
+        version="v1",
+        cases=[case_forward],
+    ).publish()
+
+    ds2 = BenchmarkDataset(
+        id="ds_1",
+        project_id="p1",
+        name="ds1",
+        version="v1",
+        cases=[case_reverse],
+    ).publish()
+
+    assert ds1.checksum_sha256 == ds2.checksum_sha256
+

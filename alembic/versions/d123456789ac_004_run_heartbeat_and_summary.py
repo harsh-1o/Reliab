@@ -7,9 +7,9 @@ Create Date: 2026-09-25 23:05:00.000000
 """
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
 
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = 'd123456789ac'
@@ -25,7 +25,7 @@ def upgrade() -> None:
 
     if "runs" in tables:
         existing_cols = {col["name"] for col in insp.get_columns("runs")}
-        
+
         if "started_at" not in existing_cols:
             op.add_column("runs", sa.Column("started_at", sa.DateTime(timezone=True), nullable=True))
         if "heartbeat_at" not in existing_cols:

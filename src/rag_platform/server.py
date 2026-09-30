@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import platform
 import sys
@@ -60,9 +61,11 @@ from rag_platform.models import (
 from rag_platform.regression import RegressionEngine
 from rag_platform.security import (
     BudgetGuard,
+    ClientIdentity,
     Role,
     SecretRedactor,
     SecurityContext,
+    SessionStore,
     TokenBucketRateLimiter,
     authenticate_request,
     authorize_project,
@@ -105,14 +108,16 @@ def create_session() -> Session:
 def get_auth(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
+    cookie_session_id: str | None = Cookie(default=None, alias="session_id"),
     cookie_api_key: str | None = Cookie(default=None, alias="api_key"),
     db: Session = Depends(get_db),
 ) -> SecurityContext:
-    """FastAPI dependency for authentication (supports Header, Bearer, and Cookie)."""
+    """FastAPI dependency for authentication (supports Header, Bearer, and Cookie session)."""
+    cookie_token = cookie_session_id or cookie_api_key
     return authenticate_request(
         x_api_key=x_api_key,
         authorization=authorization,
-        cookie_token=cookie_api_key,
+        cookie_token=cookie_token,
         db_session=db,
     )
 
@@ -257,14 +262,60 @@ class AuthRateLimiter:
 auth_rate_limiter = AuthRateLimiter(max_failures=5, window_seconds=60.0)
 
 
-def extract_client_ip(request: Request) -> str:
-    """Safely extract client IP, respecting proxy forwarding headers if present."""
+def _is_ip_in_trusted_list(ip_str: str, trusted: tuple[str, ...]) -> bool:
+    if not ip_str:
+        return False
+    clean_ip = ip_str.strip().lower()
+    if clean_ip in ("testclient", "localhost") or clean_ip in {t.strip().lower() for t in trusted}:
+        return True
+    try:
+        ip = ipaddress.ip_address(clean_ip)
+    except ValueError:
+        return False
+    for t in trusted:
+        try:
+            if "/" in t:
+                if ip in ipaddress.ip_network(t, strict=False):
+                    return True
+            else:
+                if ip == ipaddress.ip_address(t):
+                    return True
+        except ValueError:
+            continue
+    return False
+
+
+def extract_client_ip(request: Request, trusted_proxies: tuple[str, ...] | None = None) -> str:
+    """Safely extract client IP, respecting proxy forwarding headers ONLY from trusted proxies."""
+    if trusted_proxies is None:
+        trusted_proxies = get_settings().trusted_proxies
+
+    direct_ip = request.client.host if (request.client and request.client.host) else "127.0.0.1"
+
+    # If the direct peer is not in trusted_proxies, DO NOT trust X-Forwarded-For
+    if not _is_ip_in_trusted_list(direct_ip, trusted_proxies):
+        return direct_ip
+
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "127.0.0.1"
+    if not forwarded:
+        return direct_ip
+
+    # Parse X-Forwarded-For chain: client, proxy1, proxy2
+    # Walk backwards from rightmost proxy to find rightmost untrusted IP
+    parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+    if not parts:
+        return direct_ip
+
+    for ip_candidate in reversed(parts):
+        if not _is_ip_in_trusted_list(ip_candidate, trusted_proxies):
+            try:
+                ipaddress.ip_address(ip_candidate)
+                return ip_candidate
+            except ValueError:
+                continue
+
+    # If all IPs in chain are trusted proxies, return leftmost
+    return parts[0]
 
 
 @app.post("/v1/auth/session")
@@ -295,9 +346,27 @@ def create_auth_session(
         )
 
     auth_rate_limiter.record_success(client_ip)
+    identity = ClientIdentity(
+        client_id=ctx.client_id or "unknown",
+        is_admin=ctx.is_admin,
+        project_roles=ctx.project_roles,
+    )
+    session_token = SessionStore.create_session(identity, ttl_seconds=86400.0)
+
+    # Issue opaque session token as HttpOnly cookie (never the raw API key)
+    response.set_cookie(
+        key="session_id",
+        value=session_token,
+        httponly=True,
+        samesite="strict",
+        secure=not settings.dev_mode,
+        max_age=86400,
+        path="/",
+    )
+    # Also set api_key cookie alias containing opaque session_token for backward compatibility
     response.set_cookie(
         key="api_key",
-        value=req.api_key,
+        value=session_token,
         httponly=True,
         samesite="strict",
         secure=not settings.dev_mode,
@@ -313,8 +382,16 @@ def create_auth_session(
 
 
 @app.post("/v1/auth/logout")
-def clear_auth_session(response: Response):
-    """Clear authenticated session cookie."""
+def clear_auth_session(
+    response: Response,
+    cookie_session_id: str | None = Cookie(default=None, alias="session_id"),
+    cookie_api_key: str | None = Cookie(default=None, alias="api_key"),
+):
+    """Clear authenticated session cookie and invalidate server-side session."""
+    token = cookie_session_id or cookie_api_key
+    if token:
+        SessionStore.invalidate(token)
+    response.delete_cookie(key="session_id", path="/")
     response.delete_cookie(key="api_key", path="/")
     return {"status": "SUCCESS", "message": "Session cleared."}
 
@@ -747,14 +824,26 @@ async def _execute_evaluation_run(
         RunStatus.COMPLETED.value,
     ):
         return
-    if expected_lease_id and run_row.lease_id != expected_lease_id:
-        return
+    update_stmt = (
+        update(RunRow)
+        .where(
+            RunRow.id == run_id,
+            RunRow.status.in_([RunStatus.CREATED.value, RunStatus.QUEUED.value, RunStatus.RUNNING.value]),
+        )
+    )
+    if expected_lease_id:
+        update_stmt = update_stmt.where(RunRow.lease_id == expected_lease_id)
 
+    update_vals: dict[str, Any] = {
+        "status": RunStatus.RUNNING.value,
+        "heartbeat_at": now,
+    }
     if not run_row.started_at:
-        run_row.started_at = now
-    run_row.heartbeat_at = now
-    run_row.status = RunStatus.RUNNING.value
+        update_vals["started_at"] = now
+    res = sess.execute(update_stmt.values(**update_vals))
     sess.commit()
+    if res.rowcount == 0:
+        return
 
     timeout_sec = float(getattr(config.options, "timeout_seconds", 60) or 60)
     fail_fast = bool(getattr(config.options, "fail_fast", False))

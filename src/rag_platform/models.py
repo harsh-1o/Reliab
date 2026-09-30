@@ -130,15 +130,23 @@ class TestCase(BaseModel):
         and domain parameters to SUT adapters and evaluators. Changes to metadata
         alter evaluation behavior and therefore alter the dataset checksum.
         """
+        canonical_docs = sorted(
+            [
+                {"document_id": d.document_id, "chunk_id": d.chunk_id, "page": d.page, "span": d.span}
+                for d in self.relevant_documents
+            ],
+            key=lambda d: (
+                str(d["document_id"]),
+                str(d["chunk_id"] or ""),
+                str(d["page"] if d["page"] is not None else ""),
+            ),
+        )
         return {
             "id": self.id,
             "question": self.question.strip(),
             "expected_answer": self.expected_answer.strip() if self.expected_answer else None,
             "expected_facts": sorted([f.strip() for f in self.expected_facts]),
-            "relevant_documents": [
-                {"document_id": d.document_id, "chunk_id": d.chunk_id, "page": d.page, "span": d.span}
-                for d in self.relevant_documents
-            ],
+            "relevant_documents": canonical_docs,
             "answerability": self.answerability.value,
             "tags": sorted(self.tags),
             "metadata": {k: self.metadata[k] for k in sorted(self.metadata.keys())},

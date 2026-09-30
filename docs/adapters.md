@@ -32,39 +32,45 @@ Adapters return a normalized `RagTrace` object containing:
 ### 1. `HttpRagAdapter`
 Connects to remote or local HTTP microservices serving RAG pipelines:
 - **SSRF Defense**: Uses `SSRFProtectedTransport` to validate destination IP addresses against private networks (RFC 1918, RFC 3927) and pin sockets to prevent DNS rebinding.
-- **Resilience**: Configurable retry policies with exponential backoff (`asyncio.sleep`) and jitter.
+- **Strict Response Validation**: Explicitly validates RAG payloads against schema contracts before converting into `RagTrace`. Missing or non-string answers on non-abstained responses, malformed citations, or invalid chunk structures generate clear `OPS-01` traces with diagnostic telemetry instead of silent partial evaluations.
+- **Retry & Idempotency Contract**: Intended for read-only evaluation requests. Outbound requests automatically include `X-Request-ID` and `Idempotency-Key` headers (`eval_{project}_{dataset}_{case}_{trace}`). Automatic retries with exponential backoff and jitter are performed for transient HTTP status codes (`429`, `502`, `503`, `504`) and connection drops without duplicating side-effects.
 - **Bounded Concurrency**: Throttles outbound traffic using `asyncio.Semaphore` to protect SUT endpoints from overload.
 
 #### Expected Request Payload
 ```json
 {
-  "query": "What is the warranty period for Model X?",
-  "metadata": {
-    "test_case_id": "tc_001"
-  }
+  "question": "What is the warranty period for Model X?",
+  "test_case_id": "tc_001",
+  "metadata": {}
 }
 ```
 
-#### Expected Response Payload
+#### Expected Response Payload Contract
 ```json
 {
   "answer": "The warranty period for Model X is 3 years or 36,000 miles [1].",
-  "retrieved_documents": [
+  "abstained": false,
+  "abstention_reason": null,
+  "retrieved_chunks": [
     {
       "chunk_id": "chk_102",
       "document_id": "doc_warranty_guide",
       "text": "Model X coverage includes a 3-year or 36,000-mile limited warranty.",
-      "score": 0.94
+      "score": 0.94,
+      "rank": 1
     }
   ],
   "citations": [
     {
+      "claim_id": "cl_0",
+      "claim_text": "Model X coverage includes a 3-year or 36,000-mile limited warranty.",
       "document_id": "doc_warranty_guide",
       "chunk_id": "chk_102"
     }
   ],
-  "latency_ms": 320.5,
-  "cost_usd": 0.00045
+  "telemetry": {
+    "latency_ms": 320.5
+  }
 }
 ```
 
@@ -120,3 +126,14 @@ class CustomPipelineAdapter(RagAdapter):
             latency_ms=result.elapsed_ms,
         )
 ```
+
+### 4. Process-Local Python Adapter Registry
+To evaluate internal Python pipelines without exposing the platform to arbitrary remote code execution via HTTP payloads:
+- Callables are registered explicitly in code:
+  ```python
+  from rag_platform.adapters import PythonAdapterRegistry
+  PythonAdapterRegistry.register("my_model_v1", my_eval_fn)
+  ```
+- **Multi-Process Architecture**: When running distributed workers across separate processes, callables must be registered during application bootstrap in each worker process.
+- **Security**: The REST API accepts only pre-registered string identifiers (`"adapter_type": "python"`, `"adapter_config": {"model_name": "my_model_v1"}`). Arbitrary code submission via JSON or network payload is strictly prohibited.
+

@@ -184,6 +184,13 @@ class Settings:
             "false" if _is_production_environment() else "true",
         ).lower() in ("true", "1")
     )
+    trusted_proxies: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            p.strip()
+            for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1,testclient").split(",")
+            if p.strip()
+        )
+    )
     default_max_cases: int = 500
     default_timeout_seconds: int = 60
 

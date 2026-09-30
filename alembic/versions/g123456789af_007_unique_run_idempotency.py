@@ -5,9 +5,9 @@ Revises: f123456789ae
 """
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
 
+from alembic import op
 
 revision: str = "g123456789af"
 down_revision: Union[str, None] = "f123456789ae"

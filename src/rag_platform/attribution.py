@@ -58,7 +58,7 @@ class FailureAttributionEngine:
         findings: list[DiagnosticFinding] = []
 
         # --- Stage 1: Infrastructure & System Errors (OPS-01) ---
-        if trace.error_code == "OPS-01" or (trace.latency_ms >= 5000 and not trace.answer):
+        if trace.error_code is not None or (trace.latency_ms >= 5000 and not trace.answer):
             findings.append(
                 DiagnosticFinding(
                     code=FailureCode.OPS_01,

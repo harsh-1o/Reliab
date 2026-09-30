@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from enum import Enum
 from typing import Any, Callable, Protocol
@@ -31,29 +32,108 @@ class RagAdapter(Protocol):
         ...
 
 
+class HttpRagResponseError(ValueError):
+    """Raised when an external RAG HTTP endpoint returns a schema-violating payload."""
+    pass
+
+
+def validate_http_rag_response(raw_data: Any) -> dict[str, Any]:
+    """Validate external RAG system response against expected contract.
+
+    Enforces required fields and structural types while keeping legitimate optional fields optional.
+    """
+    if not isinstance(raw_data, dict):
+        raise HttpRagResponseError(
+            f"Expected JSON object (dict) in RAG response, got {type(raw_data).__name__}"
+        )
+
+    abstained = raw_data.get("abstained")
+    if abstained is not None and not isinstance(abstained, bool):
+        raise HttpRagResponseError(
+            f"Field 'abstained' must be a boolean, got {type(abstained).__name__}"
+        )
+    is_abstained = bool(abstained)
+
+    answer = raw_data.get("answer")
+    if not is_abstained:
+        if answer is None:
+            raise HttpRagResponseError("Missing required field 'answer' on non-abstained response")
+        if not isinstance(answer, str):
+            raise HttpRagResponseError(f"Field 'answer' must be a string, got {type(answer).__name__}")
+    else:
+        if answer is not None and not isinstance(answer, str):
+            raise HttpRagResponseError(f"Field 'answer' must be a string or None, got {type(answer).__name__}")
+
+    abstention_reason = raw_data.get("abstention_reason")
+    if abstention_reason is not None and not isinstance(abstention_reason, str):
+        raise HttpRagResponseError(
+            f"Field 'abstention_reason' must be a string or None, got {type(abstention_reason).__name__}"
+        )
+
+    chunks = raw_data.get("retrieved_chunks")
+    if chunks is not None:
+        if not isinstance(chunks, list):
+            raise HttpRagResponseError(f"Field 'retrieved_chunks' must be a list, got {type(chunks).__name__}")
+        for idx, chunk in enumerate(chunks):
+            if not isinstance(chunk, dict):
+                raise HttpRagResponseError(f"Chunk at index {idx} in 'retrieved_chunks' must be a dict")
+            chunk_doc = chunk.get("document_id")
+            if chunk_doc is not None and not isinstance(chunk_doc, str):
+                raise HttpRagResponseError(f"Chunk at index {idx} has invalid 'document_id': must be string")
+
+    citations = raw_data.get("citations")
+    if citations is not None:
+        if not isinstance(citations, list):
+            raise HttpRagResponseError(f"Field 'citations' must be a list, got {type(citations).__name__}")
+        for idx, cit in enumerate(citations):
+            if not isinstance(cit, dict):
+                raise HttpRagResponseError(f"Citation at index {idx} in 'citations' must be a dict")
+            claim_text = cit.get("claim_text")
+            if claim_text is not None and not isinstance(claim_text, str):
+                raise HttpRagResponseError(f"Citation at index {idx} has invalid 'claim_text': must be string")
+
+    telemetry = raw_data.get("telemetry")
+    if telemetry is not None and not isinstance(telemetry, dict):
+        raise HttpRagResponseError(f"Field 'telemetry' must be a dict, got {type(telemetry).__name__}")
+
+    return raw_data
+
+
 class PythonAdapterRegistry:
     """Trusted server-side registry mapping adapter names to verified Python callables.
 
     Prevents untrusted remote code execution from JSON payloads while allowing
     pre-registered Python callables to be referenced safely by name via API.
+
+    Multi-process note: When running distributed workers across separate processes,
+    callables must be registered during application initialization in each worker process.
+    The REST API strictly disallows dynamic code submission, only referencing registered names.
     """
 
     _registry: dict[str, Callable[[TestCase, RunConfig], RagTrace | Any]] = {}
+    _lock: threading.Lock = threading.Lock()
 
     @classmethod
     def register(cls, name: str, fn: Callable[[TestCase, RunConfig], RagTrace | Any]) -> None:
-        cls._registry[name] = fn
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Adapter name must be a non-empty string.")
+        if not callable(fn):
+            raise ValueError(f"Adapter handler for '{name}' must be callable.")
+        with cls._lock:
+            cls._registry[name] = fn
 
     @classmethod
     def get(cls, name: str) -> Callable[[TestCase, RunConfig], RagTrace | Any]:
-        if name not in cls._registry:
-            available = sorted(list(cls._registry.keys()))
-            raise ValueError(f"Unknown registered python adapter '{name}'. Available: {available}")
-        return cls._registry[name]
+        with cls._lock:
+            if name not in cls._registry:
+                available = sorted(list(cls._registry.keys()))
+                raise ValueError(f"Unknown registered python adapter '{name}'. Available: {available}")
+            return cls._registry[name]
 
     @classmethod
     def clear(cls) -> None:
-        cls._registry.clear()
+        with cls._lock:
+            cls._registry.clear()
 
 
 class PythonRagAdapter:
@@ -112,6 +192,13 @@ class HttpRagAdapter:
         self._shared_client = client
         self._owns_client = client is None
 
+    def _pin_host(self, client: httpx.AsyncClient, host: str, ip: str) -> None:
+        """Encapsulate IP pinning behind transport interface without exposing internal details."""
+        transport = getattr(client, "_transport", None)
+        pin_fn = getattr(transport, "pin_host", None)
+        if callable(pin_fn):
+            pin_fn(host, ip)
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._shared_client is not None and not self._shared_client.is_closed:
             return self._shared_client
@@ -163,10 +250,9 @@ class HttpRagAdapter:
             client = await self._get_client()
 
             # Pin validated host IP on transport if supported
-            if hasattr(client, "_transport") and hasattr(client._transport, "pin_host"):
-                parsed_host = urlsplit(current_url).hostname
-                if parsed_host and validated_ips:
-                    client._transport.pin_host(parsed_host, validated_ips[0])
+            parsed_host = urlsplit(current_url).hostname
+            if parsed_host and validated_ips:
+                self._pin_host(client, parsed_host, validated_ips[0])
 
             # Follow redirects manually with strict SSRF validation at every hop
             max_redirects = 5
@@ -209,6 +295,7 @@ class HttpRagAdapter:
                         raise httpx.TooManyRedirects("Exceeded maximum redirect hops")
                     location = resp.headers["location"]
                     current_url = urljoin(current_url, location)
+                    redir_host = urlsplit(current_url).hostname
                     # Revalidate every redirect destination before following
                     redirect_ips = validate_url_ssrf(
                         current_url,
@@ -216,10 +303,8 @@ class HttpRagAdapter:
                         allow_private_ips=self.allow_private_ip,
                         dns_resolver=self.dns_resolver,
                     )
-                    if hasattr(client, "_transport") and hasattr(client._transport, "pin_host"):
-                        redir_host = urlsplit(current_url).hostname
-                        if redir_host and redirect_ips:
-                            client._transport.pin_host(redir_host, redirect_ips[0])
+                    if redir_host and redirect_ips:
+                        self._pin_host(client, redir_host, redirect_ips[0])
                     continue
                 break
 
@@ -242,7 +327,39 @@ class HttpRagAdapter:
                     },
                 )
 
-            data = resp.json()
+            try:
+                raw_json = resp.json()
+            except Exception as json_err:
+                return RagTrace(
+                    trace_id=trace_id,
+                    run_id=generate_id("run"),
+                    test_case_id=case.id,
+                    question=case.question,
+                    error_code="OPS-01",
+                    latency_ms=latency_ms,
+                    telemetry={
+                        "error": f"Failed to parse JSON from adapter response: {json_err}",
+                        "raw_body": SecretRedactor.redact_text(resp.text[:500]),
+                        "stage": "adapter_response_validation",
+                    },
+                )
+
+            try:
+                data = validate_http_rag_response(raw_json)
+            except HttpRagResponseError as val_err:
+                return RagTrace(
+                    trace_id=trace_id,
+                    run_id=generate_id("run"),
+                    test_case_id=case.id,
+                    question=case.question,
+                    error_code="OPS-01",
+                    latency_ms=latency_ms,
+                    telemetry={
+                        "error": f"Adapter response schema validation error: {val_err}",
+                        "stage": "adapter_response_validation",
+                    },
+                )
+
             chunks = [
                 RetrievedChunk(
                     document_id=c.get("document_id", "doc_unknown"),
