@@ -1340,7 +1340,12 @@ class EvaluationEngine:
         evaluated_cases = len(evaluated_case_ids)
         total_cases = evaluated_cases
         # Semantically correct scored_cases: distinct cases where at least one metric yielded a numeric score
-        scored_cases = sum(1 for _, m_list in traces_with_metrics if any(m.score is not None for m in m_list))
+        scored_case_ids = {
+            trace.test_case_id
+            for trace, m_list in traces_with_metrics
+            if trace.test_case_id in seen_case_ids and any(m.score is not None for m in m_list)
+        }
+        scored_cases = len(scored_case_ids)
         infra_error_count = sum(
             1 for trace, _ in traces_with_metrics
             if trace.error_code is not None or (trace.telemetry and trace.telemetry.get("error_code"))
