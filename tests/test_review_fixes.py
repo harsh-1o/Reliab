@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from rag_platform.adapters import HttpRagResponseError, HttpRagResponsePayload
+from rag_platform.adapters import HttpRagResponsePayload
 from rag_platform.evaluators import CitationSupportMetric, RecallAtKMetric
 from rag_platform.models import (
     Citation,
