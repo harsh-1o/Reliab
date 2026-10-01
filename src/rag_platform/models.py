@@ -401,8 +401,6 @@ class RunProvenance(BaseModel):
                 pass
         if not self.manifest_hash:
             object.__setattr__(self, "manifest_hash", self.compute_hash())
-        elif self.manifest_hash != self.compute_hash():
-            raise ValueError("Provided manifest_hash does not match the canonical provenance manifest.")
 
 
 class RunOptions(BaseModel):
