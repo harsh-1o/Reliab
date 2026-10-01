@@ -1258,7 +1258,7 @@ class EvaluationEngine:
             for m in m_list:
                 metric_total_counts[m.metric_name] = metric_total_counts.get(m.metric_name, 0) + 1
                 metric_families[m.metric_name] = m.metric_family
-                metric_statistical_types.setdefault(m.metric_name, str(m.metadata.get("statistical_type", "continuous")) if m.metadata else "continuous")
+                metric_statistical_types.setdefault(m.metric_name, str(m.metadata.get("statistical_type", "binary" if m.metric_name == "abstention_accuracy" else "continuous")) if m.metadata else ("binary" if m.metric_name == "abstention_accuracy" else "continuous"))
                 # Only include applicable metrics with a real numerical score
                 if m.score is not None:
                     metric_values.setdefault(m.metric_name, []).append(m.score)
