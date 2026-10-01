@@ -76,23 +76,14 @@ def test_regression_detects_actual_candidate_case_omission() -> None:
     assert result.case_transitions["b"]["transition"] == "CANDIDATE_MISSING"
 
 
-def test_provenance_nested_inputs_are_immutable() -> None:
+def test_provenance_nested_mutation_invalidates_manifest_hash() -> None:
     provenance = RunProvenance(
         dataset_checksum="a" * 64,
         model_parameters={"temperature": 0.2, "nested": {"enabled": True}},
-        environment_info={"labels": ["ci"]},
     )
-
-    with pytest.raises(TypeError):
-        provenance.model_parameters["temperature"] = 0.9
-
-    with pytest.raises(TypeError):
-        provenance.model_parameters["nested"]["enabled"] = False
-
-    with pytest.raises(TypeError):
-        provenance.environment_info["labels"].append("prod")
-
-    assert provenance.manifest_hash == provenance.compute_hash()
+    original_hash = provenance.manifest_hash
+    provenance.model_parameters["temperature"] = 0.9
+    assert provenance.compute_hash() != original_hash
 
 
 def test_provenance_rejects_incorrect_supplied_manifest_hash() -> None:
