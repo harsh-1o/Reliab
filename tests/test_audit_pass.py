@@ -244,7 +244,7 @@ def test_security_recursive_sanitization_before_persistence(memory_db: Session):
     repo.publish_dataset(ds.id)
 
     prov = RunProvenance(
-        dataset_checksum="test_checksum",
+        dataset_checksum=ds.checksum_sha256,
         rag_version="v1",
         model_config_hash="cfg",
         prompt_hash="pr",

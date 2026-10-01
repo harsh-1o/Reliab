@@ -334,6 +334,60 @@ class TestEvalCacheKeyRank:
 
         assert key1 != key2, "Cache keys must differ when chunk rank differs"
 
+    @pytest.mark.asyncio
+    async def test_different_answerability_produces_different_cache_keys(self):
+        """Cache keys must differ when test case answerability differs."""
+        from rag_platform.models import Answerability
+
+        engine = EvaluationEngine(cache=BoundedLRUCache(capacity=100))
+        case_ans = TestCase(
+            id="t1", question="q", answerability=Answerability.ANSWERABLE,
+            relevant_documents=[DocumentReference(document_id="doc1", chunk_id="c1")],
+        )
+        case_unans = TestCase(
+            id="t1", question="q", answerability=Answerability.UNANSWERABLE,
+            relevant_documents=[DocumentReference(document_id="doc1", chunk_id="c1")],
+        )
+        trace = RagTrace(
+            trace_id="tr1", run_id="r1", test_case_id="t1", question="q",
+            answer="answer",
+            retrieved_chunks=[RetrievedChunk(document_id="doc1", chunk_id="c1", rank=1, text="evidence")],
+        )
+        metric = engine.metrics[0]
+        key1 = engine._cache_key(metric, trace, case_ans)
+        key2 = engine._cache_key(metric, trace, case_unans)
+        assert key1 != key2, "Cache keys must differ when case answerability differs"
+
+    @pytest.mark.asyncio
+    async def test_different_citation_doc_and_span_produce_different_cache_keys(self):
+        """Cache keys must differ when citation document_id or span differs."""
+        from rag_platform.models import Citation
+
+        engine = EvaluationEngine(cache=BoundedLRUCache(capacity=100))
+        case = TestCase(
+            id="t1", question="q",
+            relevant_documents=[DocumentReference(document_id="doc1", chunk_id="c1")],
+        )
+        trace_doc1 = RagTrace(
+            trace_id="tr1", run_id="r1", test_case_id="t1", question="q", answer="answer",
+            citations=[Citation(claim_id="cl1", claim_text="Fact", document_id="doc1", chunk_id="c1", span=[0, 10])],
+        )
+        trace_doc2 = RagTrace(
+            trace_id="tr1", run_id="r1", test_case_id="t1", question="q", answer="answer",
+            citations=[Citation(claim_id="cl1", claim_text="Fact", document_id="doc2", chunk_id="c1", span=[0, 10])],
+        )
+        trace_span2 = RagTrace(
+            trace_id="tr1", run_id="r1", test_case_id="t1", question="q", answer="answer",
+            citations=[Citation(claim_id="cl1", claim_text="Fact", document_id="doc1", chunk_id="c1", span=[15, 25])],
+        )
+        metric = engine.metrics[0]
+        key_doc1 = engine._cache_key(metric, trace_doc1, case)
+        key_doc2 = engine._cache_key(metric, trace_doc2, case)
+        key_span2 = engine._cache_key(metric, trace_span2, case)
+
+        assert key_doc1 != key_doc2, "Cache keys must differ when citation document_id differs"
+        assert key_doc1 != key_span2, "Cache keys must differ when citation span differs"
+
 
 # ─── P2: Wilson CI Only for Binary Metrics ──────────────────────────────────
 

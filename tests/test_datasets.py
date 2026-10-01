@@ -166,3 +166,27 @@ def test_case_canonical_dict_document_order_invariance():
 
     assert ds1.checksum_sha256 == ds2.checksum_sha256
 
+
+def test_csv_import_corrupted_metadata_raises_error(tmp_path):
+    """Corrupted metadata_json must raise ValueError rather than silently defaulting to {}."""
+    bad_csv = tmp_path / "bad_metadata.csv"
+    bad_csv.write_text(
+        "id,question,expected_answer,expected_facts,tags,doc_ids,metadata_json\n"
+        "c1,What is revenue?,10B,10B,tag1,doc1,{malformed_json:not_valid\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid metadata_json"):
+        import_dataset_csv(bad_csv, "proj_1", "bad_ds", "v1.0")
+
+
+def test_split_benchmark_dataset_rejects_negative_or_out_of_bounds_ratios(sample_dataset):
+    """Each split ratio must satisfy 0 < ratio < 1."""
+    # Sum is 1.0 (-0.2 + 0.2 + 1.0 = 1.0), but dev_ratio is negative
+    with pytest.raises(ValueError, match="each split ratio must satisfy 0 < ratio < 1"):
+        split_benchmark_dataset(sample_dataset, dev_ratio=-0.2, val_ratio=0.2, test_ratio=1.0)
+
+    # 0.0 ratio
+    with pytest.raises(ValueError, match="each split ratio must satisfy 0 < ratio < 1"):
+        split_benchmark_dataset(sample_dataset, dev_ratio=0.0, val_ratio=0.4, test_ratio=0.6)
+
+

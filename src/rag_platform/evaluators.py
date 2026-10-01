@@ -1120,31 +1120,41 @@ class EvaluationEngine:
     def _cache_key(self, metric: BaseMetric, trace: RagTrace, case: TestCase) -> str:
         """Cache key incorporating ALL inputs that affect evaluation output.
 
-        Includes case questions, facts, relevant documents, answer, chunks (with content hash),
-        citations, and metric version to prevent stale cache entries.
+        Constructed from a canonical serialized representation of TestCase (including answerability,
+        facts, relevant documents with spans) and RagTrace (including answer, abstained status,
+        chunks with ranks and content hashes, citations with document_id and spans), paired with
+        the metric name and version to prevent stale cache entries.
         """
         payload = {
             "metric": metric.name,
             "version": metric.version,
-            "case_id": case.id,
-            "question": case.question,
-            "expected_answer": case.expected_answer,
-            "expected_facts": sorted(case.expected_facts),
-            "relevant_documents": [
-                {"document_id": d.document_id, "chunk_id": d.chunk_id, "page": d.page, "span": d.span}
-                for d in case.relevant_documents
-            ],
-            "trace_answer": trace.answer,
-            "trace_abstained": trace.abstained,
-            # Include chunk content hash AND rank (rank affects MRR/precision metrics)
-            "chunks": [
-                {"document_id": c.document_id, "chunk_id": c.chunk_id, "rank": c.rank, "content_hash": sha256_hash(c.text)}
-                for c in trace.retrieved_chunks
-            ],
-            "citations": [
-                {"claim_id": cit.claim_id, "chunk_id": cit.chunk_id, "claim_text": cit.claim_text}
-                for cit in trace.citations
-            ],
+            "case": case.to_canonical_dict(),
+            "trace": {
+                "question": trace.question.strip() if trace.question else "",
+                "answer": trace.answer.strip() if trace.answer else None,
+                "abstained": trace.abstained,
+                "abstention_reason": trace.abstention_reason,
+                "chunks": [
+                    {
+                        "document_id": c.document_id,
+                        "chunk_id": c.chunk_id,
+                        "rank": c.rank,
+                        "score": c.score,
+                        "content_hash": sha256_hash(c.text),
+                    }
+                    for c in trace.retrieved_chunks
+                ],
+                "citations": [
+                    {
+                        "claim_id": cit.claim_id,
+                        "claim_text": cit.claim_text,
+                        "document_id": cit.document_id,
+                        "chunk_id": cit.chunk_id,
+                        "span": cit.span,
+                    }
+                    for cit in trace.citations
+                ],
+            },
         }
         return sha256_hash(canonical_json(payload))
 

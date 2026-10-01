@@ -588,10 +588,6 @@ class SessionStore:
         sess, should_close = _resolve_session_db(db_session)
         try:
             row = sess.get(SessionRow, token_hash)
-            # In case the caller provided an already-hashed 64-character token
-            if row is None and len(session_id) == 64:
-                row = sess.get(SessionRow, session_id)
-
             if row is None:
                 return None
 
@@ -674,8 +670,6 @@ class SessionStore:
         sess, should_close = _resolve_session_db(db_session)
         try:
             row = sess.get(SessionRow, token_hash)
-            if row is None and len(session_id) == 64:
-                row = sess.get(SessionRow, session_id)
             if row is not None:
                 sess.delete(row)
                 sess.commit()

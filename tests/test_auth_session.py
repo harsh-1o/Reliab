@@ -378,6 +378,10 @@ def test_database_contains_only_session_token_hash_not_raw_bearer():
         # Lookup with tampered token fails
         assert SessionStore.get_session(raw_token + "_tampered", db_session=sess) is None
 
+        # Regression: database token_hash itself must NEVER be accepted as bearer credential
+        assert SessionStore.get_session(row.token_hash, db_session=sess) is None
+        assert SessionStore.get_session(expected_hash, db_session=sess) is None
+
 
 def test_api_key_revocation_invalidates_linked_session(auth_client):
     """Prove: API key -> session -> revoke API key -> session rejected (401)."""

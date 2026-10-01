@@ -107,8 +107,8 @@ def import_dataset_csv(
                 try:
                     parsed_facts = json.loads(raw_facts_json)
                     facts = [str(f) for f in parsed_facts] if isinstance(parsed_facts, list) else [str(parsed_facts)]
-                except Exception:
-                    facts = [ft.strip() for ft in row.get("expected_facts", "").split(";") if ft.strip()]
+                except Exception as exc:
+                    raise ValueError(f"Invalid expected_facts_json in row {row.get('id', 'unknown')}: {exc}") from exc
             else:
                 facts = [ft.strip() for ft in row.get("expected_facts", "").split(";") if ft.strip()]
 
@@ -117,8 +117,8 @@ def import_dataset_csv(
                 try:
                     parsed_tags = json.loads(raw_tags_json)
                     tags = [str(t) for t in parsed_tags] if isinstance(parsed_tags, list) else [str(parsed_tags)]
-                except Exception:
-                    tags = [t.strip() for t in row.get("tags", "").split(";") if t.strip()]
+                except Exception as exc:
+                    raise ValueError(f"Invalid tags_json in row {row.get('id', 'unknown')}: {exc}") from exc
             else:
                 tags = [t.strip() for t in row.get("tags", "").split(";") if t.strip()]
 
@@ -126,10 +126,11 @@ def import_dataset_csv(
             if raw_docs_json and raw_docs_json.strip():
                 try:
                     parsed_docs = json.loads(raw_docs_json)
+                    if not isinstance(parsed_docs, list):
+                        raise ValueError(f"relevant_documents_json must be a JSON list, got {type(parsed_docs).__name__}")
                     relevant_docs = [DocumentReference(**d) for d in parsed_docs]
-                except Exception:
-                    doc_ids = [d.strip() for d in row.get("doc_ids", "").split(";") if d.strip()]
-                    relevant_docs = [DocumentReference(document_id=did) for did in doc_ids]
+                except Exception as exc:
+                    raise ValueError(f"Invalid relevant_documents_json in row {row.get('id', 'unknown')}: {exc}") from exc
             else:
                 doc_ids = [d.strip() for d in row.get("doc_ids", "").split(";") if d.strip()]
                 relevant_docs = [DocumentReference(document_id=did) for did in doc_ids]
@@ -139,10 +140,11 @@ def import_dataset_csv(
             if raw_metadata and raw_metadata.strip():
                 try:
                     parsed_metadata = json.loads(raw_metadata)
-                    if isinstance(parsed_metadata, dict):
-                        metadata = parsed_metadata
-                except (TypeError, ValueError):
-                    metadata = {}
+                    if not isinstance(parsed_metadata, dict):
+                        raise ValueError(f"metadata_json must be a JSON object, got {type(parsed_metadata).__name__}")
+                    metadata = parsed_metadata
+                except Exception as exc:
+                    raise ValueError(f"Invalid metadata_json in row {row.get('id', 'unknown')}: {exc}") from exc
 
             cases.append(
                 TestCase(
@@ -237,7 +239,10 @@ def split_benchmark_dataset(
     test_ratio: float = 0.60,
     seed: int = 42,
 ) -> tuple[BenchmarkDataset, BenchmarkDataset, BenchmarkDataset]:
-    """Split a dataset deterministically into non-empty (dev, val, locked_test) sets."""
+    for name, r in [("dev_ratio", dev_ratio), ("val_ratio", val_ratio), ("test_ratio", test_ratio)]:
+        if not (0.0 < r < 1.0):
+            raise ValueError(f"Invalid {name} ({r}): each split ratio must satisfy 0 < ratio < 1.")
+
     total_ratio = dev_ratio + val_ratio + test_ratio
     if abs(total_ratio - 1.0) > 1e-4:
         raise ValueError(

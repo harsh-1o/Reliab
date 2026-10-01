@@ -133,3 +133,42 @@ async def test_diagnose_infrastructure_error_never_labeled_hallucination(eval_en
     assert diag is not None
     assert diag.failure_type == FailureCode.OPS_01
     assert diag.failure_type != FailureCode.GEN_01  # Crucial safety check!
+
+
+@pytest.mark.asyncio
+async def test_attribution_strict_citation_resolution_no_fallback(eval_engine, attr_engine, answerable_case, run_config):
+    """When retrieved chunks contain doc1/chunk_A and doc1/chunk_B,
+    and a citation cites doc1/WRONG_CHUNK, attribution must NOT fall back to doc1.
+    It must strictly flag CIT_01 (unretrieved citation).
+    """
+    from rag_platform.models import Citation, DocumentReference, RagTrace, RetrievedChunk
+
+    case = answerable_case.model_copy(update={
+        "relevant_documents": [DocumentReference(document_id="doc1", chunk_id="chunk_A")],
+    })
+
+    trace = RagTrace(
+        trace_id="tr_strict_cit",
+        run_id="run_1",
+        test_case_id=case.id,
+        question=case.question,
+        answer="2024 revenue was 10.5B.",
+        retrieved_chunks=[
+            RetrievedChunk(document_id="doc1", chunk_id="chunk_A", rank=1, text="2024 revenue was 10.5B."),
+            RetrievedChunk(document_id="doc1", chunk_id="chunk_B", rank=2, text="2024 revenue was 10.5B."),
+        ],
+        citations=[
+            Citation(
+                claim_id="cl_1",
+                claim_text="2024 revenue was 10.5B",
+                document_id="doc1",
+                chunk_id="WRONG_CHUNK",
+            )
+        ],
+    )
+    metrics = await eval_engine.evaluate_trace(trace, case)
+    diag = attr_engine.diagnose(trace, case, metrics)
+    assert diag is not None
+    assert diag.failure_type == FailureCode.CIT_01
+    assert "WRONG_CHUNK" in str(diag.evidence)
+

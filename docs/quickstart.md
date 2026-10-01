@@ -66,6 +66,8 @@ reliab-gate --bootstrap --project proj_quickstart --dataset ds_quickstart_bench 
 - **`0` (`PASS`)**: All metric thresholds and regression budgets satisfied.
 - **`1` (`FAIL`)**: Gate violations detected (e.g., faithfulness drop or new regressions).
 
+> **Schema Ownership Note**: `--bootstrap` is provided solely for rapid local quickstart and ephemeral tests. Production databases must run Alembic migrations (`python -m alembic upgrade head`) for schema management.
+
 ---
 
 ## 5. Launch the Web Dashboard

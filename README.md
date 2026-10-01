@@ -115,6 +115,8 @@ Exit codes are CI-friendly:
 - `0` — gate passed
 - `1` — gate violations detected
 
+> **Note on Migration Ownership**: `--bootstrap` is strictly a local/offline development convenience for auto-initializing ephemeral SQLite tables and fixture datasets during initial setup. In staging and production environments, **Alembic is the authoritative schema authority** (`python -m alembic upgrade head`). Production deployment pipelines should never use `--bootstrap` as a substitute for tracked migrations.
+
 ### Launch the dashboard
 
 ```bash

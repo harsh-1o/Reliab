@@ -139,3 +139,47 @@ def test_run_creation_and_provenance_immutability(session: Session):
 
     with pytest.raises(ImmutabilityError):
         repo.record_trace(trace)
+
+
+def test_create_run_enforces_dataset_provenance_invariants():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        repo = DatabaseRepo(session)
+
+        proj_a = repo.create_project("Project A")
+        proj_b = repo.create_project("Project B")
+        ds = repo.create_dataset(proj_a.id, "ds_provenance", "v1.0")
+        repo.add_test_cases(ds.id, [TestCase(id="c1", question="Q", expected_answer="A")])
+        repo.publish_dataset(ds.id)
+        session.commit()
+
+        correct_prov = RunProvenance(dataset_checksum=ds.checksum_sha256, rag_version="v1")
+        correct_config = RunConfig(
+            project_id=proj_a.id,
+            dataset_id=ds.id,
+            dataset_version="v1.0",
+            system_version="sys1",
+        )
+
+        # 1. Project ID mismatch (Project B tries to evaluate Project A's dataset)
+        with pytest.raises(ValueError, match="belongs to project"):
+            repo.create_run(
+                correct_config.model_copy(update={"project_id": proj_b.id}),
+                correct_prov,
+            )
+
+        # 2. Dataset version mismatch
+        with pytest.raises(ValueError, match="version is 'v1.0', but requested dataset_version is 'v2.0'"):
+            repo.create_run(
+                correct_config.model_copy(update={"dataset_version": "v2.0"}),
+                correct_prov,
+            )
+
+        # 3. Provenance checksum mismatch
+        with pytest.raises(ValueError, match="dataset checksum .* does not match"):
+            repo.create_run(
+                correct_config,
+                correct_prov.model_copy(update={"dataset_checksum": "corrupted_checksum"}),
+            )
+

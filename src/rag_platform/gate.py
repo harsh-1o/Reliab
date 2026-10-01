@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from rag_platform.adapters import SyntheticRagAdapter, SyntheticRagMode
 from rag_platform.attribution import FailureAttributionEngine
+from rag_platform.core import generate_id
 from rag_platform.db import DatabaseRepo, DatasetRow, DatasetStatus, ProjectRow, TestCaseRow, create_db_engine
 from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
@@ -361,8 +362,14 @@ def execute_gate_evaluation(
                 db_session.add(tc_row)
             db_session.commit()
         elif ds_row.status == DatasetStatus.PUBLISHED.value:
-            # Published datasets are immutable — do not mutate.
-            # Use the existing dataset as-is; skip test case updates.
+            # Published datasets are immutable. If a file is supplied for an already-published dataset,
+            # its contents MUST match the published checksum; otherwise it would silently substitute the wrong data.
+            if ds_row.checksum_sha256 != checksum:
+                raise ValueError(
+                    f"Dataset '{dataset_id}' is already PUBLISHED with checksum '{ds_row.checksum_sha256}', "
+                    f"but supplied dataset file '{dataset_path}' has checksum '{checksum}'. "
+                    "Published datasets are immutable; cannot silently evaluate different data under an existing published dataset ID."
+                )
             db_session.commit()
         else:
             ds_row.checksum_sha256 = checksum
@@ -455,6 +462,9 @@ def execute_gate_evaluation(
         for case in cases:
             trace = await adapter.run(case, config)
             trace.run_id = run.id
+            if trace.trace_id and not trace.telemetry.get("adapter_trace_id"):
+                trace.telemetry["adapter_trace_id"] = trace.trace_id
+            trace.trace_id = f"tr_{run.id}_{case.id}_{generate_id()}"
             metrics = await eval_engine.evaluate_trace(trace, case)
             attr = attr_engine.diagnose(trace, case, metrics)
             repo.record_trace(trace, metrics, attr)

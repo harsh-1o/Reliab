@@ -906,8 +906,9 @@ async def _execute_evaluation_run(
             )
 
         trace.run_id = run_id
-        if not trace.trace_id or not trace.trace_id.startswith(f"tr_{run_id}"):
-            trace.trace_id = f"tr_{run_id}_{case.id}"
+        if trace.trace_id and not trace.telemetry.get("adapter_trace_id"):
+            trace.telemetry["adapter_trace_id"] = trace.trace_id
+        trace.trace_id = f"tr_{run_id}_{case.id}_{generate_id()}"
         metrics = await eval_engine.evaluate_trace(trace, case, use_cache=use_cache)
         diag = attr_engine.diagnose(trace, case, metrics)
         return (trace, metrics, diag)

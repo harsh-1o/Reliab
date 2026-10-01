@@ -103,6 +103,7 @@ def _seed_project_and_dataset(sess: Session) -> tuple[str, str]:
     p = repo.create_project(name=f"Test Project {generate_id()}")
     ds = repo.create_dataset(project_id=p.id, name=f"Test DS {generate_id()}", version="v1.0")
     ds.status = DatasetStatus.PUBLISHED.value
+    ds.checksum_sha256 = "c1"
     sess.commit()
     return p.id, ds.id
 

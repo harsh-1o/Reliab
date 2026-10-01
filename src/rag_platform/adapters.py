@@ -213,6 +213,7 @@ class HttpRagAdapter:
             transport=transport,
             timeout=self.timeout_seconds,
             follow_redirects=False,
+            trust_env=False,
         )
         self._owns_client = True
         return self._shared_client

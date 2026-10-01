@@ -441,6 +441,21 @@ class DatabaseRepo:
             raise ValueError(f"Dataset {config.dataset_id} not found.")
         if ds.status != DatasetStatus.PUBLISHED.value:
             raise ValueError(f"Cannot run evaluation against unpublished dataset {config.dataset_id}.")
+        if ds.project_id != config.project_id:
+            raise ValueError(
+                f"Dataset {config.dataset_id} belongs to project '{ds.project_id}', "
+                f"not requested project '{config.project_id}'."
+            )
+        if config.dataset_version and ds.version != config.dataset_version:
+            raise ValueError(
+                f"Dataset {config.dataset_id} version is '{ds.version}', "
+                f"but requested dataset_version is '{config.dataset_version}'."
+            )
+        if provenance.dataset_checksum != ds.checksum_sha256:
+            raise ValueError(
+                f"Run provenance dataset checksum '{provenance.dataset_checksum}' does not match "
+                f"dataset {config.dataset_id} checksum '{ds.checksum_sha256}'."
+            )
 
         run = RunRow(
             id=generate_id("run"),
@@ -520,6 +535,10 @@ class DatabaseRepo:
 
         # Recursively sanitize the entire trace (nested chunks, metadata, telemetry, credentials)
         clean_trace: RagTrace = RecursiveTraceSanitizer.sanitize_trace(trace)
+
+        # Validate uniqueness of trace_id before persistence to protect against primary-key collisions
+        if self.session.get(TraceRow, clean_trace.trace_id) is not None:
+            clean_trace.trace_id = f"tr_{clean_trace.run_id}_{clean_trace.test_case_id}_{generate_id()}"
 
         trace_row = TraceRow(
             id=clean_trace.trace_id,

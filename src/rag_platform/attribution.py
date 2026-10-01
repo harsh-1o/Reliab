@@ -14,6 +14,7 @@ from rag_platform.models import (
     FailureCode,
     MetricResult,
     RagTrace,
+    RetrievedChunk,
     Severity,
     TestCase,
 )
@@ -215,11 +216,28 @@ class FailureAttributionEngine:
         # --- Stage 5: Citation Integrity (CIT-01, CIT-02) ---
         if trace.citations:
             chunk_map = {c.chunk_id: c for c in trace.retrieved_chunks}
-            doc_map = {c.document_id: c for c in trace.retrieved_chunks}
+            # Preserve ALL chunks per document (not just the last one)
+            doc_chunks_map: dict[str, list[RetrievedChunk]] = {}
+            for c in trace.retrieved_chunks:
+                doc_chunks_map.setdefault(c.document_id, []).append(c)
 
             for cit in trace.citations:
-                matched_chunk = chunk_map.get(cit.chunk_id) or doc_map.get(cit.document_id)
-                if not matched_chunk:
+                # Strict match: if citation specifies a chunk_id, require exact doc + chunk match.
+                # Do NOT fall back to document-level when an explicit chunk_id is wrong.
+                if cit.chunk_id and cit.chunk_id in chunk_map:
+                    candidate = chunk_map[cit.chunk_id]
+                    if cit.document_id and candidate.document_id != cit.document_id:
+                        matched_chunks = []
+                    else:
+                        matched_chunks = [candidate]
+                elif cit.chunk_id:
+                    # Citation references a specific chunk_id that was NOT retrieved — genuine miss
+                    matched_chunks = []
+                else:
+                    # No chunk_id specified — match at document level across all chunks for that document
+                    matched_chunks = doc_chunks_map.get(cit.document_id, [])
+
+                if not matched_chunks:
                     findings.append(
                         DiagnosticFinding(
                             code=FailureCode.CIT_01,
@@ -237,20 +255,27 @@ class FailureAttributionEngine:
 
                 # Verify cited chunk text substantiates claim
                 claim_words = [w for w in re.findall(r"[A-Za-z0-9]+", cit.claim_text.lower()) if len(w) >= 1]
-                chunk_words = set(re.findall(r"[A-Za-z0-9]+", matched_chunk.text.lower()))
-                overlap = sum(1 for w in claim_words if w in chunk_words) / len(claim_words) if claim_words else 0.0
-                if overlap < 0.30:
+                best_overlap = 0.0
+                best_chunk = matched_chunks[0]
+                for chunk in matched_chunks:
+                    chunk_words = set(re.findall(r"[A-Za-z0-9]+", chunk.text.lower()))
+                    overlap = sum(1 for w in claim_words if w in chunk_words) / len(claim_words) if claim_words else 0.0
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_chunk = chunk
+
+                if best_overlap < 0.30:
                     findings.append(
                         DiagnosticFinding(
                             code=FailureCode.CIT_02,
                             severity=Severity.HIGH,
                             confidence=0.92,
-                            explanation=f"Citation attached to chunk '{matched_chunk.chunk_id}' in doc '{cit.document_id}', but chunk text does not substantiate the claim.",
+                            explanation=f"Citation attached to chunk '{best_chunk.chunk_id}' in doc '{cit.document_id}', but chunk text does not substantiate the claim.",
                             evidence={
                                 "claim": cit.claim_text,
                                 "cited_doc": cit.document_id,
                                 "cited_chunk": cit.chunk_id,
-                                "chunk_snippet": matched_chunk.text[:200],
+                                "chunk_snippet": best_chunk.text[:200],
                             },
                             recommended_actions=[
                                 "Enforce sentence-level citation verification before emitting answer",

@@ -187,6 +187,38 @@ class TestSSRFProtection:
             assert trace.error_code == "OPS-01"
             assert "SSRFProtectionError" in trace.telemetry.get("type", "")
 
+    @pytest.mark.asyncio
+    async def test_ssrf_disables_environment_proxies(self, monkeypatch):
+        """Prove that environmental proxy variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
+        cannot bypass SSRF protection and that client explicitly disables environment proxies.
+        """
+        monkeypatch.setenv("HTTP_PROXY", "http://evil-proxy.attacker.local:8080")
+        monkeypatch.setenv("HTTPS_PROXY", "http://evil-proxy.attacker.local:8080")
+        monkeypatch.setenv("ALL_PROXY", "http://evil-proxy.attacker.local:8080")
+
+        adapter = HttpRagAdapter(
+            endpoint_url="https://example.com/v1/query",
+            allowed_hosts=["example.com"],
+        )
+        try:
+            client = await adapter._get_client()
+            # Must explicitly set trust_env=False to reject environment proxies
+            assert client.trust_env is False
+
+            # SSRF validation still blocks disallowed destination despite proxy config
+            disallowed_adapter = HttpRagAdapter(
+                endpoint_url="http://169.254.169.254/latest/meta-data/",
+            )
+            case = TestCase(id="tc_ssrf_proxy", question="SSRF via proxy?", expected_answer="")
+            trace = await disallowed_adapter.run(
+                case,
+                RunConfig(project_id="p1", dataset_id="d1", dataset_version="1.0", system_version="v1"),
+            )
+            assert trace.error_code == "OPS-01"
+            assert "SSRFProtectionError" in trace.telemetry.get("type", "")
+        finally:
+            await adapter.close()
+
 
 # =====================================================================
 # 2. DURABLE WORKER & HEARTBEAT TESTS

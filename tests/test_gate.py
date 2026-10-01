@@ -220,3 +220,33 @@ def test_gate_cli_main_soft_mode_and_dataset_path(monkeypatch, tmp_path):
 
     # In soft gate mode, even with HALLUCINATING mock mode, exit code must be 0
     assert exc_info.value.code == 0
+
+
+def test_gate_published_dataset_checksum_mismatch_raises_error(memory_db, setup_test_benchmark, tmp_path):
+    """When a dataset is already published, supplying a different dataset file with the same
+    dataset ID must raise an error instead of silently proceeding with the old dataset.
+    """
+    import json
+    proj_id, ds_id = setup_test_benchmark
+
+    different_file = tmp_path / "different_cases.json"
+    different_file.write_text(
+        json.dumps([
+            {
+                "id": "case_diff_1",
+                "question": "Different question?",
+                "expected_answer": "Different answer.",
+                "answerability": "ANSWERABLE",
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="already PUBLISHED"):
+        execute_gate_evaluation(
+            db_session=memory_db,
+            project_id=proj_id,
+            dataset_id=ds_id,
+            dataset_path=str(different_file),
+            system_version="v1.0.0",
+        )

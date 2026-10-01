@@ -244,7 +244,7 @@ def test_failure_only_trace_pagination(in_memory_db, client):
             dataset_version="v1",
             system_version="sys-1",
         ),
-        RunProvenance(dataset_checksum="c1", rag_version="v1", dataset_id=ds.id, dataset_version="v1"),
+        RunProvenance(dataset_checksum=ds.checksum_sha256, rag_version="v1", dataset_id=ds.id, dataset_version="v1"),
     )
 
     # Insert 15 traces: 5 failures and 10 passes
