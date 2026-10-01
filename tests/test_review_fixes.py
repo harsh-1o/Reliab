@@ -4,6 +4,7 @@ import pytest
 
 from rag_platform.adapters import HttpRagResponsePayload
 from rag_platform.evaluators import CitationSupportMetric, RecallAtKMetric
+from rag_platform.gate import resolve_release_policy
 from rag_platform.models import (
     Citation,
     MetricFamily,
@@ -15,11 +16,6 @@ from rag_platform.models import (
     RunProvenance,
     TestCase,
 )
-from rag_platform.regression import RegressionEngine
-from rag_platform.gate import resolve_release_policy
-
-
-def _summary(case_count: int = 2) -> RunMetricsSummary:
     metric = MetricSummary(
         metric_name="faithfulness",
         metric_family=MetricFamily.GENERATION,
