@@ -1242,8 +1242,15 @@ class EvaluationEngine:
         abstention_scores = []
         latencies = []
         total_cost = 0.0
+        seen_case_ids: set[str] = set()
 
         for trace, m_list in traces_with_metrics:
+            # A release evaluation has one authoritative trace per test case.
+            # Ignore duplicate traces rather than allowing retries/duplicates to inflate
+            # coverage, metric sample sizes, latency statistics, or cost totals.
+            if trace.test_case_id in seen_case_ids:
+                continue
+            seen_case_ids.add(trace.test_case_id)
             latencies.append(trace.latency_ms)
             if trace.cost_usd:
                 total_cost += trace.cost_usd
@@ -1329,7 +1336,7 @@ class EvaluationEngine:
                 sample_warning=sample_warning,
             )
 
-        evaluated_case_ids = {trace.test_case_id for trace, _ in traces_with_metrics}
+        evaluated_case_ids = seen_case_ids
         evaluated_cases = len(evaluated_case_ids)
         total_cases = evaluated_cases
         # Semantically correct scored_cases: distinct cases where at least one metric yielded a numeric score
