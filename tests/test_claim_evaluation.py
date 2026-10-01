@@ -177,7 +177,10 @@ async def test_statistical_aggregation_and_sample_size_warning():
     metrics = await eval_engine.evaluate_trace(trace, case)
 
     # 5 samples (N < 30)
-    traces = [(trace, metrics)] * 5
+    traces = [
+        (trace.model_copy(update={"trace_id": f"t{i}", "test_case_id": f"{case.id}_{i}"}), metrics)
+        for i in range(5)
+    ]
     summary = eval_engine.aggregate_run(traces)
 
     assert summary.total_cases == 5
