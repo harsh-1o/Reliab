@@ -425,6 +425,9 @@ class DatabaseRepo:
         options_override_json: str | None = None,
         idempotency_key: str | None = None,
     ) -> RunRow:
+        if provenance.manifest_hash != provenance.compute_hash():
+            raise ValueError("Run provenance manifest_hash does not match the canonical provenance manifest.")
+
         if idempotency_key:
             existing = self.session.scalar(
                 select(RunRow).where(
