@@ -183,10 +183,8 @@ class RegressionEngine:
                     trans_status = "CANDIDATE_MISSING"
                     score_delta = None
                 elif b_score is None or c_score is None:
-                    trans_status = "CANDIDATE_MISSING" if c_score is None else "NOT_APPLICABLE"
+                    trans_status = "NOT_APPLICABLE"
                     score_delta = None
-                    if c_score is None:
-                        candidate_missing.append(cid)
                 else:
                     score_drop = round(b_score - c_score, 4)
                     score_delta = round(c_score - b_score, 4)
