@@ -458,6 +458,9 @@ class DatabaseRepo:
                 f"dataset {config.dataset_id} checksum '{ds.checksum_sha256}'."
             )
 
+        if provenance.manifest_hash != provenance.compute_hash():
+            raise ValueError("Run provenance manifest_hash does not match the canonical provenance manifest.")
+
         run = RunRow(
             id=generate_id("run"),
             project_id=config.project_id,
