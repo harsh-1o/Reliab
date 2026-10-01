@@ -676,7 +676,7 @@ def postgres_shared_db():
             name="PG Concurrency Benchmark",
             version="1.0.0",
             status=DatasetStatus.PUBLISHED.value,
-            checksum_sha256="fake_pg_checksum",
+            checksum_sha256="abc123checksum",
         )
         sess.add(ds)
         sess.commit()
