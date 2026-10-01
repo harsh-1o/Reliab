@@ -49,7 +49,6 @@ from rag_platform.models import (
     GateResult,
     MetricFamily,
     MetricResult,
-
     RagTrace,
     ReleasePolicy,
     RunConfig,
