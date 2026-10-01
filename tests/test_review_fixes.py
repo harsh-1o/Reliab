@@ -175,3 +175,25 @@ def test_release_policy_resolution_does_not_silently_default_unknown_policy() ->
     assert resolve_release_policy("prod-default").policy_id == "prod-default"
     with pytest.raises(ValueError, match="Unknown release policy"):
         resolve_release_policy("does-not-exist")
+
+
+def test_aggregate_run_deduplicates_case_ids() -> None:
+    from rag_platform.evaluators import EvaluationEngine
+
+    trace = RagTrace(
+        trace_id="t1",
+        run_id="r",
+        test_case_id="case",
+        question="q",
+        answer="answer",
+    )
+    metrics = [MetricResult(metric_name="faithfulness", metric_family=MetricFamily.GENERATION, score=1.0)]
+    duplicate = trace.model_copy(update={"trace_id": "t2"})
+    summary = EvaluationEngine().aggregate_run(
+        [(trace, metrics), (duplicate, metrics)],
+        required_case_count=2,
+    )
+    assert summary.evaluated_case_count == 1
+    assert summary.missing_case_count == 1
+    assert summary.coverage_ratio == 0.5
+    assert summary.metrics["faithfulness"].count == 1
