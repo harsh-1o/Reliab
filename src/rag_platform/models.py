@@ -295,32 +295,6 @@ class HumanOverride(BaseModel):
 
 
 # --- Run Provenance & Gate ---
-class _FrozenDict(dict[str, Any]):
-    """Dict that cannot be mutated after provenance construction."""
-    def _blocked(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("Provenance mappings are immutable.")
-
-    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _blocked
-
-
-class _FrozenList(list[Any]):
-    """List that cannot be mutated after provenance construction."""
-    def _blocked(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("Provenance lists are immutable.")
-
-    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = _blocked
-
-
-def _freeze_provenance(value: Any) -> Any:
-    if isinstance(value, dict):
-        return _FrozenDict({k: _freeze_provenance(v) for k, v in value.items()})
-    if isinstance(value, list):
-        return _FrozenList(_freeze_provenance(v) for v in value)
-    if isinstance(value, set):
-        return frozenset(_freeze_provenance(v) for v in value)
-    return value
-
-
 class RunProvenance(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -425,13 +399,6 @@ class RunProvenance(BaseModel):
                         break
             except Exception:
                 pass
-        # Freeze every nested provenance container after all derived hashes are computed.
-        for field_name in (
-            "model_parameters", "retriever_config", "reranker_config", "chunking_config",
-            "adapter_config", "evaluation_config", "experiment_config", "environment_info",
-        ):
-            object.__setattr__(self, field_name, _freeze_provenance(getattr(self, field_name)))
-
         if not self.manifest_hash:
             object.__setattr__(self, "manifest_hash", self.compute_hash())
         elif self.manifest_hash != self.compute_hash():
