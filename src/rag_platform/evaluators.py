@@ -937,6 +937,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
         self.errors: int = 0
         self.is_degraded: bool = False
         self.last_error: str | None = None
+        self.last_lookup_failed: bool = False
 
     def _get_session(self):
         if self.session_factory is not None:
@@ -949,6 +950,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
 
         from rag_platform.db import EvaluationCacheRow
 
+        self.last_lookup_failed = False
         try:
             with self._get_session() as sess:
                 row = sess.get(EvaluationCacheRow, key)
@@ -967,6 +969,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
         except Exception as exc:
             self.errors += 1
             self.is_degraded = True
+            self.last_lookup_failed = True
             self.last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("DatabaseEvaluationCache infrastructure get error on key %s: %s", key, exc)
             return None
@@ -1116,6 +1119,10 @@ class TwoTierEvaluationCache(BaseEvaluationCache):
     def infrastructure_errors(self) -> int:
         return self.l2.errors
 
+    @property
+    def last_lookup_failed(self) -> bool:
+        return self.l2.last_lookup_failed
+
     def clear(self) -> None:
         self.l1.clear()
         self.l2.clear()
@@ -1211,6 +1218,9 @@ class EvaluationEngine:
 
             result = await metric.compute(trace, case)
             result.metadata.setdefault("statistical_type", getattr(metric, "statistical_type", "continuous"))
+            if getattr(self._cache, "last_lookup_failed", False):
+                result.metadata["cache_degraded"] = True
+                result.metadata["cache_infrastructure_error"] = getattr(self._cache, "last_error", "persistent cache lookup failed")
             if use_cache:
                 if hasattr(self._cache, "set"):
                     self._cache.set(key, result)
