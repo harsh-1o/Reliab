@@ -1,5 +1,4 @@
-"""FastAPI REST API control plane and engineering-grade observability dashboard.
-"""
+"""FastAPI REST API control plane and engineering-grade observability dashboard."""
 
 from __future__ import annotations
 
@@ -47,9 +46,31 @@ from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
     DocumentReference,
+    GateResult,
     MetricFamily,
     MetricResult,
-    GateResult,
+    RagTrace,
+    ReleasePolicy,
+    RunConfig,
+    RunMetricsSummary,
+    RunOptions,
+    RunProvenance,
+    RunStatus,
+    Severity,
+    TestCase,
+)
+from rag_platform.regression import RegressionEngine
+from rag_platform.security import (
+    BudgetGuard,
+    ClientIdentity,
+    Role,
+    SecretRedactor,
+    SecurityContext,
+    SessionStore,
+    TokenBucketRateLimiter,
+    authenticate_request,
+    authorize_project,
+)
     RagTrace,
     ReleasePolicy,
     RunConfig,
