@@ -1057,11 +1057,12 @@ async def _execute_evaluation_run(
 
         gate_obj = None
         if summary_obj and final_status == RunStatus.COMPLETED:
-            from rag_platform.regression import RegressionEngine, ReleasePolicy
+            from rag_platform.gate import resolve_release_policy
+            from rag_platform.regression import RegressionEngine
             reg_engine = RegressionEngine()
             gate_obj = reg_engine.evaluate_gate(
                 summary_obj,
-                ReleasePolicy(policy_id=run_row.policy_id),
+                resolve_release_policy(run_row.policy_id),
                 candidate_run_id=run_row.id,
             )
 
@@ -1227,12 +1228,18 @@ async def create_run(
         random_seed=req.random_seed,
     )
 
+    from rag_platform.gate import resolve_release_policy
+    try:
+        active_policy = resolve_release_policy(req.policy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     config = RunConfig(
         project_id=req.project_id,
         dataset_id=req.dataset_id,
         dataset_version=ds.version,
         system_version=req.system_version,
-        policy_id=req.policy_id,
+        policy_id=active_policy.policy_id,
         options=config_options,
     )
 
