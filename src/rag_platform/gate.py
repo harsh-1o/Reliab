@@ -506,6 +506,10 @@ def execute_gate_evaluation(
 
     reg_engine = RegressionEngine()
     gate = reg_engine.evaluate_gate(summary, active_policy, run.id)
+    run.summary_json = summary.model_dump_json()
+    run.gate_result_json = gate.model_dump_json()
+    run.gate_status = gate.status.value
+    db_session.commit()
 
     if junit_xml_path:
         xml_content = format_junit_xml(gate)
