@@ -36,7 +36,7 @@ Reliab gives those failures a structured evaluation path:
 - **Abstention** — evaluate whether unanswerable queries are handled appropriately.
 - **Failure attribution** — map failures to diagnostic codes with remediation context.
 - **Regression detection** — track per-case transitions against a baseline.
-- **Release gates** — enforce metric thresholds and regression budgets with CI-friendly exit codes.
+- **Release gates** — enforce metric thresholds, complete dataset coverage, and regression budgets with CI-friendly exit codes.
 
 ## How it works
 
@@ -140,7 +140,7 @@ reliab-gate \
   --junit-xml test-results/gate.xml
 ```
 
-A gate can fail because of metric thresholds or newly introduced per-case regressions, even when aggregate metrics remain above their minimum thresholds.
+A gate can fail because of metric thresholds, insufficient dataset coverage, omitted baseline test cases, or newly introduced per-case regressions, even when aggregate metrics remain above their minimum thresholds.
 
 ## Architecture
 

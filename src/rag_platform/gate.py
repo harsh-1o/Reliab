@@ -64,12 +64,14 @@ def format_junit_xml(gate_result: GateResult) -> str:
 
     # Core release gate policy checks evaluated by Reliab
     standard_checks = [
+        ("case_coverage", "Required Test Case Coverage"),
         ("faithfulness", "Claim Faithfulness Threshold"),
         ("recall_at_5", "Evidence Retrieval Recall@5"),
         ("citation_accuracy", "Citation Grounding Accuracy"),
         ("hallucination_rate", "Hallucination Rate Cap"),
         ("abstention_accuracy", "Abstention & Refusal Quality"),
     ]
+
 
     violations_by_metric: dict[str, list[GateViolation]] = {}
     for v in gate_result.violations:
@@ -459,21 +461,31 @@ def execute_gate_evaluation(
     traces_with_metrics = []
 
     async def run_pipeline():
-        for case in cases:
-            trace = await adapter.run(case, config)
-            trace.run_id = run.id
-            if trace.trace_id and not trace.telemetry.get("adapter_trace_id"):
-                trace.telemetry["adapter_trace_id"] = trace.trace_id
-            trace.trace_id = f"tr_{run.id}_{case.id}_{generate_id()}"
-            metrics = await eval_engine.evaluate_trace(trace, case)
-            attr = attr_engine.diagnose(trace, case, metrics)
-            repo.record_trace(trace, metrics, attr)
-            traces_with_metrics.append((trace, metrics))
+        try:
+            for case in cases:
+                trace = await adapter.run(case, config)
+                trace.run_id = run.id
+                if trace.trace_id and not trace.telemetry.get("adapter_trace_id"):
+                    trace.telemetry["adapter_trace_id"] = trace.trace_id
+                trace.trace_id = f"tr_{run.id}_{case.id}_{generate_id()}"
+                metrics = await eval_engine.evaluate_trace(trace, case)
+                attr = attr_engine.diagnose(trace, case, metrics)
+                repo.record_trace(trace, metrics, attr)
+                traces_with_metrics.append((trace, metrics))
+        finally:
+            if hasattr(adapter, "close"):
+                try:
+                    res = adapter.close()
+                    if hasattr(res, "__await__"):
+                        await res
+                except Exception:
+                    pass
 
     asyncio.run(run_pipeline())
-    summary = eval_engine.aggregate_run(traces_with_metrics)
+    summary = eval_engine.aggregate_run(traces_with_metrics, required_case_count=len(cases))
     repo.update_run_status(run.id, RunStatus.COMPLETED)
     db_session.commit()
+
 
     reg_engine = RegressionEngine()
     gate = reg_engine.evaluate_gate(summary, active_policy, run.id)

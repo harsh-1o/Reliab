@@ -6,6 +6,7 @@ Revises: h123456789ag
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "i123456789ah"

@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 
 # --- Exceptions ---
@@ -197,5 +197,44 @@ class Settings:
 settings = Settings()
 
 
+def calculate_percentile(values: Sequence[float | int], percentile: float) -> float:
+    """Calculate percentile using standard linear interpolation (NIST Method 7 / NumPy default).
+
+    Computes the p-th percentile (where percentile is between 0.0 and 1.0, e.g. 0.95 for p95)
+    over a sequence of numerical observations.
+
+    Method:
+      1. Sorts input values in ascending order.
+      2. Computes fractional rank: rank = percentile * (N - 1).
+      3. Interpolates linearly between adjacent ranks:
+         result = sorted_vals[lo] + (rank - lo) * (sorted_vals[hi] - sorted_vals[lo])
+
+    Properties:
+      - n=0: Returns 0.0
+      - n=1: Returns the single observation
+      - p=0.0: Returns min value
+      - p=0.5: Returns median (p50)
+      - p=1.0: Returns max value
+      - Properly handles unsorted input and repeated values without bias.
+    """
+    if not values:
+        return 0.0
+    sorted_vals = sorted(float(v) for v in values)
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+
+    p = float(percentile)
+    if p > 1.0:
+        p = p / 100.0
+    clamped_pct = max(0.0, min(1.0, p))
+    rank = clamped_pct * (n - 1)
+    lo = int(rank)
+    hi = min(lo + 1, n - 1)
+    frac = rank - lo
+    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+
+
 def get_settings() -> Settings:
     return settings
+

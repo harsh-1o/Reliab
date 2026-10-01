@@ -24,10 +24,11 @@ Reliab is built with enterprise defense-in-depth principles to safely evaluate i
 - **API-Key Cache & Revocation Consistency**:
   - API key identities are cached in-memory with a short TTL (configurable via `API_KEY_CACHE_TTL_SECONDS`, default 2.0 seconds).
   - Key revocation and rotation immediately purge the local process cache. Cross-process propagation is guaranteed within the 2.0-second window (or 0.0 seconds if `API_KEY_CACHE_TTL_SECONDS=0` is configured for strict instantaneous cross-process consistency).
-- **Brute-Force Rate Limiting Scope**:
-  - `AuthRateLimiter` enforces a process-local sliding window (default 5 failed attempts per 60s per IP) for defense-in-depth against brute-force attacks on `/v1/auth/session`.
+- **Brute-Force Rate Limiting Scope & Bounded Memory**:
+  - `AuthRateLimiter` enforces a sliding window (default 5 failed attempts per 60s per IP) for defense-in-depth against brute-force attacks on `/v1/auth/session`.
+  - Memory consumption is strictly bounded with capacity-based eviction (`max_tracked_ips=10_000`) and active TTL pruning, preventing memory exhaustion attacks from unbounded numbers of unique source IPs.
   - In distributed multi-process or containerized deployments behind load balancers, edge gateways (such as NGINX, Cloudflare, Envoy, or AWS WAF) handle centralized rate limiting without requiring external Redis dependencies for offline/air-gapped environments.
-- **Trusted Reverse Proxy Defense**: Client IP extraction respects `TRUSTED_PROXIES` (default `127.0.0.1,::1,testclient`). If a request does not originate from a configured trusted proxy, `X-Forwarded-For` headers are ignored and the direct socket IP is enforced, preventing spoofing and rate-limiting bypasses.
+- **Trusted Reverse Proxy Defense**: Client IP extraction respects `TRUSTED_PROXIES` (default `127.0.0.1,::1,testclient`). If a request does not originate from a configured trusted proxy, `X-Forwarded-For` headers are completely ignored. If an attacker connects directly and provides a forged all-trusted forwarded chain, the proxy extractor rejects the forwarded chain and safely falls back to the direct socket IP.
 
 ### Socket-Level SSRF Defense
 When evaluating external HTTP RAG endpoints, attackers or rogue configurations could target internal infrastructure (e.g. cloud instance metadata at `169.254.169.254` or internal microservices).
@@ -39,12 +40,13 @@ Reliab implements `SSRFProtectedTransport`:
 4. **Socket IP Pinning**: Binds TCP connections directly to pre-validated IP addresses, defeating DNS rebinding (TOCTOU) attacks.
 5. **Air-Gapped & Offline Support**: Offline evaluation environments can register static IP mappings via `register_static_dns()` or `STATIC_DNS_MAP` env without opening network access.
 
-### Recursive Secret Sanitization
+### Recursive Secret Sanitization & Secret References
 Traces often capture real user queries or raw LLM completions that contain accidentally leaked credentials.
 
 Before any trace, metric, or attribution evidence is persisted:
 - A recursive scrubbing filter traverses all dictionary keys, lists, and strings.
 - Automatically redacts API keys (`sk-...`, `Bearer ...`, `token`), JWT strings, database connection strings, and common authentication headers.
+- **Environment-Backed Secret References**: HTTP adapters use secret references (`header_secret_refs` or `${ENV_VAR}`). Plaintext credentials are redacted before persistence, while secret references are preserved so workers resolve credentials at runtime from the worker environment. Database storage never contains plaintext secrets.
 
 ### Tenant & Workspace Isolation
 - Projects enforce strict boundary isolation.
@@ -52,9 +54,10 @@ Before any trace, metric, or attribution evidence is persisted:
 
 ---
 
-## 2. Reproducible Run Manifests & Provenance
+## 2. Reproducible Run Manifests & Provenance Immutability
 
-Every evaluation run creates an immutable `RunProvenance` record containing:
+Every evaluation run creates a cryptographically verified, immutable `RunProvenance` record (`ConfigDict(frozen=True)`):
+- **Immutability Guarantee**: Provenance objects cannot be modified after construction. Any mutation attempts raise frozen instance errors, ensuring derived manifest hashes cannot become stale.
 - **`dataset_checksum`**: SHA-256 hash of all test cases in the dataset version.
 - **`rag_version`**: Evaluated system version or Git commit SHA.
 - **`adapter_config`**: Configuration payload stripped of API keys and credentials.

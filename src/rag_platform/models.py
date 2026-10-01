@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from rag_platform.core import canonical_json, sha256_hash
 
@@ -248,6 +248,12 @@ class RunMetricsSummary(BaseModel):
     metrics: dict[str, MetricSummary] = Field(default_factory=dict)
     total_cases: int = 0
     scored_cases: int = 0
+    required_case_count: int = 0
+    evaluated_case_count: int = 0
+    missing_case_count: int = 0
+    coverage_ratio: float = 1.0
+    is_full_evaluation: bool = True
+    eligible_for_release_gate: bool = True
     hallucination_rate: float | None = None
     low_faithfulness_rate: float | None = None
     abstention_accuracy: float | None = None
@@ -255,6 +261,7 @@ class RunMetricsSummary(BaseModel):
     p95_latency_ms: float = 0.0
     total_cost_usd: float = 0.0
     sample_warning: str | None = None
+
 
 
 # --- Failure Attribution ---
@@ -289,6 +296,8 @@ class HumanOverride(BaseModel):
 
 # --- Run Provenance & Gate ---
 class RunProvenance(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     dataset_checksum: str
     dataset_id: str | None = None
     dataset_version: str | None = None
@@ -361,19 +370,21 @@ class RunProvenance(BaseModel):
     def model_post_init(self, __context: Any) -> None:
         from rag_platform.security import SecretRedactor
         if self.adapter_config:
-            self.adapter_config = SecretRedactor.redact_dict(self.adapter_config)
+            object.__setattr__(self, "adapter_config", SecretRedactor.redact_dict(self.adapter_config))
         if self.model_parameters and not self.model_config_hash:
-            self.model_config_hash = sha256_hash(canonical_json(self.model_parameters))
+            object.__setattr__(self, "model_config_hash", sha256_hash(canonical_json(self.model_parameters)))
         elif self.model_config_hash == "default_model_config_hash":
-            self.model_config_hash = sha256_hash(canonical_json(self.model_parameters)) if self.model_parameters else ""
+            h = sha256_hash(canonical_json(self.model_parameters)) if self.model_parameters else ""
+            object.__setattr__(self, "model_config_hash", h)
         if self.experiment_config and not self.experiment_hash:
-            self.experiment_hash = sha256_hash(canonical_json(self.experiment_config))
+            object.__setattr__(self, "experiment_hash", sha256_hash(canonical_json(self.experiment_config)))
         elif self.experiment_hash == "default_experiment_hash":
-            self.experiment_hash = sha256_hash(canonical_json(self.experiment_config)) if self.experiment_config else ""
+            h = sha256_hash(canonical_json(self.experiment_config)) if self.experiment_config else ""
+            object.__setattr__(self, "experiment_hash", h)
         if self.prompt_template and not self.prompt_hash:
-            self.prompt_hash = sha256_hash(self.prompt_template)
+            object.__setattr__(self, "prompt_hash", sha256_hash(self.prompt_template))
         if self.system_prompt and not self.system_prompt_hash:
-            self.system_prompt_hash = sha256_hash(self.system_prompt)
+            object.__setattr__(self, "system_prompt_hash", sha256_hash(self.system_prompt))
         if not self.dependency_lock_hash:
             try:
                 from pathlib import Path
@@ -384,16 +395,16 @@ class RunProvenance(BaseModel):
                 ]
                 for lock_file in candidate_paths:
                     if lock_file.is_file():
-                        self.dependency_lock_hash = sha256_hash(lock_file.read_text(encoding="utf-8"))
+                        object.__setattr__(self, "dependency_lock_hash", sha256_hash(lock_file.read_text(encoding="utf-8")))
                         break
             except Exception:
                 pass
         if not self.manifest_hash:
-            self.manifest_hash = self.compute_hash()
+            object.__setattr__(self, "manifest_hash", self.compute_hash())
 
 
 class RunOptions(BaseModel):
-    max_cases: int | None = Field(default=500, ge=1, le=10000)
+    max_cases: int | None = Field(default=None, ge=1, le=10000)
     concurrency: int = Field(default=5, ge=1, le=100)
     timeout_seconds: float = 60.0
     fail_fast: bool = False
@@ -449,7 +460,10 @@ class ReleasePolicy(BaseModel):
     max_cost_regression_pct: float = 25.0
     min_cost_budget_usd: float = 0.05
     max_critical_regressions: int = 0
+    min_case_coverage: float = 1.0
+    allow_candidate_missing: bool = False
     metric_policies: list[MetricRegressionPolicy] = Field(default_factory=list)
+
 
 
 class GateViolation(BaseModel):

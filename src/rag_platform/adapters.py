@@ -10,6 +10,7 @@ from typing import Any, Callable, Protocol
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rag_platform.core import generate_id
 from rag_platform.models import (
@@ -20,7 +21,7 @@ from rag_platform.models import (
     RunConfig,
     TestCase,
 )
-from rag_platform.security import SecretRedactor
+from rag_platform.security import SecretRedactor, SecretResolutionError, resolve_adapter_headers
 from rag_platform.ssrf import SSRFProtectionError, validate_url_ssrf
 
 
@@ -37,10 +38,56 @@ class HttpRagResponseError(ValueError):
     pass
 
 
-def validate_http_rag_response(raw_data: Any) -> dict[str, Any]:
-    """Validate external RAG system response against expected contract.
+class HttpRetrievedChunkPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore")
 
-    Enforces required fields and structural types while keeping legitimate optional fields optional.
+    document_id: str
+    chunk_id: str | None = None
+    rank: int | None = None
+    score: float | int | None = 0.0
+    text: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class HttpCitationPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    claim_id: str | None = None
+    claim_text: str
+    document_id: str | None = None
+    chunk_id: str | None = None
+    span: list[int] | None = None
+
+
+class HttpRagResponsePayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    answer: str | None = None
+    abstained: bool = False
+    abstention_reason: str | None = None
+    retrieved_chunks: list[HttpRetrievedChunkPayload] = Field(default_factory=list)
+    citations: list[HttpCitationPayload] = Field(default_factory=list)
+    latency_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | int | None = None
+    model: str | None = None
+    telemetry: dict[str, Any] = Field(default_factory=dict)
+    trace_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_answer(self) -> HttpRagResponsePayload:
+        if not self.abstained and self.answer is None:
+            raise ValueError("Missing required field 'answer' on non-abstained response")
+        return self
+
+
+def validate_http_rag_response(raw_data: Any) -> dict[str, Any]:
+    """Validate external RAG system response against canonical strict Pydantic contract.
+
+    Enforces required fields and structural types across top-level and nested structures
+    (retrieved chunks, chunk IDs, citations, spans, abstention states) while allowing
+    harmless extra fields.
     """
     if not isinstance(raw_data, dict):
         raise HttpRagResponseError(
@@ -96,7 +143,13 @@ def validate_http_rag_response(raw_data: Any) -> dict[str, Any]:
     if telemetry is not None and not isinstance(telemetry, dict):
         raise HttpRagResponseError(f"Field 'telemetry' must be a dict, got {type(telemetry).__name__}")
 
+    try:
+        HttpRagResponsePayload.model_validate(raw_data)
+    except Exception as err:
+        raise HttpRagResponseError(f"HTTP RAG response schema validation error: {err}") from err
+
     return raw_data
+
 
 
 class PythonAdapterRegistry:
@@ -177,6 +230,7 @@ class HttpRagAdapter:
         self,
         endpoint_url: str,
         headers: dict[str, str] | None = None,
+        header_secret_refs: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
         client: httpx.AsyncClient | None = None,
         allowed_hosts: list[str] | set[str] | None = None,
@@ -185,6 +239,7 @@ class HttpRagAdapter:
     ) -> None:
         self.endpoint_url = endpoint_url
         self.headers = headers or {}
+        self.header_secret_refs = header_secret_refs or {}
         self.timeout_seconds = timeout_seconds
         self.allowed_hosts = allowed_hosts
         self.allow_private_ip = allow_private_ip
@@ -239,6 +294,23 @@ class HttpRagAdapter:
         }
 
         try:
+            req_headers = resolve_adapter_headers(self.headers, self.header_secret_refs)
+        except SecretResolutionError as sec_err:
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            return RagTrace(
+                trace_id=trace_id,
+                run_id=generate_id("run"),
+                test_case_id=case.id,
+                question=case.question,
+                error_code="OPS-01",
+                latency_ms=latency_ms,
+                telemetry={
+                    "error": str(sec_err),
+                    "stage": "adapter_secret_resolution",
+                },
+            )
+
+        try:
             current_url = self.endpoint_url
             # Pre-flight SSRF validation immediately before connecting
             validated_ips = validate_url_ssrf(
@@ -261,10 +333,10 @@ class HttpRagAdapter:
             max_retries = 3
             retry_count = 0
             # Build request headers with trace ID and idempotency key to protect SUT against duplicated side-effects during retries
-            req_headers = dict(self.headers)
             req_headers.setdefault("X-Request-ID", trace_id)
             req_headers.setdefault("Idempotency-Key", f"eval_{config.project_id}_{config.dataset_id}_{case.id}_{trace_id}")
             retry_status_codes = {429, 502, 503, 504}
+
 
             while True:
                 try:

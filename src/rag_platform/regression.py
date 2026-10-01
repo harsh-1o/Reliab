@@ -40,10 +40,13 @@ class RunComparison(BaseModel):
     unchanged_cases: list[str] = Field(default_factory=list)
     unchanged_pass_cases: list[str] = Field(default_factory=list)
     unchanged_fail_cases: list[str] = Field(default_factory=list)
+    candidate_missing_cases: list[str] = Field(default_factory=list)
+    baseline_missing_cases: list[str] = Field(default_factory=list)
     case_transitions: dict[str, dict[str, Any]] = Field(default_factory=dict)
     regressed_cases: list[str] = Field(default_factory=list)  # Backward-compatible alias
     improved_cases: list[str] = Field(default_factory=list)   # Backward-compatible alias
     net_case_drift: int = 0
+
 
 
 class RegressionEngine:
@@ -151,10 +154,12 @@ class RegressionEngine:
         unchanged: list[str] = []
         unchanged_pass: list[str] = []
         unchanged_fail: list[str] = []
+        candidate_missing: list[str] = []
+        baseline_missing: list[str] = []
         transitions: dict[str, dict[str, Any]] = {}
 
         if baseline_case_scores is not None and candidate_case_scores is not None:
-            common_cases = set(baseline_case_scores.keys()).union(candidate_case_scores.keys())
+            common_cases = sorted(set(baseline_case_scores.keys()).union(candidate_case_scores.keys()))
             for cid in common_cases:
                 b_score = baseline_case_scores.get(cid)
                 c_score = candidate_case_scores.get(cid)
@@ -165,9 +170,11 @@ class RegressionEngine:
                 elif b_score is None:
                     trans_status = "BASELINE_MISSING"
                     score_delta = None
+                    baseline_missing.append(cid)
                 elif c_score is None:
                     trans_status = "CANDIDATE_MISSING"
                     score_delta = None
+                    candidate_missing.append(cid)
                 else:
                     score_drop = round(b_score - c_score, 4)
                     score_delta = round(c_score - b_score, 4)
@@ -202,30 +209,79 @@ class RegressionEngine:
             baseline_run_id=baseline_run_id,
             candidate_run_id=candidate_run_id,
             metric_deltas=deltas,
-            newly_failed_cases=newly_failed,
-            recovered_cases=recovered,
-            unchanged_cases=unchanged,
-            unchanged_pass_cases=unchanged_pass,
-            unchanged_fail_cases=unchanged_fail,
+            newly_failed_cases=sorted(newly_failed),
+            recovered_cases=sorted(recovered),
+            unchanged_cases=sorted(unchanged),
+            unchanged_pass_cases=sorted(unchanged_pass),
+            unchanged_fail_cases=sorted(unchanged_fail),
+            candidate_missing_cases=sorted(candidate_missing),
+            baseline_missing_cases=sorted(baseline_missing),
             case_transitions=transitions,
-            regressed_cases=newly_failed,
-            improved_cases=recovered,
+            regressed_cases=sorted(newly_failed),
+            improved_cases=sorted(recovered),
             net_case_drift=len(recovered) - len(newly_failed),
         )
 
     def evaluate_gate(
         self,
-        candidate: RunMetricsSummary,
-        policy: ReleasePolicy,
-        candidate_run_id: str,
+        candidate: RunMetricsSummary | None = None,
+        policy: ReleasePolicy | None = None,
+        candidate_run_id: str = "candidate",
         baseline: RunMetricsSummary | None = None,
         baseline_run_id: str | None = None,
         comparison: RunComparison | None = None,
+        candidate_summary: RunMetricsSummary | None = None,
+        baseline_summary: RunMetricsSummary | None = None,
     ) -> GateResult:
         """Evaluate composite release policy against candidate run metrics and baseline."""
+        cand = candidate or candidate_summary
+        if cand is None:
+            raise ValueError("Candidate RunMetricsSummary is required for gate evaluation.")
+        candidate = cand
+        if baseline is None and baseline_summary is not None:
+            baseline = baseline_summary
+        if policy is None:
+            policy = ReleasePolicy()
         violations: list[GateViolation] = []
 
+        # 0. Case Coverage Evaluation (Requirement 1, 2)
+        min_cov = getattr(policy, "min_case_coverage", 1.0)
+        if candidate.coverage_ratio < min_cov:
+            violations.append(
+                GateViolation(
+                    metric_name="case_coverage",
+                    candidate_value=candidate.coverage_ratio,
+                    threshold=min_cov,
+                    operator=">=",
+                    violation_type="INSUFFICIENT_COVERAGE",
+                    message=(
+                        f"Evaluation coverage {candidate.coverage_ratio * 100:.1f}% "
+                        f"({candidate.evaluated_case_count}/{candidate.required_case_count} cases) fell below "
+                        f"required release threshold of {min_cov * 100:.1f}%. Partial/smoke runs cannot pass release gating."
+                    ),
+                )
+            )
+
+        # Baseline Test Case Parity / Candidate Missing Check (Requirement 3)
+        if comparison and comparison.candidate_missing_cases:
+            if not getattr(policy, "allow_candidate_missing", False):
+                missing_sample = sorted(comparison.candidate_missing_cases)[:5]
+                violations.append(
+                    GateViolation(
+                        metric_name="candidate_case_coverage",
+                        candidate_value=float(len(comparison.candidate_missing_cases)),
+                        threshold=0.0,
+                        operator="<=",
+                        violation_type="CANDIDATE_MISSING",
+                        message=(
+                            f"Candidate omitted {len(comparison.candidate_missing_cases)} required test case(s) "
+                            f"present in baseline (e.g. {missing_sample}). Baseline cases must not be omitted."
+                        ),
+                    )
+                )
+
         # 1. Faithfulness Threshold
+
         cand_faith = candidate.metrics.get("faithfulness")
         if cand_faith is None or cand_faith.count == 0:
             violations.append(

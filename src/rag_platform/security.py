@@ -16,11 +16,70 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from rag_platform.core import PolicyViolationError
+from rag_platform.core import PlatformError, PolicyViolationError
 from rag_platform.models import RunOptions
 
 
 # --- 1. Comprehensive Enterprise Secret Redactor ---
+class SecretResolutionError(PlatformError):
+    """Raised when a referenced secret/environment variable cannot be resolved at runtime."""
+    pass
+
+
+def resolve_secret_reference(val: str) -> str:
+    """Resolve an environment-backed secret reference (e.g. '${VAR_NAME}' or 'env://VAR_NAME').
+
+    If val is a secret reference and the referenced env var exists, returns the resolved secret.
+    If the env var is missing, raises SecretResolutionError.
+    If val is not a secret reference, returns it as-is.
+    """
+    if not isinstance(val, str):
+        return val
+
+    # Match exact reference: ${VAR} or env://VAR
+    env_match = re.match(r"^\$\{([A-Za-z0-9_]+)\}$", val.strip()) or re.match(r"^env://([A-Za-z0-9_]+)$", val.strip())
+    if env_match:
+        var_name = env_match.group(1)
+        resolved = os.environ.get(var_name)
+        if resolved is None:
+            raise SecretResolutionError(
+                f"Missing required secret reference: environment variable '{var_name}' is not set in worker environment."
+            )
+        return resolved
+
+    # Match embedded references like "Bearer ${TOKEN}"
+    if "${" in val and "}" in val:
+        def _replace_var(m: re.Match) -> str:
+            var_name = m.group(1)
+            resolved = os.environ.get(var_name)
+            if resolved is None:
+                raise SecretResolutionError(
+                    f"Missing required secret reference: environment variable '{var_name}' is not set in worker environment."
+                )
+            return resolved
+
+        return re.sub(r"\$\{([A-Za-z0-9_]+)\}", _replace_var, val)
+
+    return val
+
+
+def resolve_adapter_headers(headers: dict[str, str] | None, header_secret_refs: dict[str, str] | None = None) -> dict[str, str]:
+    """Resolve headers by substituting secret references and merging explicit header_secret_refs."""
+    resolved: dict[str, str] = {}
+    if headers:
+        for k, v in headers.items():
+            resolved[k] = resolve_secret_reference(v)
+
+    if header_secret_refs:
+        for header_name, ref in header_secret_refs.items():
+            if "${" in ref or ref.startswith("env://"):
+                resolved[header_name] = resolve_secret_reference(ref)
+            else:
+                resolved[header_name] = resolve_secret_reference(f"${{{ref}}}")
+
+    return resolved
+
+
 class SecretRedactor:
     """Detects and redacts sensitive credentials, API keys, database connection strings, JWTs, and private keys."""
 
@@ -70,6 +129,8 @@ class SecretRedactor:
         ),
     ]
 
+    SECRET_REF_PATTERN = re.compile(r"^(?:Bearer\s+)?(?:\$\{[A-Za-z0-9_]+\}|env://[A-Za-z0-9_]+)$")
+
     @classmethod
     def redact_text(cls, text: str | None) -> str:
         """Sanitize text of known secret formats."""
@@ -98,7 +159,10 @@ class SecretRedactor:
         clean: dict[str, Any] = {}
         for k, v in data.items():
             if str(k).lower() in sensitive_keys:
-                clean[k] = "***[REDACTED]***"
+                if isinstance(v, str) and cls.SECRET_REF_PATTERN.match(v.strip()):
+                    clean[k] = v
+                else:
+                    clean[k] = "***[REDACTED]***"
             elif isinstance(v, str):
                 clean[k] = cls.redact_text(v)
             elif isinstance(v, dict):
@@ -115,6 +179,7 @@ class SecretRedactor:
             else:
                 clean[k] = v
         return clean
+
 
 
 # --- 2. Indirect Prompt Injection & Document Quarantine Defense ---

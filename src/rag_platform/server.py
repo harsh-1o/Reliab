@@ -200,7 +200,7 @@ class CreateRunReq(BaseModel):
     async_exec: bool = False
     # RunOptions fields — bounded & enforced (Points 9, 10, 29)
     concurrency: int = Field(default=5, ge=1, le=100)
-    max_cases: int | None = Field(default=500, ge=1, le=10000)
+    max_cases: int | None = Field(default=None, ge=1, le=10000)
     timeout_seconds: float = Field(default=60.0, ge=0.01, le=3600.0)
     fail_fast: bool = False
     use_cache: bool = True
@@ -225,20 +225,47 @@ class CreateApiKeyReq(BaseModel):
 
 # --- Session Auth & Rate Limiting ---
 class AuthRateLimiter:
-    """Sliding-window rate limiter protecting authentication endpoints against brute-force attacks."""
+    """Sliding-window rate limiter protecting authentication endpoints against brute-force attacks.
 
-    def __init__(self, max_failures: int = 5, window_seconds: float = 60.0):
+    Enforces bounded memory with TTL expiration pruning and capacity-based eviction
+    to prevent memory exhaustion from large numbers of unique source IPs.
+    """
+
+    def __init__(self, max_failures: int = 5, window_seconds: float = 60.0, max_tracked_ips: int = 10_000):
         self.max_failures = max_failures
         self.window_seconds = window_seconds
+        self.max_tracked_ips = max_tracked_ips
         self._failures: dict[str, list[float]] = {}
         self._lock = threading.Lock()
+
+    def _prune_expired(self, now: float) -> None:
+        """Evict expired failure records and enforce bounded memory capacity."""
+        expired_ips = [
+            ip for ip, timestamps in self._failures.items()
+            if not timestamps or (now - timestamps[-1]) >= self.window_seconds
+        ]
+        for ip in expired_ips:
+            self._failures.pop(ip, None)
+
+        if len(self._failures) > self.max_tracked_ips:
+            sorted_ips = sorted(
+                self._failures.items(),
+                key=lambda item: item[1][-1] if item[1] else 0.0,
+            )
+            excess = len(self._failures) - self.max_tracked_ips
+            for ip, _ in sorted_ips[:excess]:
+                self._failures.pop(ip, None)
 
     def is_blocked(self, ip: str) -> tuple[bool, float]:
         now = time.monotonic()
         with self._lock:
             timestamps = self._failures.get(ip, [])
             valid = [t for t in timestamps if (now - t) < self.window_seconds]
-            self._failures[ip] = valid
+            if valid:
+                self._failures[ip] = valid
+            else:
+                self._failures.pop(ip, None)
+
             if len(valid) >= self.max_failures:
                 retry_after = max(1.0, self.window_seconds - (now - valid[0]))
                 return True, retry_after
@@ -247,8 +274,11 @@ class AuthRateLimiter:
     def record_failure(self, ip: str) -> None:
         now = time.monotonic()
         with self._lock:
+            self._prune_expired(now)
             timestamps = self._failures.setdefault(ip, [])
             timestamps.append(now)
+            if len(self._failures) > self.max_tracked_ips:
+                self._prune_expired(now)
 
     def record_success(self, ip: str) -> None:
         with self._lock:
@@ -260,6 +290,7 @@ class AuthRateLimiter:
 
 
 auth_rate_limiter = AuthRateLimiter(max_failures=5, window_seconds=60.0)
+
 
 
 def _is_ip_in_trusted_list(ip_str: str, trusted: tuple[str, ...]) -> bool:
@@ -314,8 +345,10 @@ def extract_client_ip(request: Request, trusted_proxies: tuple[str, ...] | None 
             except ValueError:
                 continue
 
-    # If all IPs in chain are trusted proxies, return leftmost
-    return parts[0]
+    # If all IPs in forwarded chain appear to be trusted proxies, do NOT trust
+    # an attacker-supplied leftmost value: fall back to the authenticated direct socket peer.
+    return direct_ip
+
 
 
 @app.post("/v1/auth/session")
@@ -729,8 +762,12 @@ def list_runs(
                 )
                 for t in r.traces
             ]
-            summary = eval_engine.aggregate_run(traces) if traces else None
+            ds = db.get(DatasetRow, r.dataset_id) if r.dataset_id else None
+            req_count = len(ds.cases) if (ds and ds.cases) else None
+            summary = eval_engine.aggregate_run(traces, required_case_count=req_count) if traces else None
             summary_dict = summary.model_dump() if summary else None
+
+
             if summary:
                 gate_dict = reg_engine.evaluate_gate(
                     summary,
@@ -785,8 +822,10 @@ def _resolve_adapter(req: "CreateRunReq") -> Any:
         return HttpRagAdapter(
             endpoint_url=endpoint_url,
             headers=req.adapter_config.get("headers"),
+            header_secret_refs=req.adapter_config.get("header_secret_refs"),
             timeout_seconds=http_timeout,
         )
+
 
     if adapter_type_key == "python":
         adapter_name = req.adapter_config.get("adapter_name")
@@ -1008,7 +1047,12 @@ async def _execute_evaluation_run(
         failure_type = "FAIL_FAST" if (had_fatal_failure and fail_fast) else None
 
         # Pre-compute and persist run summary and gate result to avoid N+1 recalculation on list/get
-        summary_obj = eval_engine.aggregate_run([(t, m) for t, m, _ in results]) if results else None
+        summary_obj = (
+            eval_engine.aggregate_run([(t, m) for t, m, _ in results], required_case_count=len(ds_cases))
+            if results
+            else None
+        )
+
         gate_obj = None
         if summary_obj and final_status == RunStatus.COMPLETED:
             from rag_platform.regression import RegressionEngine, ReleasePolicy
@@ -1136,7 +1180,7 @@ async def create_run(
     cases = [db_row_to_test_case(r) for r in ds.cases]
 
     # Validate safety limits via BudgetGuard
-    effective_max_cases = req.max_cases if req.max_cases is not None else 500
+    effective_max_cases = req.max_cases
     config_options = RunOptions(
         concurrency=req.concurrency,
         max_cases=effective_max_cases,
@@ -1145,10 +1189,11 @@ async def create_run(
         use_cache=getattr(req, "use_cache", True),
     )
     try:
-        cases_to_evaluate = min(len(cases), effective_max_cases)
+        cases_to_evaluate = min(len(cases), effective_max_cases) if effective_max_cases is not None else len(cases)
         BudgetGuard.validate_run_bounds(cases_to_evaluate, config_options)
     except Exception as err:
         raise HTTPException(status_code=400, detail=str(err))
+
 
     env_info = {
         "os": platform.system(),
@@ -1339,8 +1384,11 @@ def get_run(
             )
             for t in run.traces
         ]
-        summary = eval_engine.aggregate_run(traces) if traces else None
+        ds = db.get(DatasetRow, run.dataset_id)
+        req_count = len(ds.cases) if (ds and ds.cases) else None
+        summary = eval_engine.aggregate_run(traces, required_case_count=req_count) if traces else None
         summary_dict = summary.model_dump() if summary else None
+
         if summary:
             reg_engine = RegressionEngine()
             gate_dict = reg_engine.evaluate_gate(

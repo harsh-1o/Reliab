@@ -32,9 +32,10 @@ Adapters return a normalized `RagTrace` object containing:
 ### 1. `HttpRagAdapter`
 Connects to remote or local HTTP microservices serving RAG pipelines:
 - **SSRF Defense**: Uses `SSRFProtectedTransport` to validate destination IP addresses against private networks (RFC 1918, RFC 3927) and pin sockets to prevent DNS rebinding.
-- **Strict Response Validation**: Explicitly validates RAG payloads against schema contracts before converting into `RagTrace`. Missing or non-string answers on non-abstained responses, malformed citations, or invalid chunk structures generate clear `OPS-01` traces with diagnostic telemetry instead of silent partial evaluations.
+- **Strict Canonical Response Validation**: Validates HTTP RAG responses through a canonical strict Pydantic model (`HttpRagResponsePayload`). Structural types, nested chunk definitions, citations with token spans, and abstention fields are strictly validated. Malformed responses (e.g. invalid chunk types, bad spans, missing required non-abstained answers) consistently become `OPS-01` operational errors with diagnostic telemetry rather than leaking unhandled exceptions.
+- **Environment-Backed Secret References**: To avoid storing plaintext API tokens in the database, `HttpRagAdapter` supports secret references in header configurations (`header_secret_refs` or `${ENV_VAR}`). Plaintext headers are redacted prior to database persistence, and background execution workers resolve credentials at runtime from their environment. If a referenced environment secret is missing, execution safely produces an `OPS-01` error.
 - **Retry & Idempotency Contract**: Intended for read-only evaluation requests. Outbound requests automatically include `X-Request-ID` and `Idempotency-Key` headers (`eval_{project}_{dataset}_{case}_{trace}`). Automatic retries with exponential backoff and jitter are performed for transient HTTP status codes (`429`, `502`, `503`, `504`) and connection drops without duplicating side-effects.
-- **Bounded Concurrency**: Throttles outbound traffic using `asyncio.Semaphore` to protect SUT endpoints from overload.
+- **Bounded Concurrency & Clean Resource Teardown**: Throttles outbound traffic using `asyncio.Semaphore` and guarantees async client closure via asynchronous context management and `finally` cleanup.
 
 #### Expected Request Payload
 ```json

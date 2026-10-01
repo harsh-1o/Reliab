@@ -9,7 +9,7 @@ import re
 import statistics
 from abc import ABC, abstractmethod
 
-from rag_platform.core import canonical_json, sha256_hash
+from rag_platform.core import calculate_percentile, canonical_json, sha256_hash
 from rag_platform.models import (
     Answerability,
     ClaimStatus,
@@ -927,6 +927,9 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
         self.session_factory = session_factory
         self.hits: int = 0
         self.misses: int = 0
+        self.errors: int = 0
+        self.is_degraded: bool = False
+        self.last_error: str | None = None
 
     def _get_session(self):
         if self.session_factory is not None:
@@ -955,8 +958,10 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
                 self.misses += 1
                 return None
         except Exception as exc:
-            logger.debug("DatabaseEvaluationCache get error: %s", exc)
-            self.misses += 1
+            self.errors += 1
+            self.is_degraded = True
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("DatabaseEvaluationCache infrastructure get error on key %s: %s", key, exc)
             return None
 
     def set(self, key: str, value: MetricResult) -> None:
@@ -1001,7 +1006,10 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
                             )
                 sess.commit()
         except Exception as exc:
-            logger.debug("DatabaseEvaluationCache set error: %s", exc)
+            self.errors += 1
+            self.is_degraded = True
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("DatabaseEvaluationCache infrastructure set error on key %s: %s", key, exc)
 
     def clear(self) -> None:
         from sqlalchemy import delete
@@ -1015,7 +1023,10 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
                 self.hits = 0
                 self.misses = 0
         except Exception as exc:
-            logger.debug("DatabaseEvaluationCache clear error: %s", exc)
+            self.errors += 1
+            self.is_degraded = True
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("DatabaseEvaluationCache infrastructure clear error: %s", exc)
 
     def stats(self) -> dict[str, Any]:
         from sqlalchemy import func, select
@@ -1030,14 +1041,21 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
                     "capacity": self.capacity,
                     "hits": self.hits,
                     "misses": self.misses,
+                    "infrastructure_errors": self.errors,
+                    "is_degraded": self.is_degraded,
+                    "last_error": self.last_error,
                 }
-        except Exception:
+        except Exception as exc:
             return {
                 "size": 0,
                 "capacity": self.capacity,
                 "hits": self.hits,
                 "misses": self.misses,
+                "infrastructure_errors": self.errors + 1,
+                "is_degraded": True,
+                "last_error": f"{type(exc).__name__}: {exc}",
             }
+
 
 
 class TwoTierEvaluationCache(BaseEvaluationCache):
@@ -1083,6 +1101,14 @@ class TwoTierEvaluationCache(BaseEvaluationCache):
         self.l1.set(key, value)
         self.l2.set(key, value)
 
+    @property
+    def is_degraded(self) -> bool:
+        return self.l2.is_degraded
+
+    @property
+    def infrastructure_errors(self) -> int:
+        return self.l2.errors
+
     def clear(self) -> None:
         self.l1.clear()
         self.l2.clear()
@@ -1094,7 +1120,10 @@ class TwoTierEvaluationCache(BaseEvaluationCache):
             "hits": self.hits,
             "misses": self.misses,
             "capacity": self.capacity,
+            "is_degraded": self.is_degraded,
+            "infrastructure_errors": self.infrastructure_errors,
         }
+
 
 
 # --- Evaluation Engine, Cache, & Statistics ---
@@ -1182,7 +1211,11 @@ class EvaluationEngine:
             results.append(result)
         return results
 
-    def aggregate_run(self, traces_with_metrics: list[tuple[RagTrace, list[MetricResult]]]) -> RunMetricsSummary:
+    def aggregate_run(
+        self,
+        traces_with_metrics: list[tuple[RagTrace, list[MetricResult]]],
+        required_case_count: int | None = None,
+    ) -> RunMetricsSummary:
         metric_values: dict[str, list[float]] = {}
         metric_families: dict[str, MetricFamily] = {}
         metric_total_counts: dict[str, int] = {}
@@ -1251,19 +1284,8 @@ class EvaluationEngine:
             else:
                 ci_lower, ci_upper = round(mean_val, 4), round(mean_val, 4)
 
-            # Standard percentile calculation using linear interpolation
-            def _percentile(sorted_data: list[float], pct: float) -> float:
-                """Compute percentile using standard linear interpolation (matches numpy default)."""
-                if len(sorted_data) == 1:
-                    return sorted_data[0]
-                rank = pct * (len(sorted_data) - 1)
-                lo = int(rank)
-                hi = min(lo + 1, len(sorted_data) - 1)
-                frac = rank - lo
-                return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
-
-            p50_val = _percentile(sorted_vals, 0.50)
-            p95_val = _percentile(sorted_vals, 0.95)
+            p50_val = calculate_percentile(sorted_vals, 0.50)
+            p95_val = calculate_percentile(sorted_vals, 0.95)
 
             sample_warning = (
                 f"Small sample size (N={n} < 30); statistical variance is elevated."
@@ -1287,12 +1309,33 @@ class EvaluationEngine:
                 sample_warning=sample_warning,
             )
 
-        total_cases = len(traces_with_metrics)
+        evaluated_cases = len(traces_with_metrics)
+        total_cases = evaluated_cases
+        # Semantically correct scored_cases: distinct cases where at least one metric yielded a numeric score
+        scored_cases = sum(1 for _, m_list in traces_with_metrics if any(m.score is not None for m in m_list))
+        infra_error_count = sum(
+            1 for trace, _ in traces_with_metrics
+            if trace.error_code is not None or (trace.telemetry and trace.telemetry.get("error_code"))
+        )
+
+        if required_case_count is None or required_case_count < 0:
+            required_cases = evaluated_cases
+        else:
+            required_cases = required_case_count
+
+        missing_cases = max(0, required_cases - evaluated_cases)
+        if required_cases > 0:
+            coverage_ratio = round(evaluated_cases / required_cases, 4)
+            is_full = (missing_cases == 0)
+        else:
+            coverage_ratio = 1.0
+            is_full = True
+
+        eligible = is_full and (coverage_ratio >= 1.0)
         hallucination_rate = round(hallucinations / total_cases, 4) if total_cases > 0 else None
         abstention_acc = round(sum(abstention_scores) / len(abstention_scores), 4) if abstention_scores else None
 
-        sorted_latencies = sorted(latencies) if latencies else [0]
-        p95_lat = sorted_latencies[min(int(len(sorted_latencies) * 0.95), len(sorted_latencies) - 1)]
+        p95_lat = calculate_percentile(latencies, 0.95) if latencies else 0.0
 
         run_warning = (
             f"Run evaluation based on small sample size (N={total_cases} < 30). Regression results may lack statistical power."
@@ -1303,11 +1346,19 @@ class EvaluationEngine:
         return RunMetricsSummary(
             metrics=summaries,
             total_cases=total_cases,
-            scored_cases=total_cases,
+            scored_cases=scored_cases,
+            required_case_count=required_cases,
+            evaluated_case_count=evaluated_cases,
+            missing_case_count=missing_cases,
+            coverage_ratio=coverage_ratio,
+            is_full_evaluation=is_full,
+            eligible_for_release_gate=eligible,
             hallucination_rate=hallucination_rate,
             low_faithfulness_rate=hallucination_rate,
             abstention_accuracy=abstention_acc,
-            p95_latency_ms=float(p95_lat),
+            infra_error_count=infra_error_count,
+            p95_latency_ms=round(float(p95_lat), 2),
             total_cost_usd=round(total_cost, 4),
             sample_warning=run_warning,
         )
+

@@ -47,14 +47,14 @@ flowchart TD
 ### Evaluation & Attribution Plane
 - **Evaluation Engine**: Executes asynchronous, parallel evaluators for retrieval quality, claim-level faithfulness, answer correctness, citation alignment, and abstention compliance.
 - **Metric Applicability**: Evaluators decouple conditional scoring from default values; missing preconditions yield `NOT_APPLICABLE` (`score=None`) rather than arbitrary penalties.
-- **Deterministic Attribution Engine**: Maps metric failures to canonical diagnostic codes (`RET-01`, `GEN-01`, `CIT-02`, etc.) with supporting evidence extracted from traces.
-- **Active Learning Classifier**: Auxiliary scikit-learn classifier providing secondary confidence scoring and triage prioritization for unclassified traces.
+- **Deterministic Attribution Engine**: Maps metric failures to canonical diagnostic codes (`RET-01`, `GEN-01`, `CIT-02`, etc.) with supporting evidence extracted from traces for secondary diagnostic triage.
+- **Active Learning Classifier**: Auxiliary diagnostic classifier providing triage prioritization for unclassified traces (used as secondary triage aid, not ground truth for release decisions).
 
 ### Decision & Control Plane
-- **Regression Engine**: Evaluates candidate runs against a baseline run using four-way per-case transition tracking (`NEW_FAILURE`, `RECOVERED`, `UNCHANGED_PASS`, `UNCHANGED_FAIL`).
-- **Release Policy Gate**: Computes pass/fail verdicts against configurable statistical thresholds and regression budgets, producing standard JUnit XML reports and process exit codes.
+- **Regression Engine**: Evaluates candidate runs against a baseline run using case-level transition tracking (`NEW_FAILURE`, `CANDIDATE_MISSING`, `BASELINE_MISSING`, `RECOVERED`, `UNCHANGED_PASS`, `UNCHANGED_FAIL`).
+- **Release Policy Gate**: Enforces required dataset coverage (`min_case_coverage`, default 100%), forbids silent candidate omission of baseline cases, and computes pass/fail verdicts against configurable statistical thresholds and regression budgets.
 - **FastAPI Control Plane**: Powers the REST API, session management, authentication middleware, and background task dispatch.
-- **Web Dashboard**: Server-rendered, responsive console for inspecting runs, traces, metrics, and failure attributions.
+- **Web Dashboard**: Server-rendered, responsive console for inspecting runs, traces, metrics, coverage metrics, and failure attributions.
 
 ---
 

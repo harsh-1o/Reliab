@@ -20,13 +20,22 @@ Crucially, **precondition failures emit `NOT_APPLICABLE` (`score=None`)** rather
 
 ---
 
-## 2. Statistical Reporting
+## 2. Statistical Reporting & Summary Semantics
 
-To avoid misleading averages on small test sets, Reliab computes confidence bounds:
-
-- **Wilson Score Interval**: Computed for bounded binomial metrics (Recall, Faithfulness, Precision, Citation Accuracy, Abstention Accuracy). This provides realistic lower and upper error bounds at a 95% confidence level.
+### Confidence Intervals
+- **Wilson Score Interval**: Strictly applied to binary/binomial metric outcomes ($\{0.0, 1.0\}$) such as binary exact match, binary groundings, or discrete abstentions. This provides robust lower and upper error bounds at a 95% confidence level without Gaussian skew.
+- **Normal Approximation CI**: Continuous metric distributions (e.g. continuous similarity or partial overlap scores) compute 95% confidence intervals using standard normal distribution error bounds ($\bar{x} \pm z \cdot \frac{s}{\sqrt{n}}$).
 - **Sample Size Warnings**: Runs with $N < 30$ cases automatically emit a warning:
   `Small sample size (N < 30); statistical variance is elevated.`
+
+### Percentile Methodology
+All latency and metric percentiles (p50, p95) use a single shared implementation based on **NIST Method 7 / standard linear interpolation**:
+$$\text{rank} = p \times (N - 1)$$
+where $p \in [0.0, 1.0]$ and linear interpolation is computed between adjacent ranks $v_{\lfloor \text{rank} \rfloor}$ and $v_{\lceil \text{rank} \rceil}$. This avoids the bias of nearest-rank / integer-truncation methods (which for $N=20$ incorrectly select the maximum observation).
+
+### `scored_cases` vs `evaluated_cases` Semantics
+- **`evaluated_cases`**: Total test cases executed in the run (bounded by `max_cases` if partial/smoke run).
+- **`scored_cases`**: Distinct test cases where at least one metric yielded an applicable numeric evaluation (`score is not None`). Cases where all metrics legitimately evaluated to `NOT_APPLICABLE` (e.g. unanswerable queries on retrieval metrics) do not artificially increment `scored_cases`.
 
 ---
 
@@ -101,3 +110,12 @@ Reliab evaluates system behavior on queries designed to elicit refusal:
   - Unanswerable query + system abstains: **Pass (1.0)**.
   - Unanswerable query + system hallucinates an answer: **Fail (0.0, Code ABS-01)**.
   - Answerable query + system falsely refuses: **Fail (0.0, Code ABS-02)**.
+
+---
+
+## 7. Diagnostic Failure Attribution & Secondary Triage
+
+Reliab provides root-cause failure taxonomy codes (e.g. `RET-01`, `GEN-02`, `CIT-01`, `ABS-01`) via deterministic heuristic rule engines and secondary classification models.
+
+> [!NOTE]
+> **Heuristic Diagnostics Notice**: Rule-based attribution and classifier outputs are designed for **secondary diagnostic triage and workflow acceleration**, not ground-truth causal proof or calibrated probabilistic inferences. Metric scores and raw traces remain the primary source of truth for release gate decisions.
