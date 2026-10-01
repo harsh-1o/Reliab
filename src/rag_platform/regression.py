@@ -183,7 +183,13 @@ class RegressionEngine:
                     trans_status = "CANDIDATE_MISSING"
                     score_delta = None
                 elif b_score is None or c_score is None:
-                    trans_status = "NOT_APPLICABLE"
+                    # Explicit case-ID sets distinguish an evaluated-but-unmeasurable
+                    # metric from an actually missing candidate case. Preserve the
+                    # legacy None-score contract when callers do not provide membership.
+                    if c_score is None and candidate_case_ids is None:
+                        trans_status = "CANDIDATE_MISSING"
+                    else:
+                        trans_status = "NOT_APPLICABLE"
                     score_delta = None
                 else:
                     score_drop = round(b_score - c_score, 4)
