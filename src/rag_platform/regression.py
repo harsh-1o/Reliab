@@ -60,6 +60,8 @@ class RegressionEngine:
         candidate_run_id: str,
         baseline_case_scores: dict[str, float | None] | None = None,
         candidate_case_scores: dict[str, float | None] | None = None,
+        baseline_case_ids: set[str] | None = None,
+        candidate_case_ids: set[str] | None = None,
         per_case_threshold: float = 0.15,
     ) -> RunComparison:
         """Calculate metric deltas and detect per-case regressions and recoveries."""
@@ -159,22 +161,36 @@ class RegressionEngine:
         transitions: dict[str, dict[str, Any]] = {}
 
         if baseline_case_scores is not None and candidate_case_scores is not None:
-            common_cases = sorted(set(baseline_case_scores.keys()).union(candidate_case_scores.keys()))
-            for cid in common_cases:
-                b_score = baseline_case_scores.get(cid)
-                c_score = candidate_case_scores.get(cid)
+            baseline_ids = set(baseline_case_ids) if baseline_case_ids is not None else set(baseline_case_scores.keys())
+            candidate_ids = set(candidate_case_ids) if candidate_case_ids is not None else set(candidate_case_scores.keys())
+            candidate_missing = sorted(baseline_ids - candidate_ids)
+            baseline_missing = sorted(candidate_ids - baseline_ids)
+            all_cases = sorted(baseline_ids.union(candidate_ids))
 
-                if b_score is None and c_score is None:
+            for cid in all_cases:
+                in_baseline = cid in baseline_ids
+                in_candidate = cid in candidate_ids
+                b_score = baseline_case_scores.get(cid) if in_baseline else None
+                c_score = candidate_case_scores.get(cid) if in_candidate else None
+
+                if not in_baseline and not in_candidate:
                     trans_status = "NOT_APPLICABLE"
                     score_delta = None
-                elif b_score is None:
+                elif not in_baseline:
                     trans_status = "BASELINE_MISSING"
                     score_delta = None
-                    baseline_missing.append(cid)
-                elif c_score is None:
+                elif not in_candidate:
                     trans_status = "CANDIDATE_MISSING"
                     score_delta = None
-                    candidate_missing.append(cid)
+                elif b_score is None or c_score is None:
+                    # Explicit case-ID sets distinguish an evaluated-but-unmeasurable
+                    # metric from an actually missing candidate case. Preserve the
+                    # legacy None-score contract when callers do not provide membership.
+                    if c_score is None and candidate_case_ids is None:
+                        trans_status = "CANDIDATE_MISSING"
+                    else:
+                        trans_status = "NOT_APPLICABLE"
+                    score_delta = None
                 else:
                     score_drop = round(b_score - c_score, 4)
                     score_delta = round(c_score - b_score, 4)

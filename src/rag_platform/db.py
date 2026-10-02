@@ -425,6 +425,7 @@ class DatabaseRepo:
         options_override_json: str | None = None,
         idempotency_key: str | None = None,
     ) -> RunRow:
+        # Dataset invariants are checked before the provenance manifest hash so checksum mismatches retain their specific error contract.
         if idempotency_key:
             existing = self.session.scalar(
                 select(RunRow).where(
@@ -456,6 +457,9 @@ class DatabaseRepo:
                 f"Run provenance dataset checksum '{provenance.dataset_checksum}' does not match "
                 f"dataset {config.dataset_id} checksum '{ds.checksum_sha256}'."
             )
+
+        if provenance.manifest_hash != provenance.compute_hash():
+            raise ValueError("Run provenance manifest_hash does not match the canonical provenance manifest.")
 
         run = RunRow(
             id=generate_id("run"),

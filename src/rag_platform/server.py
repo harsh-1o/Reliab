@@ -1,5 +1,4 @@
-"""FastAPI REST API control plane and engineering-grade observability dashboard.
-"""
+"""FastAPI REST API control plane and engineering-grade observability dashboard."""
 
 from __future__ import annotations
 
@@ -47,11 +46,13 @@ from rag_platform.evaluators import EvaluationEngine
 from rag_platform.models import (
     Answerability,
     DocumentReference,
+    GateResult,
     MetricFamily,
     MetricResult,
     RagTrace,
     ReleasePolicy,
     RunConfig,
+    RunMetricsSummary,
     RunOptions,
     RunProvenance,
     RunStatus,
@@ -1055,11 +1056,12 @@ async def _execute_evaluation_run(
 
         gate_obj = None
         if summary_obj and final_status == RunStatus.COMPLETED:
-            from rag_platform.regression import RegressionEngine, ReleasePolicy
+            from rag_platform.gate import resolve_release_policy
+            from rag_platform.regression import RegressionEngine
             reg_engine = RegressionEngine()
             gate_obj = reg_engine.evaluate_gate(
                 summary_obj,
-                ReleasePolicy(policy_id=run_row.policy_id),
+                resolve_release_policy(run_row.policy_id),
                 candidate_run_id=run_row.id,
             )
 
@@ -1225,12 +1227,18 @@ async def create_run(
         random_seed=req.random_seed,
     )
 
+    from rag_platform.gate import resolve_release_policy
+    try:
+        active_policy = resolve_release_policy(req.policy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     config = RunConfig(
         project_id=req.project_id,
         dataset_id=req.dataset_id,
         dataset_version=ds.version,
         system_version=req.system_version,
-        policy_id=req.policy_id,
+        policy_id=active_policy.policy_id,
         options=config_options,
     )
 
@@ -1297,27 +1305,17 @@ async def create_run(
     await _execute_evaluation_run(run.id, req, config, cases, db_session=db)
     db.refresh(run)
 
-    eval_engine = EvaluationEngine()
-    traces = [
-        (
-            RagTrace.model_validate_json(t.raw_trace_json),
-            [
-                MetricResult(
-                    metric_name=m.metric_name,
-                    metric_family=MetricFamily(m.metric_family),
-                    score=m.score,
-                )
-                for m in t.metrics
-            ],
-        )
-        for t in run.traces
-    ]
-    summary = eval_engine.aggregate_run(traces) if traces else None
+    # _execute_evaluation_run persists the authoritative summary and gate result.
+    # Return those values directly so a partial run cannot be accidentally re-aggregated
+    # as a 100% covered run by omitting required_case_count.
+    summary = RunMetricsSummary.model_validate_json(run.summary_json) if run.summary_json else None
+    gate = GateResult.model_validate_json(run.gate_result_json) if run.gate_result_json else None
     return {
         "run_id": run.id,
         "manifest_hash": run.manifest_hash,
         "status": run.status,
         "summary": summary.model_dump() if summary else None,
+        "gate_result": gate.model_dump() if gate else None,
     }
 
 
@@ -1564,36 +1562,28 @@ def compare_runs(
 
     eval_engine = EvaluationEngine()
     b_traces = [
-        (
-            RagTrace.model_validate_json(t.raw_trace_json),
-            [
-                MetricResult(
-                    metric_name=m.metric_name,
-                    metric_family=MetricFamily(m.metric_family),
-                    score=m.score,
-                )
-                for m in t.metrics
-            ],
-        )
-        for t in b_run.traces
+        (RagTrace.model_validate_json(t.raw_trace_json), [
+            MetricResult(metric_name=m.metric_name, metric_family=MetricFamily(m.metric_family), score=m.score)
+            for m in t.metrics
+        ]) for t in b_run.traces
     ]
     c_traces = [
-        (
-            RagTrace.model_validate_json(t.raw_trace_json),
-            [
-                MetricResult(
-                    metric_name=m.metric_name,
-                    metric_family=MetricFamily(m.metric_family),
-                    score=m.score,
-                )
-                for m in t.metrics
-            ],
-        )
-        for t in c_run.traces
+        (RagTrace.model_validate_json(t.raw_trace_json), [
+            MetricResult(metric_name=m.metric_name, metric_family=MetricFamily(m.metric_family), score=m.score)
+            for m in t.metrics
+        ]) for t in c_run.traces
     ]
 
-    b_summary = eval_engine.aggregate_run(b_traces)
-    c_summary = eval_engine.aggregate_run(c_traces)
+    if b_run.summary_json:
+        b_summary = RunMetricsSummary.model_validate_json(b_run.summary_json)
+    else:
+        b_ds = db.get(DatasetRow, b_run.dataset_id)
+        b_summary = eval_engine.aggregate_run(b_traces, required_case_count=len(b_ds.cases) if b_ds else None)
+    if c_run.summary_json:
+        c_summary = RunMetricsSummary.model_validate_json(c_run.summary_json)
+    else:
+        c_ds = db.get(DatasetRow, c_run.dataset_id)
+        c_summary = eval_engine.aggregate_run(c_traces, required_case_count=len(c_ds.cases) if c_ds else None)
 
     b_case_scores = {
         t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), None)
@@ -1603,6 +1593,8 @@ def compare_runs(
         t.test_case_id: next((m.score for m in t.metrics if m.metric_name == "faithfulness" and m.score is not None), None)
         for t in c_run.traces
     }
+    b_case_ids = {t.test_case_id for t in b_run.traces}
+    c_case_ids = {t.test_case_id for t in c_run.traces}
 
     reg_engine = RegressionEngine()
     comparison = reg_engine.compare(
@@ -1612,6 +1604,8 @@ def compare_runs(
         req.candidate_run_id,
         b_case_scores,
         c_case_scores,
+        baseline_case_ids=b_case_ids,
+        candidate_case_ids=c_case_ids,
     )
     gate = reg_engine.evaluate_gate(
         c_summary,

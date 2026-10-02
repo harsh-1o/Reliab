@@ -349,6 +349,7 @@ class BaseMetric(ABC):
     name: str
     family: MetricFamily
     version: str = "2.1.0"
+    statistical_type: str = "continuous"
 
     @abstractmethod
     async def compute(self, trace: RagTrace, case: TestCase) -> MetricResult:
@@ -377,7 +378,7 @@ class RecallAtKMetric(BaseMetric):
             )
 
         gold_refs = case.relevant_documents
-        retrieved_k = trace.retrieved_chunks[: self.k]
+        retrieved_k = sorted(trace.retrieved_chunks, key=lambda chunk: (chunk.rank, chunk.chunk_id))[: self.k]
 
         matched_gold = 0
         chunk_hits = 0
@@ -755,9 +756,13 @@ class CitationSupportMetric(BaseMetric):
             citation_status, _, _ = verify_claim_against_chunks(cit.claim_text, matched_chunks)
             if citation_status == ClaimStatus.SUPPORTED:
                 valid_count += 1
+            elif citation_status == ClaimStatus.CONTRADICTED:
+                # A contradiction is authoritative for citation validity. Never rescue it
+                # with a weaker lexical heuristic.
+                continue
             else:
                 # Heuristic lexical fallback — explicitly disclosed in metadata.
-                # A weak lexical match must NOT silently override the primary evaluator.
+                # This fallback may only rescue an UNSUPPORTED claim.
                 claim_words = [w for w in re.findall(r"\w+", cit.claim_text.lower()) if len(w) > 2]
                 best_overlap = 0.0
                 for mc in matched_chunks:
@@ -793,6 +798,8 @@ class CitationSupportMetric(BaseMetric):
 
 class AbstentionAccuracyMetric(BaseMetric):
     """Verifies that unanswerable cases are refused and answerable cases are attempted."""
+
+    statistical_type = "binary"
 
     def __init__(self) -> None:
         self.name = "abstention_accuracy"
@@ -930,6 +937,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
         self.errors: int = 0
         self.is_degraded: bool = False
         self.last_error: str | None = None
+        self.last_lookup_failed: bool = False
 
     def _get_session(self):
         if self.session_factory is not None:
@@ -942,6 +950,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
 
         from rag_platform.db import EvaluationCacheRow
 
+        self.last_lookup_failed = False
         try:
             with self._get_session() as sess:
                 row = sess.get(EvaluationCacheRow, key)
@@ -960,6 +969,7 @@ class DatabaseEvaluationCache(BaseEvaluationCache):
         except Exception as exc:
             self.errors += 1
             self.is_degraded = True
+            self.last_lookup_failed = True
             self.last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("DatabaseEvaluationCache infrastructure get error on key %s: %s", key, exc)
             return None
@@ -1109,6 +1119,10 @@ class TwoTierEvaluationCache(BaseEvaluationCache):
     def infrastructure_errors(self) -> int:
         return self.l2.errors
 
+    @property
+    def last_lookup_failed(self) -> bool:
+        return self.l2.last_lookup_failed
+
     def clear(self) -> None:
         self.l1.clear()
         self.l2.clear()
@@ -1203,6 +1217,10 @@ class EvaluationEngine:
                     continue
 
             result = await metric.compute(trace, case)
+            result.metadata.setdefault("statistical_type", getattr(metric, "statistical_type", "continuous"))
+            if getattr(self._cache, "last_lookup_failed", False):
+                result.metadata["cache_degraded"] = True
+                result.metadata["cache_infrastructure_error"] = getattr(self._cache, "last_error", "persistent cache lookup failed")
             if use_cache:
                 if hasattr(self._cache, "set"):
                     self._cache.set(key, result)
@@ -1218,13 +1236,21 @@ class EvaluationEngine:
     ) -> RunMetricsSummary:
         metric_values: dict[str, list[float]] = {}
         metric_families: dict[str, MetricFamily] = {}
+        metric_statistical_types: dict[str, str] = {}
         metric_total_counts: dict[str, int] = {}
         hallucinations = 0
         abstention_scores = []
         latencies = []
         total_cost = 0.0
+        seen_case_ids: set[str] = set()
 
         for trace, m_list in traces_with_metrics:
+            # A release evaluation has one authoritative trace per test case.
+            # Ignore duplicate traces rather than allowing retries/duplicates to inflate
+            # coverage, metric sample sizes, latency statistics, or cost totals.
+            if trace.test_case_id in seen_case_ids:
+                continue
+            seen_case_ids.add(trace.test_case_id)
             latencies.append(trace.latency_ms)
             if trace.cost_usd:
                 total_cost += trace.cost_usd
@@ -1232,6 +1258,7 @@ class EvaluationEngine:
             for m in m_list:
                 metric_total_counts[m.metric_name] = metric_total_counts.get(m.metric_name, 0) + 1
                 metric_families[m.metric_name] = m.metric_family
+                metric_statistical_types.setdefault(m.metric_name, str(m.metadata.get("statistical_type", "binary" if m.metric_name == "abstention_accuracy" else "continuous")) if m.metadata else ("binary" if m.metric_name == "abstention_accuracy" else "continuous"))
                 # Only include applicable metrics with a real numerical score
                 if m.score is not None:
                     metric_values.setdefault(m.metric_name, []).append(m.score)
@@ -1272,7 +1299,7 @@ class EvaluationEngine:
 
             # Confidence interval: Wilson score is valid only for binary/binomial metrics
             # (where each score is 0 or 1). For continuous metrics use normal CI.
-            is_binary = all(v in (0.0, 1.0) for v in vals)
+            is_binary = metric_statistical_types.get(name) == "binary"
             if is_binary:
                 ci_lower, ci_upper = wilson_score_interval(mean_val, n)
             elif n > 1:
@@ -1309,10 +1336,16 @@ class EvaluationEngine:
                 sample_warning=sample_warning,
             )
 
-        evaluated_cases = len(traces_with_metrics)
+        evaluated_case_ids = seen_case_ids
+        evaluated_cases = len(evaluated_case_ids)
         total_cases = evaluated_cases
         # Semantically correct scored_cases: distinct cases where at least one metric yielded a numeric score
-        scored_cases = sum(1 for _, m_list in traces_with_metrics if any(m.score is not None for m in m_list))
+        scored_case_ids = {
+            trace.test_case_id
+            for trace, m_list in traces_with_metrics
+            if trace.test_case_id in seen_case_ids and any(m.score is not None for m in m_list)
+        }
+        scored_cases = len(scored_case_ids)
         infra_error_count = sum(
             1 for trace, _ in traces_with_metrics
             if trace.error_code is not None or (trace.telemetry and trace.telemetry.get("error_code"))

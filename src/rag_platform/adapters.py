@@ -58,6 +58,13 @@ class HttpCitationPayload(BaseModel):
     chunk_id: str | None = None
     span: list[int] | None = None
 
+    @model_validator(mode="after")
+    def validate_span(self) -> HttpCitationPayload:
+        if self.span is not None:
+            if len(self.span) != 2 or self.span[0] < 0 or self.span[1] < self.span[0]:
+                raise ValueError("Citation span must be [start, end] with 0 <= start <= end")
+        return self
+
 
 class HttpRagResponsePayload(BaseModel):
     model_config = ConfigDict(strict=True, extra="ignore")
@@ -418,7 +425,8 @@ class HttpRagAdapter:
                 )
 
             try:
-                data = validate_http_rag_response(raw_json)
+                validate_http_rag_response(raw_json)
+                validated = HttpRagResponsePayload.model_validate(raw_json)
             except HttpRagResponseError as val_err:
                 return RagTrace(
                     trace_id=trace_id,
@@ -435,23 +443,24 @@ class HttpRagAdapter:
 
             chunks = [
                 RetrievedChunk(
-                    document_id=c.get("document_id", "doc_unknown"),
-                    chunk_id=c.get("chunk_id", f"c_{i}"),
-                    rank=c.get("rank", i + 1),
-                    score=float(c.get("score", 0.0)),
-                    text=c.get("text", ""),
+                    document_id=c.document_id,
+                    chunk_id=c.chunk_id or f"c_{i}",
+                    rank=c.rank if c.rank is not None else i + 1,
+                    score=float(c.score or 0.0),
+                    text=c.text,
+                    metadata=c.metadata,
                 )
-                for i, c in enumerate(data.get("retrieved_chunks", []))
+                for i, c in enumerate(validated.retrieved_chunks)
             ]
             citations = [
                 Citation(
-                    claim_id=cit.get("claim_id", f"cl_{i}"),
-                    claim_text=cit.get("claim_text", ""),
-                    document_id=cit.get("document_id", ""),
-                    chunk_id=cit.get("chunk_id", ""),
-                    span=cit.get("span"),
+                    claim_id=cit.claim_id or f"cl_{i}",
+                    claim_text=cit.claim_text,
+                    document_id=cit.document_id or "",
+                    chunk_id=cit.chunk_id or "",
+                    span=cit.span,
                 )
-                for i, cit in enumerate(data.get("citations", []))
+                for i, cit in enumerate(validated.citations)
             ]
 
             return RagTrace(
@@ -459,17 +468,17 @@ class HttpRagAdapter:
                 run_id=generate_id("run"),
                 test_case_id=case.id,
                 question=case.question,
-                answer=data.get("answer"),
-                abstained=bool(data.get("abstained", False)),
-                abstention_reason=data.get("abstention_reason"),
+                answer=validated.answer,
+                abstained=validated.abstained,
+                abstention_reason=validated.abstention_reason,
                 retrieved_chunks=chunks,
                 citations=citations,
                 latency_ms=latency_ms,
-                input_tokens=data.get("input_tokens"),
-                output_tokens=data.get("output_tokens"),
-                cost_usd=data.get("cost_usd"),
-                model=data.get("model"),
-                telemetry=SecretRedactor.redact_dict(data.get("telemetry", {})),
+                input_tokens=validated.input_tokens,
+                output_tokens=validated.output_tokens,
+                cost_usd=float(validated.cost_usd) if validated.cost_usd is not None else None,
+                model=validated.model,
+                telemetry=SecretRedactor.redact_dict(validated.telemetry),
             )
         except SSRFProtectionError as ex:
             latency_ms = int((time.perf_counter() - start) * 1000)

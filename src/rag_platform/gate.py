@@ -303,6 +303,23 @@ def load_dataset_from_file(
     return actual_dataset_id, cases
 
 
+BUILTIN_RELEASE_POLICIES: dict[str, ReleasePolicy] = {
+    "prod-default": ReleasePolicy(),
+}
+
+
+def resolve_release_policy(policy_id: str) -> ReleasePolicy:
+    """Resolve a named built-in policy without silently substituting defaults."""
+    try:
+        return BUILTIN_RELEASE_POLICIES[policy_id].model_copy(deep=True)
+    except KeyError as exc:
+        available = ", ".join(sorted(BUILTIN_RELEASE_POLICIES))
+        raise ValueError(
+            f"Unknown release policy '{policy_id}'. Available built-in policies: {available}. "
+            "Custom policy persistence is not configured for the CLI."
+        ) from exc
+
+
 def execute_gate_evaluation(
     db_session: Session,
     project_id: str,
@@ -409,7 +426,7 @@ def execute_gate_evaluation(
         raise ValueError("Either dataset_id or dataset_path must be specified.")
 
     repo = DatabaseRepo(db_session)
-    active_policy = policy or ReleasePolicy()
+    active_policy = policy or resolve_release_policy("prod-default")
 
     ds_row = db_session.get(DatasetRow, dataset_id)
     if not ds_row:
@@ -489,6 +506,10 @@ def execute_gate_evaluation(
 
     reg_engine = RegressionEngine()
     gate = reg_engine.evaluate_gate(summary, active_policy, run.id)
+    run.summary_json = summary.model_dump_json()
+    run.gate_result_json = gate.model_dump_json()
+    run.gate_status = gate.status.value
+    db_session.commit()
 
     if junit_xml_path:
         xml_content = format_junit_xml(gate)
@@ -516,7 +537,7 @@ def main():
     parser.add_argument("--dataset", "--dataset-id", dest="dataset", default=None, help="Published Dataset ID in database")
     parser.add_argument("--dataset-path", default=None, help="Filesystem path to load benchmark dataset from (.json, .jsonl, .csv)")
     parser.add_argument("--system-version", default="HEAD", help="Candidate RAG Git commit SHA")
-    parser.add_argument("--policy", default="prod-default", help="Release policy ID")
+    parser.add_argument("--policy", default="prod-default", help="Named built-in release policy ID (currently: prod-default)")
     parser.add_argument("--adapter-type", default="synthetic", choices=["synthetic", "http"], help="Adapter type (Points 15)")
     parser.add_argument("--endpoint-url", default=None, help="HTTP SUT endpoint URL when evaluating real RAG system")
     parser.add_argument("--mock-mode", default="PERFECT", choices=[m.value for m in SyntheticRagMode])
@@ -551,6 +572,7 @@ def main():
             dataset_id=args.dataset,
             system_version=args.system_version,
             mock_mode=mode,
+            policy=resolve_release_policy(args.policy),
             junit_xml_path=args.junit_xml,
             bootstrap=args.bootstrap,
             adapter_type=args.adapter_type,
