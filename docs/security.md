@@ -1,75 +1,106 @@
-# Security, Privacy & Provenance
+# Security & Deployment Configuration
 
-Reliab is built with enterprise defense-in-depth principles to safely evaluate internal RAG applications and manage sensitive test traces.
+Reliab evaluates systems that may contain sensitive prompts, retrieved documents, generated answers, credentials, and internal endpoints. The platform treats these inputs as untrusted.
 
----
+## Authentication
 
-## 1. Multi-Layer Security Architecture
+### AUTH_ENABLED
 
-### Fail-Closed Authentication & Opaque Sessions
-- **Default Enabled**: `AUTH_ENABLED=true` is the default configuration.
-- **Environment Gating**: The application rejects startup if `DEV_MODE=true` is detected in staging or production environments.
-- **Hashed API Keys**: API keys are securely hashed using cryptographic primitives (SHA-256) before comparison and database storage, mitigating timing attacks and credential leakage.
-- **Cryptographically Hashed Session Tokens**: Authenticating via `POST /v1/auth/session` exchanges an API key for a cryptographically secure, random bearer token (`sess_<token_urlsafe(32)>`).
-  - The raw bearer token is returned to the client and stored exclusively in an HttpOnly, SameSite=Strict `session_id` cookie.
-  - The database stores **only** the SHA-256 hash of the token (`token_hash`), ensuring that a database compromise or SQL dump never leaks valid session bearer credentials.
-  - Incoming session requests hash the presented token and perform lookup by hash.
-- **Credential Linkage & Instant Revocation**:
-  - Each browser session is linked to the issuing API key (`api_key_hash`).
-  - Revoking or rotating an API key immediately invalidates and deletes all active sessions associated with that key.
-  - Active sessions dynamically reflect live database permissions (`project_roles_json` and `is_admin`) of the originating credential.
-- **Session Cleanup & Expiration**:
-  - Sessions default to a 24-hour TTL (`expires_at`).
-  - Expired sessions are rejected automatically during authentication and can be purged safely in batches via `POST /v1/maintenance/cleanup` utilizing the database index on `expires_at`.
-- **API-Key Cache & Revocation Consistency**:
-  - API key identities are cached in-memory with a short TTL (configurable via `API_KEY_CACHE_TTL_SECONDS`, default 2.0 seconds).
-  - Key revocation and rotation immediately purge the local process cache. Cross-process propagation is guaranteed within the 2.0-second window (or 0.0 seconds if `API_KEY_CACHE_TTL_SECONDS=0` is configured for strict instantaneous cross-process consistency).
-- **Brute-Force Rate Limiting Scope & Bounded Memory**:
-  - `AuthRateLimiter` enforces a sliding window (default 5 failed attempts per 60s per IP) for defense-in-depth against brute-force attacks on `/v1/auth/session`.
-  - Memory consumption is strictly bounded with capacity-based eviction (`max_tracked_ips=10_000`) and active TTL pruning, preventing memory exhaustion attacks from unbounded numbers of unique source IPs.
-  - In distributed multi-process or containerized deployments behind load balancers, edge gateways (such as NGINX, Cloudflare, Envoy, or AWS WAF) handle centralized rate limiting without requiring external Redis dependencies for offline/air-gapped environments.
-- **Trusted Reverse Proxy Defense**: Client IP extraction respects `TRUSTED_PROXIES` (default `127.0.0.1,::1,testclient`). If a request does not originate from a configured trusted proxy, `X-Forwarded-For` headers are completely ignored. If an attacker connects directly and provides a forged all-trusted forwarded chain, the proxy extractor rejects the forwarded chain and safely falls back to the direct socket IP.
+Authentication defaults to enabled in deployment environments and disabled for local development. With authentication enabled and `DEV_MODE=false`, a strong `RAG_PLATFORM_API_KEY` is required.
 
-### Socket-Level SSRF Defense
-When evaluating external HTTP RAG endpoints, attackers or rogue configurations could target internal infrastructure (e.g. cloud instance metadata at `169.254.169.254` or internal microservices).
+### DEV_MODE
 
-Reliab implements `SSRFProtectedTransport`:
-1. **Pre-flight DNS Resolution**: Resolves target hostnames before initiating the HTTP handshake.
-2. **IP Range Blocking**: Rejects private, loopback, link-local, and reserved IPv4/IPv6 ranges (RFC 1918, RFC 3927, RFC 4193).
-3. **Redirect Hop Re-validation**: Re-validates target destinations on every redirect hop up to the redirect limit.
-4. **Socket IP Pinning**: Binds TCP connections directly to pre-validated IP addresses, defeating DNS rebinding (TOCTOU) attacks.
-5. **Air-Gapped & Offline Support**: Offline evaluation environments can register static IP mappings via `register_static_dns()` or `STATIC_DNS_MAP` env without opening network access.
+Explicit local-development authentication bypass. The application refuses to start with `DEV_MODE=true` in a deployment environment.
 
-### Recursive Secret Sanitization & Secret References
-Traces often capture real user queries or raw LLM completions that contain accidentally leaked credentials.
+### RAG_PLATFORM_API_KEY
 
-Before any trace, metric, or attribution evidence is persisted:
-- A recursive scrubbing filter traverses all dictionary keys, lists, and strings.
-- Automatically redacts API keys (`sk-...`, `Bearer ...`, `token`), JWT strings, database connection strings, and common authentication headers.
-- **Environment-Backed Secret References**: HTTP adapters use secret references (`header_secret_refs` or `${ENV_VAR}`). Plaintext credentials are redacted before persistence, while secret references are preserved so workers resolve credentials at runtime from the worker environment. Database storage never contains plaintext secrets.
+Bootstrap API credential. Keep it outside source control and inject it through the environment/secret manager.
 
-### Tenant & Workspace Isolation
-- Projects enforce strict boundary isolation.
-- Datasets, runs, and traces are scoped to project IDs, preventing cross-tenant leakage.
+## Database
 
----
+### DATABASE_URL
 
-## 2. Reproducible Run Manifests & Provenance Immutability
+Persistent deployments must explicitly configure a database URL and cannot silently use SQLite. PostgreSQL is the intended deployment database.
 
-Every evaluation run creates a cryptographically verified, immutable `RunProvenance` record (`ConfigDict(frozen=True)`):
-- **Immutability Guarantee**: Provenance objects cannot be modified after construction. Any mutation attempts raise frozen instance errors, ensuring derived manifest hashes cannot become stale.
-- **`dataset_checksum`**: SHA-256 hash of all test cases in the dataset version.
-- **`rag_version`**: Evaluated system version or Git commit SHA.
-- **`adapter_config`**: Configuration payload stripped of API keys and credentials.
-- **`dependency_lock_hash`**: SHA-256 hash of `requirements.lock` ensuring reproducible dependencies.
-- **`environment_info`**: Python runtime version, platform architecture, and worker identifier.
+Alembic is authoritative for persistent schema changes. `Base.metadata.create_all()` is restricted to ephemeral in-memory test databases.
 
----
+## Trusted proxies
 
-## 3. Adversarial & Robustness Benchmarking
+### TRUSTED_PROXIES
 
-Reliab includes specialized test case patterns to stress-test RAG robustness:
-- **Multi-Hop Synthesis**: Questions requiring reasoning across disjoint chunks.
-- **Unanswerable Boundary Queries**: Questions with absent context to evaluate refusal boundaries.
-- **Adversarial Distractors**: Documents with lexical overlap but contradictory semantic facts.
-- **Prompt Injection Probes**: Attempts to hijack model instructions via injected instructions in retrieved documents.
+Comma-separated addresses/CIDRs allowed to supply `X-Forwarded-For`. Default:
+
+```text
+127.0.0.1,::1,testclient
+```
+
+Forwarded headers are ignored when the direct peer is not trusted. Do not configure broad networks unless every address is a trusted proxy.
+
+## API-key cache
+
+### API_KEY_CACHE_TTL_SECONDS
+
+In-process API-key identity cache TTL. Default: `2.0` seconds. Set `0` for strict database validation on each request. Revocation/rotation invalidates the local cache immediately; a positive TTL can leave another process with a cached identity until expiry.
+
+## Authentication rate limiting
+
+The session endpoint has a process-local sliding-window limiter: 5 failed attempts per 60 seconds, with bounded tracking for 10,000 source IPs. In a distributed deployment, use an edge/WAF limiter as the centralized control.
+
+## Browser sessions
+
+The browser exchanges an API key for a cryptographically random opaque token. Only its SHA-256 hash is persisted. Sessions are HttpOnly, SameSite=Strict, linked to the issuing API key when applicable, and invalidated when that key is revoked/rotated.
+
+The frontend must not persist API keys in localStorage/sessionStorage.
+
+## SSRF protection
+
+HTTP adapters:
+
+1. validate the destination URL;
+2. resolve DNS before connecting;
+3. reject private, loopback, link-local, reserved, and metadata-style addresses by default;
+4. validate all resolved addresses;
+5. revalidate redirect hops;
+6. pin connections to validated addresses;
+7. disable ambient proxy environment configuration.
+
+`HTTP_RAG_ALLOWED_HOSTS` can narrow destinations to an explicit host allowlist.
+
+`SSRF_STATIC_DNS_MAP` supplies controlled DNS mappings for offline/air-gapped environments. Static mappings do not bypass private/reserved-address checks.
+
+The low-level validator exposes `allow_private_ips` for trusted environments. Enabling it weakens the SSRF boundary and should not be used for untrusted endpoint configuration.
+
+## Secrets
+
+HTTP adapter credentials should use environment-backed secret references. Trace persistence recursively redacts API keys, bearer tokens, JWTs, connection strings, authentication headers, and private-key material.
+
+Workers resolve runtime secrets from their own environment; persisted run configuration should not contain plaintext provider credentials.
+
+## Prompt injection
+
+Retrieved documents are treated as passive, untrusted evidence and are wrapped by the defensive prompt-formatting helpers. This protects Reliab's evaluation boundary; it does not make the evaluated RAG system immune to prompt injection.
+
+## Project isolation
+
+Projects are the primary authorization boundary. Datasets, runs, traces, and failures are checked against project permissions. Administrator credentials manage API keys and maintenance.
+
+## Provenance
+
+Run provenance records dataset identity/checksum, system/evaluator/adapter information, and environment/configuration data. Its manifest hash is recomputed and verified before persistence. Treat the resulting provenance as immutable after run creation.
+
+## Deployment checklist
+
+For an exposed deployment:
+
+- PostgreSQL + Alembic migrations;
+- `AUTH_ENABLED=true`;
+- `DEV_MODE=false`;
+- strong `RAG_PLATFORM_API_KEY` from a secret manager;
+- narrow `TRUSTED_PROXIES`;
+- centralized edge/WAF rate limiting;
+- narrow HTTP host allowlist;
+- private-IP access disabled unless explicitly required;
+- TLS and network segmentation;
+- identical worker/API secret configuration.
+
+These controls complement, rather than replace, TLS, network isolation, least privilege, and host security.

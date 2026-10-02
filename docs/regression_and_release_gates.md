@@ -1,130 +1,134 @@
 # Regression Detection & Release Gates
 
-Reliab prevents silent quality regressions in RAG applications by comparing candidate evaluation runs against baseline runs and enforcing statistical release policies in CI/CD pipelines.
+Reliab compares baseline and candidate runs and evaluates them against a named release policy.
 
----
+## Current built-in policy
 
-## 1. Release Policy Configuration
+The named policy currently available through the resolver is:
 
-Release policies define quality floors and allowable regression budgets.
-
-### Policy Definition
-```python
-from rag_platform.models import ReleasePolicy
-
-policy = ReleasePolicy(
-    id="prod-default",
-    name="Production Default Gate Policy",
-    min_faithfulness=0.90,          # Minimum acceptable average faithfulness
-    min_retrieval_recall=0.85,      # Minimum acceptable Recall@5
-    min_citation_accuracy=0.90,     # Minimum acceptable citation accuracy
-    max_hallucination_rate=0.05,    # Maximum allowable rate of unsupported claims
-    max_latency_regression_pct=20.0,# Max latency increase compared to baseline (%)
-    max_cost_regression_pct=25.0,   # Max cost increase compared to baseline (%)
-    min_cost_budget_usd=0.05,       # Absolute floor preventing zero-baseline division errors
-    allow_new_failures=False,       # Block gate if any previously passing case now fails
-    min_case_coverage=1.0,          # Required evaluation coverage ratio (1.0 = 100% full dataset)
-    allow_candidate_missing=False,  # Block gate if candidate omitted baseline test cases
-)
+```text
+prod-default
 ```
 
----
+Current implementation defaults:
 
-## 2. Evaluation Coverage & Partial vs Full Runs
+| Field | Value |
+|---|---:|
+| `min_faithfulness` | 0.90 |
+| `min_retrieval_recall` | 0.92 |
+| `min_citation_accuracy` | 0.95 |
+| `max_hallucination_rate` | 0.05 |
+| `min_abstention_accuracy` | 0.90 |
+| `max_latency_regression_pct` | 20.0 |
+| `max_cost_regression_pct` | 25.0 |
+| `min_cost_budget_usd` | 0.05 |
+| `max_critical_regressions` | 0 |
+| `min_case_coverage` | 1.0 |
+| `allow_candidate_missing` | false |
+| `metric_policies` | [] |
 
-Reliab distinguishes between **Full/Release** evaluations and **Partial/Smoke** evaluations:
+These are Reliab defaults, not universal definitions of acceptable RAG quality.
 
-- **Full Evaluation**: Runs the complete required dataset (`evaluated_cases == required_cases`, `coverage_ratio == 1.0`, `is_full_evaluation == True`). Eligible for release gating.
-- **Partial/Smoke Evaluation**: Intentionally evaluates a subset (e.g. `max_cases` specified). Marked with `is_full_evaluation == False` and `eligible_for_release_gate == False`.
-- **Coverage Requirement**: A release gate verifies that `evaluated_cases / required_cases >= min_case_coverage` (default 100%). If coverage is below the threshold, the gate rejects with `INSUFFICIENT_COVERAGE` regardless of metric scores.
+## Policy selection
 
----
+Supported named policy IDs are resolved explicitly. Unknown IDs are rejected instead of silently falling back to `prod-default`.
 
-## 3. Per-Case Transition & Candidate-Missing Analysis
+The CLI uses `--policy prod-default`. Programmatic code may construct a `ReleasePolicy` directly.
 
-Averaging metrics across test cases can mask regressions if improvements on some queries cancel out regressions on others, or if a candidate selectively omits difficult queries.
+Treat policy changes as release-control changes and review them like code.
 
-Reliab tracks case-level transitions between the baseline and candidate run:
+## Coverage
 
-| Transition State | Definition | Gate Impact |
-|:---|:---|:---|
-| **`NEW_FAILURE`** | Case passed in baseline, but fails in candidate | **Critical Blocker**; violates gate when `allow_new_failures=False` |
-| **`CANDIDATE_MISSING`** | Case evaluated in baseline, but omitted in candidate | **Blocker**; violates gate when `allow_candidate_missing=False` |
-| **`BASELINE_MISSING`** | Case evaluated in candidate, but was absent in baseline | Informational; newly added test cases |
-| **`RECOVERED`** | Case failed in baseline, but passes in candidate | Quality improvement |
-| **`UNCHANGED_PASS`** | Case passed in baseline and passes in candidate | Maintained quality standard |
-| **`UNCHANGED_FAIL`** | Case failed in baseline and still fails in candidate | Known defect / technical debt |
+Coverage is:
 
-Candidate-missing cases are tracked distinctly from `NEW_FAILURE` so that omitted cases cannot bypass regression budgets or distort metric delta statistics.
+```text
+distinct evaluated case IDs / required dataset case count
+```
 
----
+Duplicate traces do not increase coverage.
 
-## 4. Headless CI/CD CLI Gate
+The default `min_case_coverage=1.0` means a release run must cover the complete required dataset. A partial/smoke run can still be useful for development but should not be treated as a complete release evaluation.
 
-Run quality checks directly from terminal or CI runner:
+## Candidate missing cases
+
+```text
+baseline IDs - candidate IDs = CANDIDATE_MISSING
+candidate IDs - baseline IDs = BASELINE_MISSING
+```
+
+A case with an inapplicable metric (`score=None`) is not automatically considered missing.
+
+## Case transitions
+
+| State | Meaning |
+|---|---|
+| `NEW_FAILURE` | Baseline pass → candidate fail |
+| `CANDIDATE_MISSING` | Baseline case absent from candidate |
+| `BASELINE_MISSING` | Candidate case absent from baseline |
+| `RECOVERED` | Baseline fail → candidate pass |
+| `UNCHANGED_PASS` | Pass → pass |
+| `UNCHANGED_FAIL` | Fail → fail |
+| `NOT_APPLICABLE` | Both cases exist but compared metric is inapplicable |
+
+## Gate dimensions
+
+The gate can reject a candidate because:
+
+### Quality floors
+
+```text
+faithfulness >= 0.90
+recall@5    >= 0.92
+citation    >= 0.95
+abstention  >= 0.90
+```
+
+under the current default policy.
+
+### Hallucination cap
+
+```text
+hallucination_rate <= 0.05
+```
+
+### Regression budget
+
+Critical regressions must remain within `max_critical_regressions`; the default allows zero.
+
+### Completeness
+
+Coverage and candidate omission are separate checks so difficult cases cannot be selectively removed to improve an aggregate.
+
+### Latency and cost
+
+Candidate latency may increase by at most 20% under the default. Cost may increase by at most 25%. The `min_cost_budget_usd` floor avoids unstable percentage comparisons when baseline cost is near zero.
+
+## Gate result
+
+`GateResult` contains status, policy ID, candidate run ID, violations, critical regression count, and evaluation timestamp.
+
+CLI exit codes:
+
+- `0` = PASS
+- `1` = FAIL
+
+JUnit output converts policy dimensions into CI-visible test cases.
+
+## Example
 
 ```bash
 python -m rag_platform.gate \
-  --project proj_production \
-  --dataset ds_golden_bench \
-  --system-version $(git rev-parse HEAD) \
+  --project proj_prod --dataset ds_gold \
+  --system-version "$(git rev-parse HEAD)" \
   --policy prod-default \
   --adapter-type http \
-  --endpoint-url https://api.staging.internal/rag/query \
-  --junit-xml test-results/reliab-gate.xml
+  --endpoint-url https://rag.example/query
 ```
 
-You can also use the installed console script:
+## Interpretation
 
-```bash
-reliab-gate \
-  --project proj_production \
-  --dataset ds_golden_bench \
-  --system-version $(git rev-parse HEAD) \
-  --policy prod-default
-```
+PASS means the observed benchmark satisfied the selected policy. It does not prove universal factual correctness.
 
-### CLI Parameters
+FAIL means the observed benchmark violated at least one policy constraint. Attribution can explain likely failure classes, but attribution is not causal proof.
 
-| Parameter | Type | Default | Description |
-|:---|:---|:---|:---|
-| `--project` | string | *required* | Target project workspace ID |
-| `--dataset` | string | *required* | Published dataset ID to benchmark against |
-| `--system-version` | string | *required* | Git commit SHA or version tag of candidate RAG |
-| `--policy` | string | `prod-default` | Release policy ID to evaluate against |
-| `--adapter-type` | `synthetic` \| `http` | `synthetic` | Adapter communication protocol |
-| `--endpoint-url` | string | `None` | Target HTTP URL when `--adapter-type http` |
-| `--mock-mode` | enum | `PERFECT` | Mock behavior when `--adapter-type synthetic` |
-| `--junit-xml` | string | `None` | Destination path for JUnit XML report |
-| `--bootstrap` | flag | `False` | Auto-initialize database and seed baseline dataset |
-
-### Exit Codes
-- **`0`**: Gate status is `PASS`. All thresholds and budgets satisfied.
-- **`1`**: Gate status is `FAIL`. One or more violations detected.
-
----
-
-## 4. JUnit XML CI/CD Integration
-
-When `--junit-xml` is provided, Reliab generates test reports adhering to standard JUnit XML schemas, enabling native test visualizers in GitHub Actions, GitLab CI, Jenkins, and Azure DevOps.
-
-Example GitHub Actions step:
-
-```yaml
-- name: Run Reliab Release Gate
-  run: |
-    python -m rag_platform.gate \
-      --bootstrap \
-      --project proj_ci \
-      --dataset ds_ci_benchmark \
-      --system-version ${{ github.sha }} \
-      --policy prod-default \
-      --junit-xml test-results/reliab-gate.xml
-
-- name: Publish Test Results
-  uses: actions/upload-artifact@v4
-  if: always()
-  with:
-    name: gate-test-results
-    path: test-results/reliab-gate.xml
-```
+The gate is therefore a reproducible **benchmark decision**, not a claim about every possible production query.

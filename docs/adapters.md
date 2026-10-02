@@ -1,43 +1,31 @@
-# Adapters & SUT Integration
+# Adapters & System-Under-Test Contract
 
-Reliab connects to Systems Under Test (SUT) through an extensible adapter interface (`RagAdapter`). Adapters abstract communication protocols, concurrency controls, timeout handling, and transport security.
+Reliab evaluates an existing RAG/LLM system. It does not host or train the evaluated model. Adapters are integration boundaries that convert a benchmark `TestCase` into a normalized `RagTrace`.
 
----
-
-## 1. Adapter Interface
-
-Every adapter implements the asynchronous `run` method:
+## Canonical interface
 
 ```python
-class RagAdapter(ABC):
-    @abstractmethod
-    async def run(self, test_case: TestCase, config: RunConfig) -> RagTrace:
-        """Execute a single benchmark test case and return a normalized RagTrace."""
-        pass
+class RagAdapter(Protocol):
+    async def run(self, case: TestCase, config: RunConfig) -> RagTrace:
+        ...
 ```
 
-### Trace Output Format
-Adapters return a normalized `RagTrace` object containing:
-- `answer`: Generated textual response.
-- `retrieved_chunks`: List of retrieved chunks (`chunk_id`, `document_id`, `text`, `similarity_score`, `rank`).
-- `citations`: Extracted citations linking claim text to `document_id` and `chunk_id`.
-- `latency_ms`: Total execution time in milliseconds.
-- `cost_usd`: Computed invocation cost based on token consumption.
-- `metadata`: Execution metadata (model name, prompt tokens, completion tokens).
+A normalized trace contains the test-case ID/question, answer or abstention, retrieved chunks, citations, latency, tokens/cost, model metadata, telemetry, and operational error information where applicable.
 
----
+## Adapter types
 
-## 2. Built-in Adapters
+| Type | Purpose | Trust boundary |
+|---|---|---|
+| `synthetic` | deterministic CI/self-test | Built in |
+| `http` | external/local RAG service | SSRF-protected network |
+| `python` | in-process pipeline | trusted server-side registry |
 
-### 1. `HttpRagAdapter`
-Connects to remote or local HTTP microservices serving RAG pipelines:
-- **SSRF Defense**: Uses `SSRFProtectedTransport` to validate destination IP addresses against private networks (RFC 1918, RFC 3927) and pin sockets to prevent DNS rebinding.
-- **Strict Canonical Response Validation**: Validates HTTP RAG responses through a canonical strict Pydantic model (`HttpRagResponsePayload`). Structural types, nested chunk definitions, citations with token spans, and abstention fields are strictly validated. Malformed responses (e.g. invalid chunk types, bad spans, missing required non-abstained answers) consistently become `OPS-01` operational errors with diagnostic telemetry rather than leaking unhandled exceptions.
-- **Environment-Backed Secret References**: To avoid storing plaintext API tokens in the database, `HttpRagAdapter` supports secret references in header configurations (`header_secret_refs` or `${ENV_VAR}`). Plaintext headers are redacted prior to database persistence, and background execution workers resolve credentials at runtime from their environment. If a referenced environment secret is missing, execution safely produces an `OPS-01` error.
-- **Retry & Idempotency Contract**: Intended for read-only evaluation requests. Outbound requests automatically include `X-Request-ID` and `Idempotency-Key` headers (`eval_{project}_{dataset}_{case}_{trace}`). Automatic retries with exponential backoff and jitter are performed for transient HTTP status codes (`429`, `502`, `503`, `504`) and connection drops without duplicating side-effects.
-- **Bounded Concurrency & Clean Resource Teardown**: Throttles outbound traffic using `asyncio.Semaphore` and guarantees async client closure via asynchronous context management and `finally` cleanup.
+Adapters are selected by **interface**, not model family. A GPT/Llama/local/custom RAG service does not need a model-specific Reliab adapter if it implements one of these interfaces.
 
-#### Expected Request Payload
+## HTTP contract
+
+Request:
+
 ```json
 {
   "question": "What is the warranty period for Model X?",
@@ -46,95 +34,103 @@ Connects to remote or local HTTP microservices serving RAG pipelines:
 }
 ```
 
-#### Expected Response Payload Contract
+Response:
+
 ```json
 {
-  "answer": "The warranty period for Model X is 3 years or 36,000 miles [1].",
+  "answer": "The warranty is 3 years.",
   "abstained": false,
   "abstention_reason": null,
   "retrieved_chunks": [
     {
-      "chunk_id": "chk_102",
-      "document_id": "doc_warranty_guide",
-      "text": "Model X coverage includes a 3-year or 36,000-mile limited warranty.",
+      "document_id": "doc_warranty",
+      "chunk_id": "chunk_01",
+      "text": "Model X has a 3-year limited warranty.",
       "score": 0.94,
-      "rank": 1
+      "rank": 1,
+      "metadata": {}
     }
   ],
   "citations": [
     {
       "claim_id": "cl_0",
-      "claim_text": "Model X coverage includes a 3-year or 36,000-mile limited warranty.",
-      "document_id": "doc_warranty_guide",
-      "chunk_id": "chk_102"
+      "claim_text": "The warranty is 3 years.",
+      "document_id": "doc_warranty",
+      "chunk_id": "chunk_01"
     }
   ],
-  "telemetry": {
-    "latency_ms": 320.5
-  }
+  "telemetry": {"latency_ms": 320}
 }
 ```
 
----
+Strict validation requires a JSON object; boolean `abstained`; a string answer for non-abstained responses; structured chunks/citations; string chunk document IDs; and valid citation spans when supplied. Citation spans are exactly two non-negative integers with `start <= end`. Unknown provider fields are ignored.
 
-### 2. `SyntheticRagAdapter`
-Deterministic simulator used for unit testing, CI validation, and release gate calibration. Supports predefined mock behaviors:
+Malformed responses become operational adapter failures rather than plausible evaluation data.
 
-| Mode | Behavior |
-|:---|:---|
-| `PERFECT` | Generates fully faithful, perfectly grounded answers with accurate citations |
-| `HALLUCINATING` | Introduces unsupported claims absent from the retrieved evidence |
-| `CONTRADICTING` | Produces direct predicate or numerical conflicts with the retrieved evidence |
-| `RETRIEVAL_FAILURE` | Simulates retrieval misses by returning irrelevant chunks or empty results |
-| `UNANSWERABLE_FAILED` | Answers questions marked as unanswerable instead of refusing |
-| `HIGH_LATENCY` | Simulates slow network or LLM response times |
+## HTTP retries and identity
 
----
+Transient 429/502/503/504 responses and connection drops may be retried with backoff. Requests include `X-Request-ID` and `Idempotency-Key`.
 
-## 3. Implementing a Custom Adapter
+The evaluated endpoint should therefore make repeated read/evaluation requests safe.
 
-You can implement custom adapters in Python:
+HTTP execution also uses SSRF protection, bounded concurrency, timeout handling, and resource cleanup.
+
+## HTTP secrets
+
+Use environment-backed secret references rather than persisting long-lived provider credentials in run configuration. Workers resolve those references at runtime.
+
+## Python adapter
+
+Register a trusted callable:
 
 ```python
-from rag_platform.adapters import RagAdapter
-from rag_platform.models import TestCase, RunConfig, RagTrace, RetrievedChunk, CitationReference
-
-class CustomPipelineAdapter(RagAdapter):
-    def __init__(self, my_rag_pipeline):
-        self.pipeline = my_rag_pipeline
-
-    async def run(self, test_case: TestCase, config: RunConfig) -> RagTrace:
-        result = await self.pipeline.query_async(test_case.question)
-        
-        return RagTrace(
-            test_case_id=test_case.id,
-            question=test_case.question,
-            answer=result.text,
-            retrieved_chunks=[
-                RetrievedChunk(
-                    chunk_id=c.id,
-                    document_id=c.doc_id,
-                    text=c.content,
-                    similarity_score=c.score,
-                    rank=idx,
-                )
-                for idx, c in enumerate(result.chunks)
-            ],
-            citations=[
-                CitationReference(document_id=cite.doc_id, chunk_id=cite.chunk_id)
-                for cite in result.citations
-            ],
-            latency_ms=result.elapsed_ms,
-        )
+PythonAdapterRegistry.register("my_rag_pipeline", my_eval_fn)
 ```
 
-### 4. Process-Local Python Adapter Registry
-To evaluate internal Python pipelines without exposing the platform to arbitrary remote code execution via HTTP payloads:
-- Callables are registered explicitly in code:
-  ```python
-  from rag_platform.adapters import PythonAdapterRegistry
-  PythonAdapterRegistry.register("my_model_v1", my_eval_fn)
-  ```
-- **Multi-Process Architecture**: When running distributed workers across separate processes, callables must be registered during application bootstrap in each worker process.
-- **Security**: The REST API accepts only pre-registered string identifiers (`"adapter_type": "python"`, `"adapter_config": {"model_name": "my_model_v1"}`). Arbitrary code submission via JSON or network payload is strictly prohibited.
+The REST payload contains only:
 
+```json
+{
+  "adapter_type": "python",
+  "adapter_config": {"model_name": "my_rag_pipeline"}
+}
+```
+
+No Python source, pickle, or callable is accepted from the API.
+
+The registry is process-local. Every worker that may execute the adapter must register it during bootstrap.
+
+## Synthetic adapter
+
+Available deterministic modes include:
+
+- `PERFECT`
+- `HALLUCINATING`
+- `CONTRADICTING`
+- `RETRIEVAL_FAILURE`
+- `UNANSWERABLE_FAILED`
+- `HIGH_LATENCY`
+
+These calibrate the evaluator/gate; they are not simulations of general model quality.
+
+## Custom adapters
+
+Normalize provider-specific data before returning a `RagTrace`. Preserve real document IDs, chunk IDs, and ranks. Do not fabricate evidence to satisfy the schema.
+
+## Failure semantics
+
+An adapter/network failure is an operational failure, not automatically a hallucination:
+
+```text
+timeout / malformed provider response
+          ↓
+       OPS-01
+          ↓
+operational evaluation evidence
+```
+
+This separation prevents provider outages from being mislabeled as generation defects.
+
+## Adapter checklist
+
+Production adapters should bound timeouts/concurrency, clean up resources, preserve case identity/ranks, avoid plaintext secrets, make retries safe, and never execute arbitrary caller-supplied code.

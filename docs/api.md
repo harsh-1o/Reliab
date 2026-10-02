@@ -1,107 +1,115 @@
 # REST API Reference
 
-Reliab exposes a RESTful API built on FastAPI for managing projects, benchmark datasets, evaluation runs, and regression comparisons.
+Reliab's FastAPI control plane manages projects, benchmark datasets, evaluation runs, traces, failures, authentication, comparison, maintenance, and the dashboard.
 
----
+## Routes implemented by the current server
 
-## 1. Endpoints Overview
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/health`, `/v1/health` | Health |
+| POST | `/v1/auth/session` | API key → browser session |
+| POST | `/v1/auth/logout` | Invalidate browser session |
+| POST/GET | `/v1/auth/keys` | Create/list API keys (admin) |
+| POST | `/v1/auth/keys/{key_hash}/revoke` | Revoke key (admin) |
+| POST | `/v1/auth/keys/{key_hash}/rotate` | Rotate key (admin) |
+| POST | `/v1/maintenance/cleanup` | Cleanup (admin) |
+| POST/GET | `/v1/projects` | Create/list projects |
+| GET | `/v1/projects/{project_id}` | Get project |
+| POST | `/v1/datasets` | Create draft dataset |
+| POST | `/v1/datasets/{dataset_id}/cases/bulk` | Add cases to draft |
+| GET | `/v1/datasets` | List datasets |
+| GET | `/v1/datasets/{dataset_id}` | Get dataset |
+| GET/POST | `/v1/runs` | List/create runs |
+| POST | `/v1/runs/{run_id}/cancel` | Cancel active run |
+| GET | `/v1/runs/{run_id}` | Get run |
+| GET | `/v1/runs/{run_id}/traces` | Get traces |
+| GET | `/v1/failures` | Get failure attributions |
+| POST | `/v1/compare` | Baseline/candidate comparison |
+| POST | `/v1/demo-run` | Local demonstration run |
+| GET | `/dashboard` | Web dashboard |
 
-| Method | Endpoint | Description |
-|:---|:---|:---|
-| `GET` | `/v1/health` | Service health status and timestamp |
-| `POST` | `/v1/projects` | Register a new project workspace |
-| `GET` | `/v1/projects` | List projects (with pagination `limit`, `offset`) |
-| `POST` | `/v1/datasets` | Create draft benchmark dataset |
-| `POST` | `/v1/datasets/{id}/publish` | Publish and lock benchmark dataset version (computes SHA-256) |
-| `POST` | `/v1/datasets/{id}/cases/bulk` | Bulk insert benchmark test cases into draft dataset |
-| `POST` | `/v1/runs` | Launch evaluation run (`async_exec=true` returns `202 Accepted` + `QUEUED`) |
-| `POST` | `/v1/runs/{id}/cancel` | Cancel an in-flight evaluation run |
-| `GET` | `/v1/runs` | List evaluation runs with summary metrics |
-| `GET` | `/v1/runs/{id}` | Fetch run details, provenance manifest, and status |
-| `GET` | `/v1/runs/{id}/traces` | List individual traces with metrics and failure attributions |
-| `POST` | `/v1/compare` | Compare candidate run against baseline run (4-way transitions) |
-| `POST` | `/v1/maintenance/cleanup` | Purge expired runs based on data retention policy |
-| `GET` | `/dashboard` | Interactive web engineering console |
+There is currently **no public dataset-publish route**. Runs require a dataset that is already published.
 
----
+## Authentication
 
-## 2. Authentication & Security
+API clients use either:
 
-When `RAG_AUTH_ENABLED=true` is set (default in production):
-- **API Key**: Pass the configured secret key in the `X-API-Key` or `Authorization: Bearer <key>` HTTP header.
-- **Web UI Session**: Browser clients authenticate via `POST /v1/auth/session` with `{"api_key": "..."}` to obtain an opaque random session token (`sess_<random>`) stored in an `HttpOnly`, `SameSite=Lax`, `Secure` cookie (`reliab_session` / `session_id`). The raw API key is never stored in browser cookies. Call `POST /v1/auth/logout` to destroy the server-side session.
-- **Trusted Proxies**: Set `TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1` when operating behind reverse proxies. Untrusted client IP spoofing in `X-Forwarded-For` is automatically rejected.
-
-```bash
-curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/v1/projects
+```http
+X-API-Key: <key>
+Authorization: Bearer <key>
 ```
 
----
+Browser clients POST the key to `/v1/auth/session`. The server returns an opaque random `session_id` cookie with HttpOnly/SameSite=Strict attributes. The raw API key is not stored in browser storage.
 
-## 3. Key Endpoint Examples
+API keys and sessions are stored as hashes. Revoking/rotating an API key invalidates linked browser sessions.
 
-### Launch Evaluation Run (`POST /v1/runs`)
-```bash
-curl -X POST http://localhost:8080/v1/runs \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key" \
-  -d '{
-    "project_id": "proj_prod",
-    "dataset_id": "ds_golden_v1",
-    "system_version": "git-commit-abc1234",
-    "adapter_type": "http",
-    "adapter_config": {
-      "endpoint_url": "https://api.internal/rag/query",
-      "timeout_seconds": 15.0
-    },
-    "async_exec": true
-  }'
+## Creating a run
+
+```http
+POST /v1/runs
+Content-Type: application/json
+X-API-Key: <key>
 ```
 
-#### Response (`202 Accepted`)
+A run identifies a project, published dataset/version, system version, adapter, and release policy. Dataset project ownership, version, checksum, and provenance integrity are checked before persistence.
+
+Set `async_exec=true` for durable worker execution. The run is queued and later claimed by a worker lease.
+
+## Run lifecycle
+
+```text
+CREATED → QUEUED → RUNNING → COMPLETED
+                         ├── FAILED
+                         └── CANCELLED
+```
+
+Terminal runs are immutable. Workers use leases and heartbeats so stale workers cannot overwrite recovered runs.
+
+## Traces and summaries
+
+`GET /v1/runs/{id}` returns persisted run information, provenance, summary, coverage, and gate result.
+
+`GET /v1/runs/{id}/traces?failure_only=true` filters traces to failures.
+
+Completed run summaries/gate results are persisted; the API does not reconstruct a weaker summary that could lose authoritative coverage information.
+
+## Compare
+
 ```json
 {
-  "id": "run_01hx5m8q3v9",
-  "project_id": "proj_prod",
-  "dataset_id": "ds_golden_v1",
-  "status": "QUEUED",
-  "created_at": "2026-09-26T12:00:00Z"
+  "baseline_run_id": "run_baseline",
+  "candidate_run_id": "run_candidate"
 }
 ```
 
----
+Comparison is case-aware. It distinguishes `NEW_FAILURE`, `CANDIDATE_MISSING`, `BASELINE_MISSING`, `RECOVERED`, `UNCHANGED_PASS`, `UNCHANGED_FAIL`, and `NOT_APPLICABLE`.
 
-### Compare Candidate vs. Baseline (`POST /v1/compare`)
+Missing cases are determined from explicit case-ID membership, not from a `None` metric score.
+
+## Maintenance
+
+```http
+POST /v1/maintenance/cleanup?trace_retention_days=90
+```
+
+The API bounds the retention parameter and requires administrator access.
+
+## Important invariants
+
+- Runs require published datasets.
+- Dataset and run projects must match.
+- Dataset versions and provenance checksums must match.
+- Published datasets are immutable.
+- Python adapters reference pre-registered server-side callables; arbitrary code is never accepted from JSON.
+- Resources are project-scoped.
+- Unknown named release policies are rejected on supported policy-selection paths.
+
+## CLI gate
+
 ```bash
-curl -X POST http://localhost:8080/v1/compare \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key" \
-  -d '{
-    "baseline_run_id": "run_baseline_123",
-    "candidate_run_id": "run_candidate_456"
-  }'
+python -m rag_platform.gate --project proj_prod --dataset ds_gold \
+  --system-version "$(git rev-parse HEAD)" --policy prod-default \
+  --adapter-type http --endpoint-url https://rag.example/query
 ```
 
-#### Response (`200 OK`)
-```json
-{
-  "baseline_run_id": "run_baseline_123",
-  "candidate_run_id": "run_candidate_456",
-  "metric_deltas": {
-    "faithfulness": -0.04,
-    "recall_at_5": 0.02,
-    "citation_accuracy": -0.01
-  },
-  "transitions": {
-    "NEW_FAILURE": 2,
-    "RECOVERED": 5,
-    "UNCHANGED_PASS": 88,
-    "UNCHANGED_FAIL": 5
-  },
-  "verdict": "FAIL",
-  "violations": [
-    "2 new regressions detected on previously passing test cases."
-  ]
-}
-```
+Exit code `0` means PASS; `1` means FAIL.

@@ -1,105 +1,142 @@
 # Platform Architecture
 
-Reliab provides modular developer infrastructure for evaluating, diagnosing, and gating Retrieval-Augmented Generation (RAG) and LLM systems.
+Reliab evaluates existing RAG/LLM systems and turns benchmark evidence into diagnostics and release-gate decisions.
 
----
-
-## 1. High-Level Architecture
-
-Reliab strictly separates the execution data plane, metric evaluation engine, failure attribution subsystem, regression analysis engine, and control plane.
+## High-level architecture
 
 ```mermaid
 flowchart TD
-    subgraph DataPlane["Data Plane"]
-        A["Benchmark Dataset<br/>(Versioned & Checksummed)"] --> B["Adapter Registry<br/>(Python | HTTP | Synthetic)"]
-        B --> C["SUT Execution<br/>(Bounded Concurrency & SSRF Safe)"]
-        C --> D["RagTrace<br/>(Sanitized)"]
-    end
-
-    subgraph EvalPlane["Evaluation & Attribution"]
-        D --> E["Evaluation Engine"]
-        E --> F1["Retrieval Metrics<br/>Recall@K, MRR, Precision"]
-        E --> F2["Generation Metrics<br/>Faithfulness, Correctness"]
-        E --> F3["Citation & Abstention"]
-        F1 & F2 & F3 --> G["Deterministic Attribution Engine<br/>(Primary + Contributing Codes)"]
-        G --> H["ML Classifier Queue<br/>(Active Learning Triage)"]
-    end
-
-    subgraph DecisionPlane["Decision & Control Plane"]
-        G --> I["Regression Engine<br/>(4-Way Transitions, Wilson CIs)"]
-        I --> J{"Release Policy Gate"}
-        J -->|"PASS / FAIL"| K["JUnit XML / CI Exit Code"]
-        J --> L["REST API & FastAPI Control Plane"]
-        L --> M["Reliab Dashboard<br/>(Dense UI: Tables, Traces)"]
-    end
+    A["Published Golden Dataset<br/>version + checksum"] --> B["Run Configuration"]
+    B --> C{"Adapter"}
+    C -->|"synthetic"| D["Synthetic SUT"]
+    C -->|"python"| E["Trusted Python Callable"]
+    C -->|"http"| F["External RAG Service"]
+    F --> G["SSRF-Protected Transport"]
+    D --> H["Canonical RagTrace"]
+    E --> H
+    G --> H
+    H --> I["Secret Sanitization"]
+    I --> J["Evaluation Engine"]
+    J --> K1["Retrieval Metrics"]
+    J --> K2["Generation Metrics"]
+    J --> K3["Citation Metrics"]
+    J --> K4["Abstention Metrics"]
+    K1 --> L["Persisted Run Summary"]
+    K2 --> L
+    K3 --> L
+    K4 --> L
+    J --> M["Failure Attribution"]
+    L --> N["Regression Engine"]
+    M --> N
+    N --> O["Release Policy Gate"]
+    O --> P["PASS / FAIL"]
+    Q["FastAPI Control Plane"] --> B
+    Q --> L
+    Q --> M
+    Q --> O
+    R["Durable Worker"] --> B
+    R --> H
+    R --> J
+    R --> O
+    Q --> S["Web Dashboard"]
 ```
 
----
-
-## 2. Core Subsystems
-
-### Data Plane
-- **Dataset Registry**: Stores versioned, immutable benchmark datasets. Each version maintains a SHA-256 checksum across all test cases to guarantee evaluation integrity.
-- **Adapter Registry**: Connects to the System Under Test (SUT) via in-process Python interfaces, synthetic simulation modes, or external HTTP endpoints.
-- **SSRF-Safe Transport**: Restricts HTTP outbound traffic with pre-flight DNS resolution and IP socket-pinning against private or cloud metadata address ranges.
-- **Secret Sanitizer**: Recursively redacts JWTs, bearer tokens, API keys, and connection strings from traces prior to persistence.
-
-### Evaluation & Attribution Plane
-- **Evaluation Engine**: Executes asynchronous, parallel evaluators for retrieval quality, claim-level faithfulness, answer correctness, citation alignment, and abstention compliance.
-- **Metric Applicability**: Evaluators decouple conditional scoring from default values; missing preconditions yield `NOT_APPLICABLE` (`score=None`) rather than arbitrary penalties.
-- **Deterministic Attribution Engine**: Maps metric failures to canonical diagnostic codes (`RET-01`, `GEN-01`, `CIT-02`, etc.) with supporting evidence extracted from traces for secondary diagnostic triage.
-- **Active Learning Classifier**: Auxiliary diagnostic classifier providing triage prioritization for unclassified traces (used as secondary triage aid, not ground truth for release decisions).
-
-### Decision & Control Plane
-- **Regression Engine**: Evaluates candidate runs against a baseline run using case-level transition tracking (`NEW_FAILURE`, `CANDIDATE_MISSING`, `BASELINE_MISSING`, `RECOVERED`, `UNCHANGED_PASS`, `UNCHANGED_FAIL`).
-- **Release Policy Gate**: Enforces required dataset coverage (`min_case_coverage`, default 100%), forbids silent candidate omission of baseline cases, and computes pass/fail verdicts against configurable statistical thresholds and regression budgets.
-- **FastAPI Control Plane**: Powers the REST API, session management, authentication middleware, and background task dispatch.
-- **Web Dashboard**: Server-rendered, responsive console for inspecting runs, traces, metrics, coverage metrics, and failure attributions.
-
----
-
-## 3. Evaluation Pipeline Execution Flow
-
-For every test case in an evaluation run:
+## Execution plane
 
 ```text
-Test Case + Run Configuration
-       ↓
-  RAG Adapter Execution (Async Semaphore Concurrency & SSRF Transport)
-       ↓
-  Recursive Secret Sanitization
-       ↓
-  Metric Evaluation (Parallel Async Tasks)
-   ├── Retrieval Evaluation (Recall@K, MRR, Contextual Precision)
-   ├── Claim Extraction & Clause Decomposition
-   ├── Lexical Claim Grounding & Verification
-   ├── Fact-Anchored Answer Correctness
-   ├── Citation Validation
-   └── Abstention & Refusal Verification
-       ↓
-  Failure Attribution (Primary code, Contributing codes, Evidence)
-       ↓
-  Database Persistence (Alembic schema, Normalized records)
-       ↓
-  Aggregate Run Metrics (Wilson Score Intervals, Sample Size Warnings)
+TestCase → RunConfig → Adapter → SUT → RagTrace → sanitization
 ```
 
----
+The adapter is the integration boundary; the evaluator consumes the normalized trace rather than provider-specific response formats.
 
-## 4. Standalone Durable Worker Architecture
+## Evaluation plane
 
-Asynchronous evaluation runs (`POST /v1/runs` with `async_exec=true`) are processed by durable worker processes:
+```text
+RagTrace
+  ├─ retrieval
+  ├─ generation/claims
+  ├─ citations
+  └─ abstention
+       ↓
+MetricResult[]
+       ↓
+aggregate summary
+```
 
-- **Atomic Lease Claiming**: Workers acquire queued runs via optimistic database lease locking with configurable timeouts (`lock_timeout_seconds`).
-- **Heartbeat Maintenance**: Active workers periodically renew their lease timestamp to signal healthy execution.
-- **Stale Runner Recovery**: Abandoned or crashed jobs from ungraceful worker termination are automatically reclaimed and recovered.
-- **Notification-Driven Wakeup**: Supports PostgreSQL `LISTEN/NOTIFY` with thread-safe `asyncio` event dispatch, falling back to adaptive backoff polling for SQLite.
+Conditional metrics return `NOT_APPLICABLE`/`score=None` when their preconditions are absent instead of manufacturing a zero.
 
----
+## Diagnostic plane
 
-## 5. Architectural Tenets
+The deterministic attribution engine maps observed metric/trace conditions to retrieval, generation, citation, abstention, and operational diagnostic codes. Attribution is a heuristic diagnostic hypothesis, not causal proof or a calibrated probability.
 
-1. **Deterministic Rules as Source of Truth**: Attribution and quality gates rely on explicit, explainable programmatic logic rather than black-box LLM judgements.
-2. **Fail-Closed by Design**: Quality gates exit with code `1` whenever violations occur, blocking regressions before code reaches staging or production.
-3. **Decoupled Applicability**: Metrics distinguish between genuine failures and irrelevant checks through explicit `NOT_APPLICABLE` statuses.
-4. **Zero Unsanitized Traces**: Sensitive credentials and tokens are scrubbed in-memory before database write operations.
+## Decision plane
+
+The regression engine compares baseline and candidate cases. The release gate applies coverage, quality floors, regression budgets, latency, and cost policy.
+
+Case membership is explicit:
+
+```text
+baseline IDs - candidate IDs = CANDIDATE_MISSING
+candidate IDs - baseline IDs = BASELINE_MISSING
+```
+
+## Durable workers
+
+```text
+POST /v1/runs
+   ↓
+persist → QUEUED
+   ↓
+worker lease claim
+   ↓
+heartbeat
+   ↓
+execute cases
+   ↓
+persist summary + gate
+   ↓
+COMPLETED / FAILED / CANCELLED
+```
+
+Lease IDs and heartbeat timestamps prevent obsolete workers from overwriting recovered runs. PostgreSQL supports notification-driven wakeups; SQLite uses adaptive polling.
+
+## Persistence and integrity
+
+The database contains projects, datasets/cases, runs, traces, metrics, failures, API keys, sessions, and cache entries.
+
+Run creation checks dataset existence/publication, project ownership, dataset version/checksum, and provenance manifest integrity.
+
+Alembic owns persistent schema changes.
+
+## Security boundaries
+
+```text
+API caller
+  ↓
+authentication + project authorization
+  ↓
+run configuration
+  ├─ Python → trusted registry
+  └─ HTTP → SSRF-safe transport
+  ↓
+sanitized RagTrace
+  ↓
+evaluation/persistence
+```
+
+Retrieved documents are also treated as untrusted content for prompt-injection defenses.
+
+## Control plane
+
+FastAPI provides authentication, projects, datasets, runs, traces, failures, comparison, maintenance, and dashboard endpoints. The dashboard is a static JavaScript client; backend-controlled values are escaped before HTML insertion.
+
+## Design principles
+
+1. Reliab evaluates an external SUT; it is not the model host.
+2. Normalized traces are the evaluation boundary.
+3. Deterministic metrics are the release source of truth.
+4. Diagnostics are explicitly heuristic.
+5. Coverage is a release dimension.
+6. Published benchmark data is immutable.
+7. Provenance is integrity checked.
+8. Operational failures are separated from quality failures.
